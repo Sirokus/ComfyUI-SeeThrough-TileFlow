@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-seethrough-layerupscale"
+version = "0.1.0"
+description = "Batch upscale SeeThrough character layers and assemble a layered PSD"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+
+[tool.comfy]
+DisplayName = "ComfyUI-SeeThrough-LayerUpscale"
