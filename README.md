@@ -1,143 +1,165 @@
 # ComfyUI-SeeThrough-TileFlow
 
-> 分块驱动的 SeeThrough 角色拆层流水线：把高分辨率原图切成带重叠的块，逐块跑
-> LayerDiff + Depth + 后处理，再把每块的分层结果拼回一张完整的分层 PSD。
+**English** · [中文](README_ZH.md)
 
-Tile-based SeeThrough layer/depth generation for high-resolution character art:
-slice the reference into overlapping tiles, render only the tiles you tick, then
-merge the per-tile layers back into one layered PSD. Nodes and panels speak
-Chinese; an English localization file ships in `locales/en`.
+> Tile-driven SeeThrough character layer/depth generation: slice a high-resolution
+> reference into overlapping tiles, run LayerDiff + Depth + post-processing per
+> tile, then merge the per-tile layers back into one layered PSD.
+
+Nodes and panels speak Chinese by default; an English localization file ships in
+`locales/en`.
 
 ---
 
-## 特性
+## Features
 
-- **只跑勾选的块**：未勾选的格子不会进入 GPU，已生成过的格子直接复用。
-- **顺序引导回填**：每块生成前，把已经完成的相邻块在重叠区的像素填回去再送进
-  模型（`STLU_GuidedLayers` / `STLU_SeqTileLoop`），减轻拼缝。
-- **固定输出目录 + 参数指纹**：参数变了才清空重跑；只改合并选项时只重新合并。
-- **分层 PSD + 逐块清单**：每块存独立分层 PSD，全部完成后写 `manifest.json` /
-  `images.json` / `generation.json`，并合并出整图分层 PSD。
-- **两套工作流**：一套四步流水线（节点最少），一套「透明版」把每个阶段摊成子图，
-  内部每一步都可见，两套共用同一套底层实现。
-- **中英双语面板**：界面默认中文，`Comfy.Locale` 为英文时由 `locales/en` 与
-  `web/stlu_i18n.js` 提供英文显示（不改写任何存档值）。
+- **Only ticked tiles run**: unchecked cells never reach the GPU, already generated
+  cells are reused.
+- **Sequential guided backfill**: before each tile is generated, pixels from already
+  finished neighbouring tiles are filled into the overlap and fed to the model
+  (`STLU_GuidedLayers` / `STLU_SeqTileLoop`), softening seams.
+- **Fixed output directory + parameter fingerprint**: the directory is only cleared
+  when generation parameters change; changing merge options only re-merges.
+- **Layered PSD + per-tile manifests**: each tile is saved as its own layered PSD;
+  when all tiles finish, `manifest.json` / `images.json` / `generation.json` are
+  written and the whole image is merged into one layered PSD.
+- **Two workflows**: a four-step pipeline (fewest nodes) and a "transparent"
+  variant that expands every stage into a subgraph where each inner step is a
+  visible node. Both share the same implementation.
+- **Bilingual panels**: Chinese by default; when `Comfy.Locale` is English,
+  `locales/en` and `web/stlu_i18n.js` provide the English UI (saved values are
+  never rewritten).
 
-## 环境要求
+## Requirements
 
-- ComfyUI（Python ≥ 3.10）。
-- ComfyUI-SeeThrough 自定义节点及其 LayerDiff / Depth 模型——工作流里的
-  `SeeThrough_LoadLayerDiffModel`、`SeeThrough_GenerateLayers`、
-  `SeeThrough_LoadDepthModel`、`SeeThrough_GenerateDepth`、`SeeThrough_PostProcess`
-  都来自它。
-- ComfyUI 自带的 `torch` / `numpy` / `Pillow` / `OpenCV` / `SciPy`。
-- 可选：`opencv-contrib-python`。4K 掩膜节点会优先用 `cv2.ximgproc.guidedFilter`，
-  没装时自动退化为双线性插值；边缘吸附需要 `scipy`。
-- 本包没有额外的 pip 依赖。
+- ComfyUI (Python ≥ 3.10).
+- The ComfyUI-SeeThrough custom nodes and their LayerDiff / Depth models — the
+  workflow's `SeeThrough_LoadLayerDiffModel`, `SeeThrough_GenerateLayers`,
+  `SeeThrough_LoadDepthModel`, `SeeThrough_GenerateDepth` and
+  `SeeThrough_PostProcess` all come from it.
+- The `torch` / `numpy` / `Pillow` / `OpenCV` / `SciPy` that ship with ComfyUI.
+- Optional: `opencv-contrib-python`. The 4K mask nodes prefer
+  `cv2.ximgproc.guidedFilter` and fall back to bilinear interpolation when it is
+  missing; edge snapping needs `scipy`.
+- This package has no extra pip dependencies.
 
-## 安装
+## Installation
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
 ```
 
-重启 ComfyUI。新节点出现在 **SeeThrough/LayerUpscale** 分类下，旧版节点在
-**SeeThrough/LayerUpscale/Legacy**。
+Restart ComfyUI. New nodes appear under **SeeThrough/LayerUpscale**, legacy
+nodes under **SeeThrough/LayerUpscale/Legacy**.
 
-## 工作流
+## Workflows
 
-| 文件 | 说明 |
+| File | Description |
 |---|---|
-| `workflow/seethrough-tile-flow-simple.json` | 四步流水线：`STLU_SimpleInput` → SeeThrough 自动拆层 → `STLU_TilePSD` / `STLU_WaveIndex` → `STLU_TileMerge` → `STLU_PSDPreview`。节点最少，适合直接用。 |
-| `workflow/seethrough-tile-flow.json` | 透明版：① 计划与切块、② 顺序拆层、③ 存盘、④ 合并各是一个子图，⑤ 预览单独显示；每个内部步骤都是可见节点。 |
+| `workflow/seethrough-tile-flow-simple.json` | Four-step pipeline: `STLU_SimpleInput` → SeeThrough automatic layer generation → `STLU_TilePSD` / `STLU_WaveIndex` → `STLU_TileMerge` → `STLU_PSDPreview`. Fewest nodes, good for direct use. |
+| `workflow/seethrough-tile-flow.json` | Transparent variant: ① plan & crop, ② sequential layer generation, ③ save, ④ merge are each a subgraph; ⑤ preview is separate. Every inner step is a visible node. |
 
-两套工作流读同一份 `settings` 参数、写同一种输出目录，结果可以互相接手。
+Both workflows read the same `settings` parameters and write the same output
+layout, so results can be picked up by either of them.
 
-## 快速开始
+## Quick start
 
-1. 打开上面的工作流，在 `LoadImage` 里选原图。
-2. 在 **① 用户输入** 面板里：
-   - 设置块宽 / 块高 / 重叠（默认 1024 / 1024 / 128）、拆层分辨率与步数（默认 512 / 30）；
-   - 在格子面板里勾选要跑的块（不勾不跑）；
-   - 选输出根目录；每按一次 Queue 是否新建波次文件夹由设置决定；
-   - 选择合并选项（合并名、同名图层是否单独成组、是否导出 depth、是否放入原图）。
-3. 按 **Queue**，② 拆层 → ③ 存 PSD / 写清单 → ④ 合并自动接力。
-4. 结果在 `output/<输出目录>/`；⑤ 预览面板给出全身总览，以及按块 / 按部位的分组。
+1. Open one of the workflows above and pick the source image in `LoadImage`.
+2. In the **① user input** panel:
+   - set tile width / height / overlap (default 1024 / 1024 / 128) and layer
+     resolution / steps (default 512 / 30);
+   - tick the tiles to run in the grid panel (unticked tiles do not run);
+   - choose the output root; whether every Queue creates a new wave folder is a
+     setting;
+   - choose merge options (merge name, group same-named layers, export depth,
+     include the original).
+3. Press **Queue**; ② layer generation → ③ PSD / manifest writing → ④ merge
+   continue automatically.
+4. Results land in `output/<output dir>/`; the ⑤ preview panel shows the full-body
+   overview plus per-tile / per-part groupings.
 
-## 流水线
+## Pipeline
 
-| 阶段 | 做什么 | 简化版节点 | 透明版节点 |
+| Stage | What it does | Simple nodes | Transparent nodes |
 |---|---|---|---|
-| ① 计划与切块 | 规划网格、选块、上下文外扩、写入参数指纹、裁剪 | `STLU_SimpleInput` / `STLU_PipelineInput` | `STLU_PipelineSettings` → `STLU_PlanGrid` → `STLU_PickTiles` → `STLU_PlanContext` → `STLU_PrepareRun` → `STLU_CropTiles` |
-| ② 顺序拆层 | 逐块运行 LayerDiff → Depth → PostProcess，重叠区回填引导 | `STLU_GuidedLayers` | `STLU_SeqTileLoop`（唯一必须留在 Python 里的循环），`STLU_GuideTile` / `STLU_CropBack` 为调试用单块版本 |
-| ③ 存盘 | 恢复锁定部件、逐块写分层 PSD 与分层 PNG、存原图、汇总清单 | `STLU_TilePSD` + `STLU_WaveIndex` | `STLU_RestoreLocks` → `STLU_WriteTilePSD` / `STLU_WriteTileImages` → `STLU_SaveOriginal` → `STLU_WriteManifest` |
-| ④ 合并 | 接缝归属、缩放、整部件例外、分层组装 | `STLU_TileMerge` | `STLU_MergeTiles`（整块算法，保留为单节点） |
-| ⑤ 预览 | 合并 PSD 总览、按块 / 按部位分组 | `STLU_PSDPreview` | 同左，额外接收 ② 的 `guided_inputs` 与 `indices`，显示每块实际喂给模型的输入 |
+| ① plan & crop | Plan the grid, pick tiles, expand context, write the parameter fingerprint, crop | `STLU_SimpleInput` / `STLU_PipelineInput` | `STLU_PipelineSettings` → `STLU_PlanGrid` → `STLU_PickTiles` → `STLU_PlanContext` → `STLU_PrepareRun` → `STLU_CropTiles` |
+| ② sequential layer generation | Run LayerDiff → Depth → PostProcess per tile, guided backfill in the overlap | `STLU_GuidedLayers` | `STLU_SeqTileLoop` (the only loop that must stay in Python); `STLU_GuideTile` / `STLU_CropBack` are single-tile versions for debugging |
+| ③ save | Restore locked parts, write per-tile layered PSD and layered PNG, save the source, summarize manifests | `STLU_TilePSD` + `STLU_WaveIndex` | `STLU_RestoreLocks` → `STLU_WriteTilePSD` / `STLU_WriteTileImages` → `STLU_SaveOriginal` → `STLU_WriteManifest` |
+| ④ merge | Seam ownership, scaling, whole-part exceptions, layered assembly | `STLU_TileMerge` | `STLU_MergeTiles` (whole-tile algorithm, kept as one node) |
+| ⑤ preview | Merged PSD overview, per-tile / per-part grouping | `STLU_PSDPreview` | Same, plus ②'s `guided_inputs` and `indices` to show what each tile actually fed the model |
 
-只在 **①** 上操作；②③④ 的参数 widget 会被锁定，仅显示进度和结果。
+Only edit **①**; the parameter widgets of ②③④ are locked and only show progress
+and results.
 
-## 常用参数
+## Common parameters
 
-| 参数 | 默认 | 作用 |
+| Parameter | Default | Meaning |
 |---|---|---|
-| 块宽 / 块高 / 重叠 | 1024 / 1024 / 128 | 切格大小与重叠像素；重叠供引导回填使用 |
-| 分辨率 / 步数 | 512 / 30 | 单块拆层的分辨率与推理步数 |
-| 深度分辨率 | -1 | `-1` 表示跟随拆层分辨率 |
-| 种子 | 0 | 点「随机」或手填 |
-| 后处理 | — | 左右拆成两半 / LaMa 去背景 |
-| 块外上下文 | 0 | 每块额外向外多裁的像素，0 关闭；用于让块内看到更多身体 |
-| 透明阈值 | 8 | 高级项，判定透明像素的 alpha 门限 |
-| 合并名 / 同名图层单独成组 / depth / 原图 | — | 只影响合并，不触发重新生成 |
+| Tile width / height / overlap | 1024 / 1024 / 128 | Tile size and overlap pixels; the overlap feeds guided backfill |
+| Resolution / steps | 512 / 30 | Per-tile layer resolution and inference steps |
+| Depth resolution | -1 | `-1` follows the layer resolution |
+| Seed | 0 | Click "random" or type a value |
+| Post-process | — | Split left/right into halves / LaMa background removal |
+| Context padding | 0 | Extra pixels cropped around each tile, 0 disables; lets a tile see more of the body |
+| Alpha threshold | 8 | Advanced; alpha cutoff for transparent pixels |
+| Merge name / group same-named layers / depth / original | — | Merge-only, never triggers regeneration |
 
-## 输出结构
+## Output layout
 
 ```text
-<output>/<输出目录>/[<分类>/]
-├─ generation.json         本次运行的参数与指纹
-├─ manifest.json           逐块清单（新生成 / 复用 / 恢复的块）
+<output>/<output dir>/[<category>/]
+├─ generation.json         parameters and fingerprint of this run
+├─ manifest.json           per-tile manifest (new / reused / restored tiles)
 ├─ images/
-│  ├─ images.json          分层 PNG 清单
+│  ├─ images.json          layered PNG manifest
 │  └─ ...
-├─ original.png            原图（如选择保留）
-├─ tile_00_r0_c0.psd       每块的分层 PSD
+├─ original.png            source image (if kept)
+├─ tile_00_r0_c0.psd       per-tile layered PSD
 ├─ tile_00_r0_c0_preview.png
-├─ <合并名>.psd            合并后的整图分层 PSD
-└─ <合并名>_depth.psd      可选的独立 depth PSD（永远不混进彩色 PSD）
+├─ <merge name>.psd        merged full-image layered PSD
+└─ <merge name>_depth.psd  optional separate depth PSD (never mixed into the colour PSD)
 ```
 
-## 缓存、复用与重跑
+## Cache, reuse and re-runs
 
-- 会改变像素的参数（原图、块尺寸 / 重叠、分辨率、步数、深度分辨率、种子、左右
-  拆分、LaMa、透明阈值、拆层 / 深度模型）一旦变化，Queue 时会自动清空该输出目录
-  并重跑全部块，`generation.json` 记录原因。
-- 只改合并选项（同名图层单独成组、是否导出 depth、是否放原图、接缝羽化）不会重跑
-  块，只重新合并。
-- 同一目录里已经生成的块会自动复用：只勾选要重跑的块即可，未勾选的块仍参与合并。
-- 换了原图（即使尺寸相同）不会误用旧块——清单里带源图指纹。
+- If a parameter that changes pixels (source image, tile size / overlap,
+  resolution, steps, depth resolution, seed, left/right split, LaMa, alpha
+  threshold, layer / depth model) changes, Queue clears that output directory and
+  re-runs every tile; `generation.json` records why.
+- Changing only merge options (group same-named layers, export depth, include the
+  original, seam feathering) never re-runs tiles, only re-merges.
+- Tiles already generated in the same directory are reused automatically: tick
+  only the tiles you want re-run; unticked tiles still take part in the merge.
+- Switching the source image (even at the same size) never reuses stale tiles —
+  the manifest carries a source fingerprint.
 
-## 节点总览
+## Other nodes
 
-主流水线之外，包内还提供其他工作流用的节点（分类 **SeeThrough/LayerUpscale**）：
+Outside the main pipeline, the package also provides nodes for other workflows
+(category **SeeThrough/LayerUpscale**):
 
-- `STLU_Plan` / `STLU_UpscaleBatch`：按计划批量放大 SeeThrough 图层并组装 PSD。
-- `STLU_Mask4K` / `STLU_Mask4KBatch`：纯 CPU 的 4K 部件遮罩（引导滤波 + 边缘吸附）。
-- `STLU_EditPartsBatch`：图编辑模型批量抠取 Live2D 部件。
-- `STLU_RebuildPSD`：从已导出的分层图片重建合并 PSD（CPU）。
-- Legacy 分类下的旧节点（`STLU_LoadLayer`、`STLU_ContextBackdrop`、
-  `STLU_FocusCrop`、`STLU_PasteBack`、`STLU_DetailBatch`、`STLU_AssemblePSD`、
-  `STLU_ChromaToAlpha`、`STLU_PartsPSD`、`STLU_TileGrid` 等）保持可用，
-  但不再出现在新流水线里。
+- `STLU_Plan` / `STLU_UpscaleBatch`: batch-upscale SeeThrough layers according to
+  a plan and assemble the PSD.
+- `STLU_Mask4K` / `STLU_Mask4KBatch`: pure-CPU 4K part masks (guided filter + edge
+  snapping).
+- `STLU_EditPartsBatch`: batch-extract Live2D parts with an image-editing model.
+- `STLU_RebuildPSD`: rebuild a merged PSD from exported layer images (CPU).
+- Legacy nodes under the Legacy category (`STLU_LoadLayer`,
+  `STLU_ContextBackdrop`, `STLU_FocusCrop`, `STLU_PasteBack`,
+  `STLU_DetailBatch`, `STLU_AssemblePSD`, `STLU_ChromaToAlpha`,
+  `STLU_PartsPSD`, `STLU_TileGrid`, …) remain usable but no longer appear in the
+  new pipeline.
 
-## 工具
+## Tools
 
 ```bash
-# 构建 / 修复透明版工作流（保留用户调过的 widget 值，可重复执行）
+# Build / repair the transparent workflow (keeps widget values you changed, re-runnable)
 python tools/build_transparent_workflow.py <workflow_dir>
 python tools/build_transparent_workflow.py <workflow_dir> --force
 python tools/build_transparent_workflow.py <workflow_dir> --validate
 
-# 其他工作流生成器
+# Other workflow builders
 python tools/build_batch_workflow.py
 python tools/build_detail_workflow.py
 python tools/build_edit_workflow.py
@@ -145,26 +167,29 @@ python tools/build_mask4k_workflow.py
 python tools/validate_batch_workflow.py <workflow.json>
 ```
 
-## 测试
+## Tests
 
 ```bash
-python tests/run_all.py                 # 全部离线测试
-python tests/run_all.py tile mask4k     # 只跑文件名匹配的测试
+python tests/run_all.py                 # all offline tests
+python tests/run_all.py tile mask4k     # only tests whose file name matches
 ```
 
-全部测试只跑 CPU，写入临时目录，不需要启动 ComfyUI，也不会加载模型。
+All tests run on CPU, write to temporary directories, need no running ComfyUI and
+load no models.
 
-## 前端与 HTTP 接口
+## Frontend and HTTP endpoints
 
-- `web/stlu.js`：① 输入面板、格子勾选、③ 进度、⑤ PSD 预览、锁定部件面板等。
-- `web/stlu_i18n.js` + `locales/en/`：英文界面。
-- `routes.py` 向 ComfyUI 的 prompt server 注册 `/stlu/*` 接口：`ls`、`layers`、
-  `thumb`、`preview`、`reveal`、`open`、`wf`、`imgsize`、`psd_preview`、`locks`、
-  `tiles/*`（grids、grid、images、from_images、dirs、manifest、clear、merge、
-  merge-mixed、strips）、`edit_parts`。
+- `web/stlu.js`: the ① input panel, tile picking, ③ progress, ⑤ PSD preview,
+  locked-parts panel, etc.
+- `web/stlu_i18n.js` + `locales/en/`: English UI.
+- `routes.py` registers `/stlu/*` endpoints on ComfyUI's prompt server: `ls`,
+  `layers`, `thumb`, `preview`, `reveal`, `open`, `wf`, `imgsize`, `psd_preview`,
+  `locks`, `tiles/*` (grids, grid, images, from_images, dirs, manifest, clear,
+  merge, merge-mixed, strips), `edit_parts`.
 
-## 许可
+## License
 
-Apache License 2.0，见 [LICENSE](LICENSE)。
+Apache License 2.0, see [LICENSE](LICENSE).
 
-拆层与深度生成基于 ComfyUI-SeeThrough；本仓库只负责分块调度、分层 PSD 的读写与合并。
+Layer and depth generation is built on ComfyUI-SeeThrough; this repository only
+handles tile scheduling and layered PSD reading, writing and merging.
