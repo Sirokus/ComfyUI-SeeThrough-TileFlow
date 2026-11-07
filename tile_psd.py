@@ -138,24 +138,74 @@ def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
     return out
 
 
-def content_mask(alpha: np.ndarray, threshold: int = DEFAULT_ALPHA_THRESHOLD) -> np.ndarray:
-    """Separate a part's real pixels from SeeThrough's alpha "dust".
+SOLID_ALPHA = 224
+HALO_RADIUS = 12
+SPECK_MIN_AREA = 512
 
-    The model leaves scattered alpha speckles (values well under 64) on the
-    otherwise empty background of every layer.  They are invisible on white
-    but they wreck a layered PSD: every bbox becomes the whole tile, and the
-    cross-tile blend averages the specks into grey haze.  Anything above a
-    much higher floor counts as real content; weaker pixels only survive when
-    they sit next to real content (anti-aliased edges).
+
+def _drop_specks(mask: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Remove isolated low-alpha blobs that no real part could be.
+
+    SeeThrough drops a few dozen pixels of alpha 24-36 around every tile's
+    rim.  They pass any plain threshold, but they are tiny islands detached
+    from the part -- keeping them stretches the layer bbox back out to the
+    whole tile (the "huge blank margins" on headwear/face/nose/mouth).  A real
+    part is either one big blob or contains a solid pixel (a faint eye line
+    still has an opaque core), so keep a connected blob when it spans
+    ``SPECK_MIN_AREA`` pixels or holds any pixel at ``SOLID_ALPHA``.
     """
-    strong_floor = max(int(threshold) * 6, 48)
+    try:
+        from scipy import ndimage
+    except Exception:  # pragma: no cover - scipy ships with ComfyUI
+        return mask
+    labels, count = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
+    if count <= 1:
+        return mask
+    areas = np.bincount(labels.ravel(), minlength=count + 1)
+    keep = areas >= SPECK_MIN_AREA
+    keep[0] = False
+    kept = np.unique(labels[alpha >= SOLID_ALPHA])
+    keep[kept] = True
+    return keep[labels]
+
+
+def content_mask(alpha: np.ndarray, threshold: int = DEFAULT_ALPHA_THRESHOLD) -> np.ndarray:
+    """Separate a part's real pixels from SeeThrough's alpha "dust" and "wash".
+
+    The model leaves two kinds of junk on the otherwise empty background of
+    every layer:
+
+    * scattered alpha speckles (values well under 64) -- "dust";
+    * on layers it is unsure about, a broad translucent field (alpha 64-192)
+      covering most of the tile -- "wash".  ``earwear`` on some tiles is
+      nothing but wash: 61% coverage, not one fully opaque pixel.
+
+    Neither is visible against white on its own, but a layered PSD turns every
+    bbox into the whole tile and the wash tints every flattened preview
+    lavender/pink.  A real part always has a solid core (``SOLID_ALPHA`` and
+    up).  So: drop the dust, and when a layer has no core at all, or its faint
+    field swamps the core, keep only the core plus an anti-aliased rim.
+    """
+    alpha = np.asarray(alpha)
     weak = alpha > int(threshold)
-    strong = alpha > strong_floor
-    if not strong.any():
-        # No solid pixel at all: either a faint-but-real part, or nothing but
-        # grain.  A handful of speckles is grain; a real part covers area.
-        return weak if int(weak.sum()) >= 512 else np.zeros_like(weak)
-    return weak & _dilate(strong, 4)
+    if not weak.any():
+        return np.zeros(alpha.shape, dtype=bool)
+    weak = _drop_specks(weak, alpha)
+    if not weak.any():
+        return np.zeros(alpha.shape, dtype=bool)
+    solid = alpha >= SOLID_ALPHA
+    if not solid.any():
+        # No solid pixel at all.  A broad translucent field is a wash; a
+        # small faint part can still be real (a handful of speckles is grain).
+        if float(weak.mean()) > 0.05:
+            return np.zeros(alpha.shape, dtype=bool)
+        return weak if int(weak.sum()) >= 512 else np.zeros(alpha.shape, dtype=bool)
+    coverage = float(weak.mean())
+    core = float(solid.mean())
+    if coverage > max(2.0 * core, core + 0.10):
+        # Faint field swamps the core -- keep the core and its soft rim only.
+        return weak & _dilate(solid, HALO_RADIUS)
+    return weak
 
 
 def _clean_part(
@@ -172,7 +222,12 @@ def _clean_part(
     mask = content_mask(arr[..., 3], int(alpha_threshold))
     if not mask.any():
         return None
-    arr[..., 3][~mask] = 0
+    dead = ~mask
+    # Straight-alpha RGBA keeps colour under alpha 0; resampling (thumbnails,
+    # LANCZOS, the web preview) bleeds that hidden colour into visible pixels
+    # as pink fringes.  Whitening the dead pixels keeps every flatten white.
+    arr[..., 3][dead] = 0
+    arr[..., :3][dead] = 255
     ys, xs = np.where(mask)
     bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
     return arr, bbox
@@ -872,12 +927,17 @@ class ClearFailed(RuntimeError):
         self.run_dir = str(run_dir)
         self.failures = [(str(path), str(reason)) for path, reason in failures]
         names = [os.path.basename(path) for path, _reason in self.failures[:3]]
-        more = ("" if len(self.failures) <= 3
-                else "（另有 %d 个）" % (len(self.failures) - 3))
+        extra = len(self.failures) - 3
+        more = "" if extra <= 0 else "（另有 %d 个）" % extra
+        more_en = "" if extra <= 0 else " (%d more)" % extra
         super().__init__(
             "输出目录里有文件无法删除（可能被 Photoshop / 资源管理器占用）：%s%s。"
             "请关闭占用程序后重新 Queue。目录：%s"
-            % (", ".join(names) or "?", more, self.run_dir))
+            " / some files in the output folder cannot be deleted (they may be"
+            " locked by Photoshop or Explorer): %s%s; close the program using"
+            " them and queue again. Folder: %s"
+            % (", ".join(names) or "?", more, self.run_dir,
+               ", ".join(names) or "?", more_en, self.run_dir))
 
 
 def verify_run_cleared(run_dir: str) -> None:
@@ -2822,7 +2882,10 @@ def merge_tiles(
         if not colour_layers:
             raise ValueError("merge produced no non-empty layers")
         notes.append("同名图层单独成组：%d 个部位 / %d 层（未裁剪）"
-                     % (len(colour_layers), copy_count))
+                     " / same-named layers grouped: %d parts, %d layers"
+                     " (uncropped)"
+                     % (len(colour_layers), copy_count,
+                        len(colour_layers), copy_count))
     else:
         # Far -> near (bottom -> top); larger depth == farther away.
         order = sorted(pieces_by_name,
@@ -3221,6 +3284,7 @@ def write_tile_images(
     run_dir_abs: Optional[str] = None,
     original_rel: Optional[str] = None,
     write_index: bool = True,
+    alpha_threshold: int = DEFAULT_ALPHA_THRESHOLD,
 ) -> Dict[str, Any]:
     """Write every part of every tile as a plain layered image folder.
 
@@ -3285,6 +3349,12 @@ def write_tile_images(
             img = np.asarray(pinfo["img"], dtype=np.uint8)
             if img.ndim != 3 or img.shape[-1] != 4:
                 continue
+            # Same dust/wash scrub the PSD path gets, so the on-disk layer
+            # PNGs never carry hidden colour under alpha 0 or a wash layer.
+            scrubbed = _clean_part({"img": img}, int(alpha_threshold))
+            if scrubbed is None:
+                continue
+            img = scrubbed[0]
             stem = _safe_stem(str(tag))
             filename = stem + ".png"
             if not _save_png(os.path.join(tile_dir, filename), img, "RGBA"):

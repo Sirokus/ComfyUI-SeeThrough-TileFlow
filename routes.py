@@ -152,6 +152,32 @@ def _thumb_url(full: str, size: int = 96) -> str:
     return ""
 
 
+def _resize_rgba(im: "Image.Image", size: int) -> "Image.Image":
+    """Size an RGBA image down without letting hidden colour leak in.
+
+    A straight-alpha LANCZOS resize averages the colour stored under alpha 0
+    (SeeThrough drops dark hair colour there) into the visible pixels, which
+    is exactly how a clean layer turns into a pink fringe at thumbnail size.
+    Premultiply first, resize, then un-premultiply; fully transparent pixels
+    become white so every backdrop flattens to pure white.
+    """
+    scale = min(size / float(im.width), size / float(im.height), 1.0)
+    w = max(1, int(round(im.width * scale)))
+    h = max(1, int(round(im.height * scale)))
+    arr = np.asarray(im, dtype=np.float32) / 255.0
+    alpha = arr[..., 3:4]
+    prem = np.concatenate([arr[..., :3] * alpha, alpha], axis=2)
+    small = Image.fromarray(
+        np.rint(prem * 255.0).astype(np.uint8), "RGBA"
+    ).resize((w, h), Image.Resampling.LANCZOS)
+    out = np.asarray(small, dtype=np.float32) / 255.0
+    alpha = out[..., 3:4]
+    rgb = np.where(alpha > 1e-6, out[..., :3] / np.maximum(alpha, 1e-6), 1.0)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return Image.fromarray(
+        np.rint(np.concatenate([rgb, alpha], axis=2) * 255.0).astype(np.uint8), "RGBA")
+
+
 def _render_thumb(full: str, size: int) -> str:
     root = _scope_root("output")
     cache_dir = os.path.join(root, THUMB_DIR)
@@ -164,8 +190,12 @@ def _render_thumb(full: str, size: int) -> str:
     cache = os.path.join(cache_dir, key + ".png")
     if not os.path.isfile(cache):
         with Image.open(full) as im:
-            im = im.convert("RGBA")
-            im.thumbnail((size, size), Image.Resampling.LANCZOS)
+            if im.mode in ("RGBA", "LA") or (
+                    im.mode == "P" and "transparency" in im.info):
+                im = _resize_rgba(im.convert("RGBA"), size)
+            else:
+                im = im.convert("RGB")
+                im.thumbnail((size, size), Image.Resampling.LANCZOS)
             im.save(cache, format="PNG", compress_level=6)
         _prune_thumbs(cache_dir)
     return cache
@@ -413,15 +443,7 @@ def _build_preview(args: Dict[str, Any]) -> Dict[str, Any]:
     canvas, psd_layers, notes = core_compose.build_canvas(plan, _scope_root("output"))
 
     height, width = canvas.shape[:2]
-    max_side = args["max_side"]
-    if max(width, height) > max_side:
-        factor = float(max_side) / float(max(width, height))
-        image = Image.fromarray(canvas, "RGBA").resize(
-            (max(1, int(round(width * factor))), max(1, int(round(height * factor)))),
-            Image.Resampling.LANCZOS,
-        )
-    else:
-        image = Image.fromarray(canvas, "RGBA")
+    image = _resize_rgba(Image.fromarray(canvas, "RGBA"), int(args["max_side"]))
 
     preview_dir = os.path.join(_scope_root("output"), PREVIEW_DIR)
     os.makedirs(preview_dir, exist_ok=True)
@@ -1260,13 +1282,13 @@ def _subject_for_plan(full: str) -> Dict[str, Any]:
 
 
 def _strip_plan_payload(full: str, overlap: int, max_side: int,
-                        max_resolution: int, margin: int) -> Dict[str, Any]:
+                        resolution: int, margin: int) -> Dict[str, Any]:
     """CPU-only plan work (runs in a worker thread)."""
     detected = _subject_for_plan(full)
     plan = tile_strips.plan_from_subject(
         detected["width"], detected["height"], detected["subject"],
         overlap=int(overlap), max_side=int(max_side),
-        max_resolution=int(max_resolution), margin=int(margin))
+        margin=int(margin), resolution=int(resolution))
     return tile_strips.public_plan(
         plan, detected["width"], detected["height"])
 
@@ -1286,17 +1308,17 @@ async def tiles_strips(request: web.Request) -> web.Response:
         return _json_error(exc.text or "invalid path", exc.status)
     overlap = _query_int(request, "overlap", 256)
     max_side = _query_int(request, "max_side", 2048)
-    max_resolution = _query_int(request, "max_resolution", 768)
+    resolution = _query_int(request, "resolution", 512)
     margin = _query_int(request, "margin", 32)
     try:
         key = _file_identity(full) + (
-            overlap, max_side, max_resolution, margin)
+            overlap, max_side, resolution, margin)
         payload = _STRIP_PLAN_CACHE.get(key)
         if payload is None:
             loop = asyncio.get_running_loop()
             payload = await loop.run_in_executor(
                 None, _strip_plan_payload, full, overlap, max_side,
-                max_resolution, margin)
+                resolution, margin)
             if len(_STRIP_PLAN_CACHE) >= _STRIP_PLAN_CACHE_MAX:
                 _STRIP_PLAN_CACHE.pop(next(iter(_STRIP_PLAN_CACHE)))
             _STRIP_PLAN_CACHE[key] = payload
@@ -1410,6 +1432,15 @@ def _split_thumb(layer: Dict[str, Any], stem: str, version: str, limit: int
     px = np.asarray(layer.get("pixels"))
     if px.ndim != 3 or px.shape[-1] != 4 or not px[..., 3].any():
         return None
+    # Crop to real content: a layer saved before the dust fix is a full tile
+    # with a handful of rim speckles, and a plain >0 bbox would keep it huge.
+    mask = tile_psd.content_mask(px[..., 3])
+    if not mask.any():
+        return None
+    if not mask.all():
+        rows = np.nonzero(mask.any(axis=1))[0]
+        cols = np.nonzero(mask.any(axis=0))[0]
+        px = px[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
     image, size = _write_group_png(px, stem, version, limit)
     return {"image": image, "size": size}
 
@@ -1502,12 +1533,38 @@ def _psd_target(path: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
     return full, tile_psd.read_manifest(run_dir), run_dir
 
 
+def _guide_files(run_dir: str) -> Dict[int, str]:
+    """Per-tile model inputs ⑤ kept next to the run, keyed by grid index.
+
+    ``_guide/inputs.json`` lists the tiles this run actually produced, so a
+    picture left over from an earlier (larger) grid is never shown.
+    """
+    folder = os.path.join(run_dir, "_guide")
+    try:
+        with open(os.path.join(folder, "inputs.json"),
+                  "r", encoding="utf-8") as fh:
+            indices = json.load(fh).get("indices") or []
+    except (OSError, ValueError):
+        return {}
+    out: Dict[int, str] = {}
+    for raw in indices:
+        try:
+            index = int(raw)
+        except (TypeError, ValueError):
+            continue
+        path = os.path.join(folder, "stlu_guide_%02d.png" % index)
+        if os.path.isfile(path):
+            out[index] = path
+    return out
+
+
 def _psd_tile_groups(run_dir: str, manifest: Optional[Dict[str, Any]],
                      limit: int) -> List[Dict[str, Any]]:
     entries = (manifest or {}).get("tiles") or []
     if not entries:
         return []
     coords = tile_psd._coords_from_manifest(manifest)
+    guides = _guide_files(run_dir)
     groups: List[Dict[str, Any]] = []
     for entry in sorted(entries, key=lambda e: int(e.get("index") or 0)):
         index = int(entry.get("index") or 0)
@@ -1547,6 +1604,11 @@ def _psd_tile_groups(run_dir: str, manifest: Optional[Dict[str, Any]],
             "image": image,
             "thumb": thumb,
             "split": split,
+            # Model input for this tile, persisted by ⑤ so a refreshed page
+            # still shows it (the live payload is gone by then).
+            "guide": _image_ref(guides[index]) if index in guides else None,
+            "guide_thumb": (_thumb_url(guides[index], 192)
+                            if index in guides else ""),
         })
     return groups
 
@@ -1615,10 +1677,11 @@ def _psd_part_groups(psd_path: str, manifest: Optional[Dict[str, Any]],
                 canvas, np.asarray(layer["pixels"]),
                 int(layer["left"]) - left, int(layer["top"]) - top)
         alpha = canvas[..., 3]
-        rows = np.nonzero((alpha > threshold).any(axis=1))[0]
-        cols = np.nonzero((alpha > threshold).any(axis=0))[0]
-        if not rows.size or not cols.size:
+        mask = tile_psd.content_mask(alpha, threshold)
+        if not mask.any():
             continue
+        rows = np.nonzero(mask.any(axis=1))[0]
+        cols = np.nonzero(mask.any(axis=0))[0]
         crop = canvas[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
         image, size = _write_group_png(crop, "part_" + key, version, limit)
         split: List[Dict[str, Any]] = []
@@ -1718,7 +1781,15 @@ async def psd_preview(request: web.Request) -> web.Response:
     except (OSError, FileNotFoundError) as exc:
         return _json_error(str(exc), 404)
 
-    key = (psd_path, stat.st_mtime_ns, stat.st_size, max_side, mode)
+    # The per-tile inputs land in the run folder after the PSD does, so the
+    # cached payload must be invalidated when that list changes.
+    try:
+        guide_stamp = os.stat(
+            os.path.join(_run_dir, "_guide", "inputs.json")).st_mtime_ns
+    except OSError:
+        guide_stamp = 0
+    key = (psd_path, stat.st_mtime_ns, stat.st_size, max_side, mode,
+           guide_stamp)
     payload = _PSD_PREVIEW_CACHE.get(key)
     if payload is None:
         loop = asyncio.get_running_loop()
@@ -1807,13 +1878,16 @@ def _preview_tile_layers(run_dir: str, manifest: Optional[Dict[str, Any]],
     tile_path = tile_psd.find_tile_psd(run_dir, prefix, tile)
     if not tile_path:
         result = (None, "找不到块 %02d 的 PSD；先在「按块」里确认这一块已经生成"
-                  % tile)
+                  " / PSD for tile %02d not found; first confirm this tile has"
+                  " been generated in the \"By tile\" view." % (tile, tile))
     else:
         try:
             data = psd_reader.read_psd(tile_path)
         except Exception as exc:  # noqa: BLE001
             result = (None, "无法读取 %s：%s"
-                      % (os.path.basename(tile_path), exc))
+                      " / cannot read %s: %s"
+                      % (os.path.basename(tile_path), exc,
+                         os.path.basename(tile_path), exc))
         else:
             result = ([layer for layer in data.get("layers") or []
                        if str(layer.get("kind") or "layer") == "layer"
@@ -1832,10 +1906,13 @@ def _lock_preview_layer(run_dir: str, manifest: Optional[Dict[str, Any]],
         return error
     layer = _find_tile_layer(layers or [], name, tile)
     if layer is None:
-        return "块 %02d 的 PSD 里没有名为 %s 的图层" % (tile, name)
+        return ("块 %02d 的 PSD 里没有名为 %s 的图层"
+                " / the PSD of tile %02d has no layer named %s"
+                % (tile, name, tile, name))
     palette = np.asarray(layer.get("pixels"))
     if palette.ndim != 3 or palette.shape[-1] != 4:
-        return "图层 %s 没有可保存的 RGBA 像素" % name
+        return ("图层 %s 没有可保存的 RGBA 像素 / layer %s has no RGBA pixels"
+                " to save" % (name, name))
     entry = _tile_manifest_entry(manifest, tile) or {}
     depth_median = 1.0
     for item in entry.get("layers") or []:
@@ -1861,7 +1938,7 @@ def _lock_preview_layer(run_dir: str, manifest: Optional[Dict[str, Any]],
             source=(manifest or {}).get("source"),
             depth=depth, depth_median=depth_median)
     except (OSError, ValueError) as exc:
-        return "锁定失败：%s" % exc
+        return "锁定失败：%s / lock failed: %s" % (exc, exc)
     print("[STLU] locked tile %d part %s" % (
         tile, layer.get("name")), flush=True)
     return None

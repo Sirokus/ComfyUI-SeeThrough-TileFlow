@@ -1,0 +1,695 @@
+{
+  "STLU_CropBack": {
+    "display_name": "②-3 Crop back (debug)",
+    "description": "②-3 Crop back: tiles padded by context_pad must lose the extra border after generation or the merge geometry is wrong. The ② loop already does this; exposed separately for inspection.",
+    "inputs": {
+      "composite": {
+        "tooltip": "Composite output by the model."
+      },
+      "index": {
+        "tooltip": "This tile's original grid number."
+      },
+      "parts": {
+        "tooltip": "Parts output by the model."
+      },
+      "plan": {
+        "tooltip": "Plan (takes context_boxes and coordinates)."
+      }
+    }
+  },
+  "STLU_CropTiles": {
+    "display_name": "①-5 Crop",
+    "description": "①-5 Crop: cuts the checked tiles (including context_pad) out of the source image per the plan; the output plugs straight into a standard PreviewImage.",
+    "inputs": {
+      "image": {
+        "tooltip": "Source image."
+      },
+      "plan": {
+        "tooltip": "The plan after preparing the run."
+      }
+    }
+  },
+  "STLU_GuideTile": {
+    "display_name": "②-1 Single-tile blend-back (debug)",
+    "description": "②-1 Single-tile blend-back (pure function, exposed for debugging): feathers pixels from already-generated neighbours in the overlap back into this tile. The ② loop calls exactly this at every step.",
+    "inputs": {
+      "generated": {
+        "tooltip": "Already-generated tiles (tile number -> composite); unconnected = no blend-back."
+      },
+      "index": {
+        "tooltip": "This tile's original grid number."
+      },
+      "plan": {
+        "tooltip": "Plan (takes coordinates and guidance settings)."
+      },
+      "tile": {
+        "tooltip": "The tile to blend back into."
+      }
+    }
+  },
+  "STLU_GuidedLayers": {
+    "display_name": "SeeThrough ② Sequential layer split (overlap-guided)",
+    "description": "Sequential layer split: before each tile is generated, pixels from already-generated neighbours in the overlap are blended in and handed to SeeThrough, easing the seams. Parameters come from the ① User input node and its widgets are locked.",
+    "inputs": {
+      "grid_doc": {
+        "tooltip": "The ① document: grid coordinates / overlap / guidance settings."
+      },
+      "indices": {
+        "tooltip": "Original tile numbers, one for each tile."
+      },
+      "tiles": {
+        "tooltip": "Tile list from ① User input (processed tile by tile automatically)."
+      }
+    }
+  },
+  "STLU_MergeTiles": {
+    "display_name": "④ Merge PSD",
+    "description": "④ Merge: combines every tile from the manifest into one layered PSD by seam ownership. The algorithm (seam ownership / scaling / whole-part exceptions / layer assembly) is one unit that cannot be split into small nodes, but everything it did is written to the report output.",
+    "inputs": {
+      "merge_doc": {
+        "tooltip": "The merge_doc output by ③-5 (folder + options)."
+      }
+    }
+  },
+  "STLU_PSDPreview": {
+    "display_name": "SeeThrough ⑤ Preview merged PSD",
+    "description": "Shows the merged PSD. Connect ④'s psd_path or fill in an output folder; the panel gives a full-body overview first, then lists split images grouped by tile / by part. In legacy graphs, connecting ②'s guided_inputs / indices adds an Input thumbnail to each tile row — the image actually fed to the model after guided blend-back. Pure CPU.",
+    "inputs": {
+      "guide_images": {
+        "tooltip": "The ② guided_inputs: the image actually fed to the model after blend-back for each tile; when connected, every row in By tile gains an Input thumbnail."
+      },
+      "guide_indices": {
+        "tooltip": "The ② indices, one for each guided_inputs entry."
+      },
+      "max_side": {
+        "tooltip": "Longest side of the preview; larger images are scaled down, preview only — the PSD is untouched."
+      },
+      "psd_path": {
+        "tooltip": "The PSD path output by ④ merge; an output folder also works."
+      },
+      "show_parts": {
+        "tooltip": "Legacy switch: the panel now always lists split images by tile / by part."
+      }
+    }
+  },
+  "STLU_PickTiles": {
+    "display_name": "①-2 Select tiles",
+    "description": "①-2 Select tiles: turns the cells checked in the panel (select) into the tile numbers for this run, honouring your ordering in custom regions; if nothing is checked it raises an error instead of silently doing nothing.",
+    "inputs": {
+      "plan": {
+        "tooltip": "The STLU_PlanGrid plan."
+      }
+    }
+  },
+  "STLU_PipelineInput": {
+    "display_name": "SeeThrough ① User input (edit only here)",
+    "description": "The only node you need to touch in the whole tiled pipeline: tiling/tile selection, layer-split quality, seed, post-process, output location and merge options all live in its panel. It hands the selected tiles and all parameters to the automatic nodes downstream; the ②③④ widgets are locked and only show progress and results.",
+    "inputs": {
+      "alpha_threshold": {
+        "tooltip": "0-255; pixels below this alpha count as transparent. Default 8; raise it to remove semi-transparent fringes."
+      },
+      "context_pad": {
+        "tooltip": "Context outside the tile (pixels). 0 = off; above 0, each tile is cropped this much wider for the model and cropped back afterwards. Tiles then see more of the body, reducing redraws like legs being completed as a torso; the tiling geometry is unchanged. Changing it regenerates the affected tiles."
+      },
+      "custom_regions": {
+        "tooltip": "Internal: custom square-window JSON (x/y/size/res/name). Maintained by the ① panel canvas editor, no need to fill in."
+      },
+      "depth_model": {
+        "tooltip": "Optional: connect a depth model loader. Swapping the model clears and reruns."
+      },
+      "depth_resolution": {
+        "tooltip": "Depth map resolution; -1 = same as the layer-split resolution, or set it separately (e.g. 768)."
+      },
+      "filename_prefix": {
+        "tooltip": "Filename prefix for each tile PSD, e.g. tile_00_r0_c0.psd."
+      },
+      "grid_offset_x": {
+        "tooltip": "Horizontal grid phase (pixels): shifts the internal vertical cut lines so seams avoid the subject. The panel's Click-to-align fills this in for you; 0 = start at the left edge."
+      },
+      "grid_offset_y": {
+        "tooltip": "Vertical grid phase (pixels): shifts the internal horizontal cut lines. 0 = start at the top edge."
+      },
+      "group": {
+        "tooltip": "Optional second-level category folder; results go into <root>/<category>/."
+      },
+      "group_layers": {
+        "tooltip": "Checked (no-crop): each tile's same-named parts keep their full originals in a same-named folder, with no seam cutting, ghost cleanup or whole-part elimination, so you can fix them later. Unchecked (direct): cut by seam ownership and merged into one layer."
+      },
+      "guide_context": {
+        "tooltip": "During sequential generation, content from already-generated neighbours is blended into the overlap of the current tile before the layer split, so neighbours see the same pixels; only the guided workflow uses this."
+      },
+      "guide_feather": {
+        "tooltip": "Feather width for the blend-back overlap. 0 = hard edge; larger is softer. Default 32."
+      },
+      "guide_strength": {
+        "tooltip": "Blend-back strength (%). 100 = overlap fully takes the previous tile's result, hallucinations included; default 40 is a gentle nudge."
+      },
+      "guide_tolerance": {
+        "tooltip": "Only blend back generated pixels whose average colour differs from the source by no more than this (0-255). Default 16; lower is more conservative; 0 = no filter (risky: carried-in content leaks through)."
+      },
+      "image": {
+        "tooltip": "Reference image, fed from the standard LoadImage above; it is only tiled here, never modified."
+      },
+      "include_depth": {
+        "tooltip": "Also writes a separate <name>_depth.psd; depth never enters the colour PSD."
+      },
+      "include_original": {
+        "tooltip": "Adds the source image layer at the bottom of the merged PSD for reference."
+      },
+      "layerdiff_model": {
+        "tooltip": "Optional: connect a layer-split model loader. Swapping the model clears and reruns."
+      },
+      "merge_name": {
+        "tooltip": "Merged PSD filename (without extension), default merged."
+      },
+      "num_inference_steps": {
+        "tooltip": "Sampling steps for the layer split. 30 is the default compromise; higher is slower without necessarily more detail."
+      },
+      "out_dir": {
+        "tooltip": "Output root relative to output/; results go straight into this folder (no new wave subfolder per run). Tiles already in it are reused: rerun just a few checked tiles and the unchecked ones still join guidance and the merge."
+      },
+      "overlap": {
+        "tooltip": "Pixels of overlap between neighbouring tiles; a sine window smooths seams at merge time. Default 128, 0 = no overlap."
+      },
+      "partition_mode": {
+        "tooltip": "Uniform grid = the original tiling; Square full-width = automatic square strips sized to the subject width, each inference seeing full left and right, so no vertical seam crosses the subject; Custom regions = place square windows by hand on the panel canvas, each enclosing one complete part."
+      },
+      "random_seed": {
+        "tooltip": "Random seed shared by layer split and depth (0-2^32-1, upstream limit). Same image, tile and seed give reproducible results."
+      },
+      "resolution": {
+        "tooltip": "Inference resolution for the layer-split model (512-2048, same as upstream). 512 balances speed and detail; do not raise it when VRAM is tight."
+      },
+      "seam_feather": {
+        "tooltip": "Affects direct merge only (when same-named layers are not grouped): pixels from the losing tile fade out within at most this width beyond the seam, avoiding colour fringes. 0 = hard cut everywhere; default 32."
+      },
+      "select": {
+        "tooltip": "Run only these tiles: all / none / 0-2,5. Clicking cells in the panel writes here; unchecked tiles never run the GPU."
+      },
+      "select_plan": {
+        "tooltip": "Internal: the plan_id of the partition the current select belongs to; maintained by the panel, no need to fill in."
+      },
+      "strip_margin": {
+        "tooltip": "Background margin left around the subject box for the model (pixels). Narrowed automatically when the subject nearly fills the frame."
+      },
+      "strip_max_resolution": {
+        "tooltip": "(Deprecated, kept for legacy workflows) Square partitioning now uses the Resolution from the layer-split quality card; this value no longer affects planning."
+      },
+      "strip_max_side": {
+        "tooltip": "Target side length for square partitioning (pixels). When subject width + margins exceed it, the square grows to cover the full subject width instead of cutting it vertically; the panel shows the actual side length."
+      },
+      "tblr_split": {
+        "tooltip": "Splits left/right asymmetric parts at the centre line into -l / -r for separate edits."
+      },
+      "tile_height": {
+        "tooltip": "Crop height per tile (pixels). Default 1024, usually the same as the tile width."
+      },
+      "tile_width": {
+        "tooltip": "Crop width per tile (pixels). Larger means more detail and more VRAM; default 1024."
+      },
+      "use_lama": {
+        "tooltip": "Uses LaMa to fill parts hidden by nearer layers; when off, occluded areas stay transparent."
+      }
+    }
+  },
+  "STLU_PipelineSettings": {
+    "display_name": "①-0 User input (settings bundle)",
+    "description": "① User input: the panel and every parameter live here, but this node only bundles them into STLU_SETTINGS. Tiling, tile selection, padding, fingerprint checks and cropping happen in the small nodes after it, visible on the graph.",
+    "inputs": {
+      "alpha_threshold": {
+        "tooltip": "0-255; pixels below this alpha count as transparent. Default 8; raise it to remove semi-transparent fringes."
+      },
+      "context_pad": {
+        "tooltip": "Context outside the tile (pixels). 0 = off; above 0, each tile is cropped this much wider for the model and cropped back afterwards. Tiles then see more of the body, reducing redraws like legs being completed as a torso; the tiling geometry is unchanged. Changing it regenerates the affected tiles."
+      },
+      "custom_regions": {
+        "tooltip": "Internal: custom square-window JSON (x/y/size/res/name). Maintained by the ① panel canvas editor, no need to fill in."
+      },
+      "depth_resolution": {
+        "tooltip": "Depth map resolution; -1 = same as the layer-split resolution, or set it separately (e.g. 768)."
+      },
+      "filename_prefix": {
+        "tooltip": "Filename prefix for each tile PSD, e.g. tile_00_r0_c0.psd."
+      },
+      "grid_offset_x": {
+        "tooltip": "Horizontal grid phase (pixels): shifts the internal vertical cut lines so seams avoid the subject. The panel's Click-to-align fills this in for you; 0 = start at the left edge."
+      },
+      "grid_offset_y": {
+        "tooltip": "Vertical grid phase (pixels): shifts the internal horizontal cut lines. 0 = start at the top edge."
+      },
+      "group": {
+        "tooltip": "Optional second-level category folder; results go into <root>/<category>/."
+      },
+      "group_layers": {
+        "tooltip": "Checked (no-crop): each tile's same-named parts keep their full originals in a same-named folder, with no seam cutting, ghost cleanup or whole-part elimination, so you can fix them later. Unchecked (direct): cut by seam ownership and merged into one layer."
+      },
+      "guide_context": {
+        "tooltip": "During sequential generation, content from already-generated neighbours is blended into the overlap of the current tile before the layer split, so neighbours see the same pixels; only the guided workflow uses this."
+      },
+      "guide_feather": {
+        "tooltip": "Feather width for the blend-back overlap. 0 = hard edge; larger is softer. Default 32."
+      },
+      "guide_strength": {
+        "tooltip": "Blend-back strength (%). 100 = overlap fully takes the previous tile's result, hallucinations included; default 40 is a gentle nudge."
+      },
+      "guide_tolerance": {
+        "tooltip": "Only blend back generated pixels whose average colour differs from the source by no more than this (0-255). Default 16; lower is more conservative; 0 = no filter (risky: carried-in content leaks through)."
+      },
+      "image": {
+        "tooltip": "Reference image (used only by the panel to draw the grid; the settings bundle itself does not read it)."
+      },
+      "include_depth": {
+        "tooltip": "Also writes a separate <name>_depth.psd; depth never enters the colour PSD."
+      },
+      "include_original": {
+        "tooltip": "Adds the source image layer at the bottom of the merged PSD for reference."
+      },
+      "merge_name": {
+        "tooltip": "Merged PSD filename (without extension), default merged."
+      },
+      "num_inference_steps": {
+        "tooltip": "Sampling steps for the layer split. 30 is the default compromise; higher is slower without necessarily more detail."
+      },
+      "out_dir": {
+        "tooltip": "Output root relative to output/; results go straight into this folder (no new wave subfolder per run). Tiles already in it are reused: rerun just a few checked tiles and the unchecked ones still join guidance and the merge."
+      },
+      "overlap": {
+        "tooltip": "Pixels of overlap between neighbouring tiles; a sine window smooths seams at merge time. Default 128, 0 = no overlap."
+      },
+      "partition_mode": {
+        "tooltip": "Uniform grid = the original tiling; Square full-width = automatic square strips sized to the subject width, each inference seeing full left and right, so no vertical seam crosses the subject; Custom regions = place square windows by hand on the panel canvas, each enclosing one complete part."
+      },
+      "random_seed": {
+        "tooltip": "Random seed shared by layer split and depth (0-2^32-1, upstream limit). Same image, tile and seed give reproducible results."
+      },
+      "resolution": {
+        "tooltip": "Inference resolution for the layer-split model (512-2048, same as upstream). 512 balances speed and detail; do not raise it when VRAM is tight."
+      },
+      "seam_feather": {
+        "tooltip": "Affects direct merge only (when same-named layers are not grouped): pixels from the losing tile fade out within at most this width beyond the seam, avoiding colour fringes. 0 = hard cut everywhere; default 32."
+      },
+      "select": {
+        "tooltip": "Run only these tiles: all / none / 0-2,5. Clicking cells in the panel writes here; unchecked tiles never run the GPU."
+      },
+      "select_plan": {
+        "tooltip": "Internal: the plan_id of the partition the current select belongs to; maintained by the panel, no need to fill in."
+      },
+      "strip_margin": {
+        "tooltip": "Background margin left around the subject box for the model (pixels). Narrowed automatically when the subject nearly fills the frame."
+      },
+      "strip_max_resolution": {
+        "tooltip": "(Deprecated, kept for legacy workflows) Square partitioning now uses the Resolution from the layer-split quality card; this value no longer affects planning."
+      },
+      "strip_max_side": {
+        "tooltip": "Target side length for square partitioning (pixels). When subject width + margins exceed it, the square grows to cover the full subject width instead of cutting it vertically; the panel shows the actual side length."
+      },
+      "tblr_split": {
+        "tooltip": "Splits left/right asymmetric parts at the centre line into -l / -r for separate edits."
+      },
+      "tile_height": {
+        "tooltip": "Crop height per tile (pixels). Default 1024, usually the same as the tile width."
+      },
+      "tile_width": {
+        "tooltip": "Crop width per tile (pixels). Larger means more detail and more VRAM; default 1024."
+      },
+      "use_lama": {
+        "tooltip": "Uses LaMa to fill parts hidden by nearer layers; when off, occluded areas stay transparent."
+      }
+    }
+  },
+  "STLU_PlanContext": {
+    "display_name": "①-3 Context padding",
+    "description": "①-3 Context padding: with context_pad > 0 each checked tile is cropped this much wider so the model sees more of the body; STLU_CropBack trims it back after generation.",
+    "inputs": {
+      "plan": {
+        "tooltip": "The plan after tile selection."
+      }
+    }
+  },
+  "STLU_PlanGrid": {
+    "display_name": "①-1 Plan grid",
+    "description": "①-1 Plan grid: takes one of three branches from the parameters (uniform grid / square full-width / custom regions) and only computes coordinates — no cropping, no disk writes. A pure function: same image + same parameters always give the same plan.",
+    "inputs": {
+      "depth_model": {
+        "tooltip": "Optional: connect a depth model, same as above."
+      },
+      "image": {
+        "tooltip": "Reference image; only read to compute size and subject position, never cropped."
+      },
+      "layerdiff_model": {
+        "tooltip": "Optional: connect a layer-split model; swapping it enters the fingerprint and clears/reruns."
+      },
+      "settings": {
+        "tooltip": "The STLU_PipelineSettings settings bundle."
+      }
+    }
+  },
+  "STLU_PrepareRun": {
+    "display_name": "①-4 Prepare run",
+    "description": "①-4 Prepare run (the only step that writes to disk): fingerprints this run's parameters and compares them with the old manifest in the folder; when they changed it clears the old results (still running only the checked tiles), writes generation.json and emits the grid notice.",
+    "inputs": {
+      "image": {
+        "tooltip": "Source image; the fingerprint comes from it, so a different image (even of the same size) never reuses old tiles."
+      },
+      "plan": {
+        "tooltip": "The plan after padding."
+      }
+    }
+  },
+  "STLU_RebuildPSD": {
+    "display_name": "SeeThrough ③ Rebuild from images (optional, CPU)",
+    "inputs": {
+      "source": {
+        "tooltip": "An already-generated wave folder / *_layers.json / a single image."
+      },
+      "tiles": {
+        "tooltip": "Rebuild only these tiles, e.g. 0-2,5; leave empty for every tile in the source."
+      }
+    }
+  },
+  "STLU_RestoreLocks": {
+    "display_name": "③-1 Restore locked parts",
+    "description": "③-1 Restore locked parts: reads this tile's panel-locked parts back from the _locks/ snapshot (or an old PSD); read-only, writes nothing.",
+    "inputs": {
+      "index": {
+        "tooltip": "This tile's original grid number."
+      },
+      "parts": {
+        "tooltip": "The ② output; the list expands tile by tile and this node runs once per tile."
+      },
+      "plan": {
+        "tooltip": "Plan (takes folder and tile naming)."
+      }
+    }
+  },
+  "STLU_SaveOriginal": {
+    "display_name": "③-4 Save original",
+    "description": "③-4 Save original: writes one original.png into the run folder (a single copy; images.json points at it).",
+    "inputs": {
+      "image": {
+        "tooltip": "Source image."
+      },
+      "plan": {
+        "tooltip": "Plan (takes the run folder)."
+      }
+    }
+  },
+  "STLU_SaveTiles": {
+    "display_name": "SeeThrough · Legacy: save tile images",
+    "inputs": {
+      "grid": {
+        "tooltip": "The grid path output by STLU_TileGrid (tile positions, source size)."
+      }
+    }
+  },
+  "STLU_SelectTiles": {
+    "display_name": "SeeThrough · Legacy tile select (standalone)",
+    "inputs": {
+      "select": {
+        "tooltip": "Run only these tiles: all / none / 0-2,5; clicking the cells on the node also writes here."
+      }
+    }
+  },
+  "STLU_SeqTileLoop": {
+    "display_name": "②-2 Sequential layer-loop",
+    "description": "②-2 Sequential layer-loop: per tile “blend back → GenerateLayers → GenerateDepth → PostProcess → empty-tile retry → crop back”. Cross-tile state (each result feeds the next tile) cannot be expressed in a loop-free node graph, so this part stays in Python. The extra guided_inputs / composites outputs plug into previews to show what each tile actually fed the model.",
+    "inputs": {
+      "depth_model": {
+        "tooltip": "Depth model loader."
+      },
+      "indices": {
+        "tooltip": "Tile numbers, one for each tile."
+      },
+      "layerdiff_model": {
+        "tooltip": "Layer-split model loader."
+      },
+      "plan": {
+        "tooltip": "Plan: coordinates / guidance settings / resolution / seed."
+      },
+      "tiles": {
+        "tooltip": "The list of tiles cropped by ①."
+      }
+    }
+  },
+  "STLU_SimpleInput": {
+    "display_name": "SeeThrough ① User input (simple)",
+    "description": "Simple ①: only the switches the four-stage pipeline actually uses (tiling/tile selection, layer-split quality, partitioning, post-process, output and merge); sequential guidance and context padding are removed. Planning, caching and grid_doc are the same code as the full version.",
+    "inputs": {
+      "alpha_threshold": {
+        "tooltip": "0-255; pixels below this alpha count as transparent. Default 8; raise it to remove semi-transparent fringes."
+      },
+      "custom_regions": {
+        "tooltip": "Internal: custom square-window JSON (x/y/size/res/name). Maintained by the ① panel canvas editor, no need to fill in."
+      },
+      "depth_model": {
+        "tooltip": "Optional: connect a depth model loader. Swapping the model clears and reruns."
+      },
+      "depth_resolution": {
+        "tooltip": "Depth map resolution; -1 = same as the layer-split resolution, or set it separately (e.g. 768)."
+      },
+      "filename_prefix": {
+        "tooltip": "Filename prefix for each tile PSD, e.g. tile_00_r0_c0.psd."
+      },
+      "grid_offset_x": {
+        "tooltip": "Horizontal grid phase (pixels): shifts the internal vertical cut lines so seams avoid the subject. The panel's Click-to-align fills this in for you; 0 = start at the left edge."
+      },
+      "grid_offset_y": {
+        "tooltip": "Vertical grid phase (pixels): shifts the internal horizontal cut lines. 0 = start at the top edge."
+      },
+      "group": {
+        "tooltip": "Optional second-level category folder; results go into <root>/<category>/."
+      },
+      "group_layers": {
+        "tooltip": "Checked (no-crop): each tile's same-named parts keep their full originals in a same-named folder, with no seam cutting, ghost cleanup or whole-part elimination, so you can fix them later. Unchecked (direct): cut by seam ownership and merged into one layer."
+      },
+      "image": {
+        "tooltip": "Reference image, fed from the standard LoadImage above; it is only tiled here, never modified."
+      },
+      "include_depth": {
+        "tooltip": "Also writes a separate <name>_depth.psd; depth never enters the colour PSD."
+      },
+      "include_original": {
+        "tooltip": "Adds the source image layer at the bottom of the merged PSD for reference."
+      },
+      "layerdiff_model": {
+        "tooltip": "Optional: connect a layer-split model loader. Swapping the model clears and reruns."
+      },
+      "merge_name": {
+        "tooltip": "Merged PSD filename (without extension), default merged."
+      },
+      "num_inference_steps": {
+        "tooltip": "Sampling steps for the layer split. 30 is the default compromise; higher is slower without necessarily more detail."
+      },
+      "out_dir": {
+        "tooltip": "Output root relative to output/; results go straight into this folder (no new wave subfolder per run). Tiles already in it are reused: rerun just a few checked tiles and the unchecked ones still join guidance and the merge."
+      },
+      "overlap": {
+        "tooltip": "Pixels of overlap between neighbouring tiles; a sine window smooths seams at merge time. Default 128, 0 = no overlap."
+      },
+      "partition_mode": {
+        "tooltip": "Uniform grid = the original tiling; Square full-width = automatic square strips sized to the subject width, each inference seeing full left and right, so no vertical seam crosses the subject; Custom regions = place square windows by hand on the panel canvas, each enclosing one complete part."
+      },
+      "random_seed": {
+        "tooltip": "Random seed shared by layer split and depth (0-2^32-1, upstream limit). Same image, tile and seed give reproducible results."
+      },
+      "resolution": {
+        "tooltip": "Inference resolution for the layer-split model (512-2048, same as upstream). 512 balances speed and detail; do not raise it when VRAM is tight."
+      },
+      "seam_feather": {
+        "tooltip": "Affects direct merge only (when same-named layers are not grouped): pixels from the losing tile fade out within at most this width beyond the seam, avoiding colour fringes. 0 = hard cut everywhere; default 32."
+      },
+      "select": {
+        "tooltip": "Run only these tiles: all / none / 0-2,5. Clicking cells in the panel writes here; unchecked tiles never run the GPU."
+      },
+      "select_plan": {
+        "tooltip": "Internal: the plan_id of the partition the current select belongs to; maintained by the panel, no need to fill in."
+      },
+      "strip_margin": {
+        "tooltip": "Background margin left around the subject box for the model (pixels). Narrowed automatically when the subject nearly fills the frame."
+      },
+      "strip_max_side": {
+        "tooltip": "Target side length for square partitioning (pixels). When subject width + margins exceed it, the square grows to cover the full subject width instead of cutting it vertically; the panel shows the actual side length."
+      },
+      "tblr_split": {
+        "tooltip": "Splits left/right asymmetric parts at the centre line into -l / -r for separate edits."
+      },
+      "tile_height": {
+        "tooltip": "Crop height per tile (pixels). Default 1024, usually the same as the tile width."
+      },
+      "tile_width": {
+        "tooltip": "Crop width per tile (pixels). Larger means more detail and more VRAM; default 1024."
+      },
+      "use_lama": {
+        "tooltip": "Uses LaMa to fill parts hidden by nearer layers; when off, occluded areas stay transparent."
+      }
+    }
+  },
+  "STLU_TileGrid": {
+    "display_name": "SeeThrough ① Grid + tile select",
+    "inputs": {
+      "overlap": {
+        "tooltip": "Pixels of overlap between neighbouring tiles; a sine window smooths seams at merge time."
+      },
+      "select": {
+        "tooltip": "Run only these tiles: all / none / 0-2,5; clicking the cells on the node also writes here."
+      }
+    }
+  },
+  "STLU_TileMerge": {
+    "display_name": "SeeThrough ④ Merge tile PSDs",
+    "inputs": {
+      "group_layers": {
+        "tooltip": "Checked (no-crop): each tile's same-named parts keep their full originals in a same-named folder for later fixes. Unchecked (direct): cut by seam ownership and merged into one layer."
+      },
+      "include_depth": {
+        "tooltip": "Exports a separate <name>_depth.psd; uncheck to skip it. depth never enters the colour PSD."
+      },
+      "include_original": {
+        "tooltip": "Adds the source image layer at the bottom of the merged PSD"
+      },
+      "merge_doc": {
+        "tooltip": "The document output by ③ Write manifest: output folder + merge name/options. When connected this node merges automatically (including tiles already cached in the folder) and the panel only shows results."
+      },
+      "run_dir": {
+        "tooltip": "Run folder holding the tile PSDs (relative to output/, or an absolute path)."
+      },
+      "seam_feather": {
+        "tooltip": "Direct merge only: the losing tile fades out within at most this width beyond the seam. Not used when same-named layers are grouped. 0 = hard cut everywhere; when ③ is connected the ① value wins."
+      }
+    }
+  },
+  "STLU_TilePSD": {
+    "display_name": "SeeThrough ③ Save per-tile PSD (auto per tile)",
+    "inputs": {
+      "alpha_threshold": {
+        "tooltip": "Pixels below this alpha count as transparent; default 8, usually the same as ①."
+      },
+      "grid_doc": {
+        "tooltip": "The ① document: tile size / source size / output path / merge options."
+      },
+      "index": {
+        "tooltip": "This tile's index in the source grid (from ①'s indices); used to name tile_XX and place the blend-back."
+      },
+      "parts": {
+        "tooltip": "Parts output by the ② PostProcess; the list expands tile by tile and this node runs once per tile."
+      },
+      "wave_doc": {
+        "tooltip": "Legacy STLU_Wave document; not needed in the new flow — the output path is already in grid_doc."
+      }
+    }
+  },
+  "STLU_TileSelect": {
+    "display_name": "SeeThrough · Legacy grid select"
+  },
+  "STLU_TilesPSD": {
+    "display_name": "SeeThrough · Legacy ③ Images → tile PSDs",
+    "inputs": {
+      "grid": {
+        "tooltip": "Connect ①'s grid_doc (the in-memory grid document, not written to disk); legacy workflows may fill a grids/*.json path instead."
+      },
+      "group": {
+        "tooltip": "Category prefix (optional): results go into SeeThrough/<prefix>/<this run id>/."
+      },
+      "group_layers": {
+        "tooltip": "Always on (legacy workflows): tile PSDs always keep hairf/hairb sub-layers and ④ decides whether to merge or group them."
+      },
+      "include_original": {
+        "tooltip": "Always on (legacy workflows): the source image is saved with the wave for ④'s background layer."
+      },
+      "merge_parts": {
+        "tooltip": "Retired (legacy workflows): ③ always kept eyel/eyer, hairf/hairb sub-layers for ④ to merge by name."
+      },
+      "merged_psd": {
+        "tooltip": "Retired (legacy workflows): all merging happens in ④; nothing is merged here."
+      },
+      "source": {
+        "tooltip": "An already-generated images folder / *_layers.json / a single image; leave empty to use the parts input."
+      },
+      "tiles": {
+        "tooltip": "Rebuild only these tiles, e.g. 0-2,5; leave empty for every tile in the source."
+      },
+      "write_depth": {
+        "tooltip": "Always on (legacy workflows): every tile saves depth.png so ④ can write a separate depth PSD."
+      }
+    }
+  },
+  "STLU_Wave": {
+    "display_name": "SeeThrough ③ Output folder (new per run)",
+    "inputs": {
+      "filename_prefix": {
+        "tooltip": "Filename prefix for each tile PSD"
+      },
+      "group": {
+        "tooltip": "Category prefix (optional): results go into <out_dir>/<prefix>/<wave>/."
+      },
+      "out_dir": {
+        "tooltip": "Root folder relative to output/"
+      }
+    }
+  },
+  "STLU_WaveIndex": {
+    "display_name": "SeeThrough ③ Write manifest (after all tiles)",
+    "inputs": {
+      "grid_doc": {
+        "tooltip": "The ① document: source size / tile size / output path / merge options."
+      },
+      "original": {
+        "tooltip": "The ① source image; writes one original.png into the output root and points images.json at it."
+      },
+      "tiles": {
+        "tooltip": "Records returned by ③ TilePSD for each tile (list); collected into manifest.json."
+      },
+      "wave_doc": {
+        "tooltip": "Legacy STLU_Wave document; not needed in the new flow."
+      }
+    }
+  },
+  "STLU_WriteManifest": {
+    "display_name": "③-5 Write manifest",
+    "description": "③-5 Write manifest: collects every tile's records into manifest.json / images.json; it also folds in tiles already generated in the same folder by an earlier round (so a partial rerun still describes the whole image) and restores tiles with locked parts that fell out of the selection. Emits merge_doc for ④.",
+    "inputs": {
+      "images": {
+        "tooltip": "Image entries returned per tile."
+      },
+      "original": {
+        "tooltip": "Filename of the original.png written by ③-4."
+      },
+      "plan": {
+        "tooltip": "Plan (takes folder / merge options / fingerprint)."
+      },
+      "tiles": {
+        "tooltip": "Records returned per tile (auto-collected into a list)."
+      }
+    }
+  },
+  "STLU_WriteTileImages": {
+    "display_name": "③-3 Write per-tile layer images",
+    "description": "③-3 Write per-tile layer images: this tile's layered PNG + layers.json (for offline rebuild / second-pass upscaling). Runs once per item when the input is a list.",
+    "inputs": {
+      "index": {
+        "tooltip": "This tile's original grid number."
+      },
+      "parts": {
+        "tooltip": "Parts after ③-1 lock restore."
+      },
+      "plan": {
+        "tooltip": "Plan (takes folder / prefix)."
+      }
+    }
+  },
+  "STLU_WriteTilePSD": {
+    "display_name": "③-2 Write per-tile PSD",
+    "description": "③-2 Write per-tile PSD: this tile's <prefix>_XX_rX_cX.psd, preview, depth and lock snapshot. Runs once per item when the input is a list; its records feed ③-4 Write manifest.",
+    "inputs": {
+      "index": {
+        "tooltip": "This tile's original grid number."
+      },
+      "parts": {
+        "tooltip": "Parts after ③-1 lock restore."
+      },
+      "plan": {
+        "tooltip": "Plan (takes folder / prefix / alpha threshold)."
+      }
+    }
+  }
+}

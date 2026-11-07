@@ -24,6 +24,13 @@
   const TILE_MERGE = "STLU_TileMerge";
   const TILE_GRID = "STLU_TileGrid";
   const PIPELINE = "STLU_PipelineInput";
+  // The transparent variant splits stage ① into visible nodes; the same grid
+  // panel lives on its settings node so the user still has one place to edit.
+  const PIPELINE_SETTINGS = "STLU_PipelineSettings";
+  // The lightweight ① node: same planner, fewer knobs.  Optional controls are
+  // hidden by widget presence, so this only needs to be recognized as a
+  // pipeline node.
+  const SIMPLE = "STLU_SimpleInput";
   // Subject strips: one inference sees the whole subject width.  Kept as a
   // literal so the panel, the route and the Python widget use one spelling.
   const STRIPS_MODE = "方形全宽分区";
@@ -125,6 +132,8 @@
   .stlu-focusctx{flex:0 1 150px;font-size:11px;}
   .stlu-focusprompt{margin-top:2px;}
   .stlu-focusprompt summary{cursor:pointer;}
+  .stlu-hints summary{cursor:pointer;color:#9a9a9a;}
+  .stlu-hints .stlu-hint{white-space:normal;line-height:1.5;margin:2px 0;}
   .stlu-promptarea{width:100%;box-sizing:border-box;resize:vertical;margin-top:3px;
     font:11px/1.45 ui-monospace,Consolas,monospace;
     background:#0e0e0f;color:#ddd;border:1px solid #3a3a3c;border-radius:4px;padding:4px 6px;}
@@ -345,10 +354,20 @@
     return data || {};
   }
 
+  // stlu_i18n.js loads after this file, so never cache the module at top level.
+  function i18n() {
+    return window.STLU_I18N || null;
+  }
+
+  function tr(text) {
+    const m = i18n();
+    return m && m.enabled ? m.t(text) : text;
+  }
+
   function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
-    if (text != null) node.textContent = text;
+    if (text != null) node.textContent = tr(text);
     return node;
   }
 
@@ -577,6 +596,8 @@
       dom.options = dom.options || {};
       dom.options.serialize = false;
     }
+    const m = i18n();
+    if (m && m.enabled && root) m.watch(root);
     return dom;
   }
 
@@ -727,7 +748,7 @@
       dirs = (data.dirs || []).filter((entry) => entry.dir && entry.count);
     } catch (e) { dirs = []; }
     if (!dirs.length) {
-      window.alert("还没有可分格合并的波次：先跑一次 ③。");
+      window.alert(tr("还没有可分格合并的波次：先跑一次 ③。"));
       return;
     }
     const manifests = new Map();
@@ -739,7 +760,7 @@
     }));
     const usable = dirs.filter((entry) => manifests.has(entry.dir));
     if (!usable.length) {
-      window.alert("这些波次都没有可读的分块 PSD。");
+      window.alert(tr("这些波次都没有可读的分块 PSD。"));
       return;
     }
 
@@ -1915,7 +1936,8 @@
     if (!ctx.node || !ctx.listEl) return;
     const source = ctx.pathInput.value.trim();
     const rules = String(widgetValue(ctx.node, "size_rules", "") || "");
-    const keepStatus = ctx.statusEl ? ctx.statusEl.textContent : "";
+    const m0 = i18n();
+    const keepStatus = ctx.statusEl ? (m0 ? m0.raw(ctx.statusEl) : ctx.statusEl.textContent) : "";
     if (!ctx.running) setStatus(ctx, "正在读取部件…");
     try {
       const data = await getJson(
@@ -3359,7 +3381,9 @@
     root.style.padding = "6px";
     root.style.gap = "4px";
 
-    const isPipeline = node.type === PIPELINE;
+    const isPipeline = node.type === PIPELINE
+      || node.type === PIPELINE_SETTINGS
+      || node.type === SIMPLE;
 
     const head = el("div", "stlu-line");
     head.appendChild(el("span", "stlu-cardtitle",
@@ -3632,7 +3656,7 @@
       return {
         overlap: Math.max(0, Number(widgetValue(node, "overlap", 128)) || 0),
         max_side: Math.max(512, Number(widgetValue(node, "strip_max_side", 2048)) || 2048),
-        max_resolution: Math.max(512, Number(widgetValue(node, "strip_max_resolution", 768)) || 768),
+        resolution: Math.max(512, Number(widgetValue(node, "resolution", 512)) || 512),
         margin: Math.max(0, Number(widgetValue(node, "strip_margin", 32)) || 0),
       };
     }
@@ -3757,7 +3781,7 @@
       }
       const settings = stripSettings();
       const key = [sourcePath, sourceEpoch, settings.overlap, settings.max_side,
-        settings.max_resolution, settings.margin].join("|");
+        settings.resolution, settings.margin].join("|");
       if (!force && planState && planState.key === key && planState.plan) return;
       const token = ++planToken;
       planInfo.style.display = "";
@@ -3767,7 +3791,7 @@
         path: sourcePath,
         overlap: String(settings.overlap),
         max_side: String(settings.max_side),
-        max_resolution: String(settings.max_resolution),
+        resolution: String(settings.resolution),
         margin: String(settings.margin),
       });
       getJson("/stlu/tiles/strips?" + query.toString())
@@ -3843,6 +3867,8 @@
         alpha_threshold: Number(widgetValue(node, "alpha_threshold", 8)),
         context_pad: Math.max(0, Number(widgetValue(node, "context_pad", 0)) || 0),
         guide: {
+          // The simple node has no guide widgets; the backend fills in the
+          // shared defaults, so these fallbacks must be those defaults.
           enabled: !!widgetValue(node, "guide_context", true),
           feather: Math.max(0, Number(widgetValue(node, "guide_feather", 32)) || 0),
           strength: Math.min(100, Math.max(0, Number(widgetValue(node, "guide_strength", 40)) || 0)),
@@ -4198,7 +4224,7 @@
         } else {
           nextKey = "strips_pending|" + srcW + "|" + srcH + "|" + ov + "|" +
             Number(widgetValue(node, "strip_max_side", 2048)) + "|" +
-            Number(widgetValue(node, "strip_max_resolution", 768)) + "|" +
+            Number(widgetValue(node, "resolution", 512)) + "|" +
             Number(widgetValue(node, "strip_margin", 32));
         }
       }
@@ -4542,7 +4568,7 @@
         watchValue(node, name, layout);
       }
       for (const name of ["partition_mode", "strip_max_side",
-                          "strip_max_resolution", "strip_margin"]) {
+                          "resolution", "strip_margin"]) {
         watchValue(node, name, () => {
           if (pipelineControls) pipelineControls.applyMode();
           schedulePlan(true);
@@ -4575,6 +4601,16 @@
     // node's own widgets are hidden: this panel is the only place to edit.
     function buildPipelineControls() {
       const fields = [];
+
+      // 面板上只留控件；解释性文字统一收进这个折叠区，节点上不再堆注释。
+      const detailsCard = el("details", "stlu-card stlu-hints");
+      detailsCard.style.gap = "4px";
+      detailsCard.appendChild(el("summary", "stlu-cardtitle", "细节说明（点开）"));
+      function hint(text) {
+        const box = el("div", "stlu-hint", text || "");
+        detailsCard.appendChild(box);
+        return box;
+      }
 
       function makeInput(spec) {
         const input = document.createElement("input");
@@ -4660,12 +4696,10 @@
       fields.push({ input: modeSelect, spec: {
         name: "partition_mode", fallback: "均匀网格", kind: "select",
       } });
-      const modeHint = el("div", "stlu-hint",
+      const modeHint = hint(
         "「方形全宽分区」会忽略块宽/块高/偏移和点图对齐；区域最大边是目标值，"
         + "主体更宽时会自动放大到覆盖全宽，不会竖直切开。"
         + "「自定义分区」由你在画面上摆放正方形窗口。切换模式会清空输出目录。");
-      modeHint.style.whiteSpace = "normal";
-      modeCard.appendChild(modeHint);
 
       const cut = card("切格");
       const tileRow = line(cut, [
@@ -4685,39 +4719,32 @@
       alignBtn.addEventListener("click", () => setAlignMode(!alignMode));
       setAlignMode(false);
       alignRow.appendChild(alignBtn);
-      alignRow.appendChild(el("span", "stlu-hint",
-        "接缝切到脸时：点按钮，再点画面上的脸/头部中心。"));
+      alignBtn.title = "接缝切到脸时：点按钮，再点画面上的脸/头部中心。";
+      hint("点图对齐主体：接缝切到脸时，先点「点图对齐主体」，再点画面上的脸/头部中心。");
       cut.appendChild(alignRow);
       const stripRow = line(cut, [
         { label: "区域最大边", name: "strip_max_side", fallback: 2048,
           onChange: () => { schedulePlan(true); layout(); refreshCacheHint(); } },
-        { label: "分辨率上限", name: "strip_max_resolution", fallback: 768,
-          onChange: () => { schedulePlan(true); layout(); refreshCacheHint(); } },
-      ]);
-      const stripRow2 = line(cut, [
         { label: "主体边距", name: "strip_margin", fallback: 32,
           onChange: () => { schedulePlan(true); layout(); refreshCacheHint(); } },
       ]);
-      line(cut, [
-        { label: "块外上下文", name: "context_pad", fallback: 0,
-          onChange: () => { layout(); refreshCacheHint(); } },
-      ]);
-      const contextHint = el("div", "stlu-hint",
-        "0 = 关闭；大于 0 时每块向四周多裁这么多像素送进模型，生成后裁回原条带。"
-        + "让只有腿脚的块也能看到上半身，减少按错误部位补全；不改变分块位置。"
-        + "改它会重新生成相关块。");
-      contextHint.style.whiteSpace = "normal";
-      cut.appendChild(contextHint);
-      const stripHint = el("div", "stlu-hint",
-        "每条都是方形窗口，自动以主体宽度/位置为中心；头部在第一条内完整。"
+      if (widgetOf(node, "context_pad")) {
+        line(cut, [
+          { label: "块外上下文", name: "context_pad", fallback: 0,
+            onChange: () => { layout(); refreshCacheHint(); } },
+        ]);
+        hint(
+          "块外上下文 0 = 关闭；大于 0 时每块向四周多裁这么多像素送进模型，生成后裁回原条带。"
+          + "让只有腿脚的块也能看到上半身，减少按错误部位补全；不改变分块位置。"
+          + "改它会重新生成相关块。");
+      }
+      const stripHint = hint(
+        "方形分区每条都是方形窗口，自动以主体宽度/位置为中心；头部在第一条内完整。"
         + "勾选按原图覆盖区域从旧网格迁移，不会自动扩大；如果迁移后为空，"
         + "面板会标红提示，点「全选」再 Queue。");
-      stripHint.style.whiteSpace = "normal";
-      cut.appendChild(stripHint);
-      const cutHint = el("div", "stlu-hint",
+      const cutHint = hint(
         "让某一块完整包住人物后，合并时这个部位会整块采用那一块，不再被接缝切成两半。"
         + "也可以把重叠调到块宽的一半（块数会增加），让每块看到更多邻居。");
-      cut.appendChild(cutHint);
 
       // --- custom square windows ------------------------------------------
       const customCard = card("自定义正方形窗口（每个包住一个部位）");
@@ -4759,12 +4786,10 @@
 
       const customList = el("div", "stlu-customlist");
       customCard.appendChild(customList);
-      const customHint = el("div", "stlu-hint",
-        "顺序 = 生成顺序；后面的窗口会看到前面窗口在重叠区的结果。"
+      const customHint = hint(
+        "自定义窗口顺序 = 生成顺序；后面的窗口会看到前面窗口在重叠区的结果。"
         + "改位置/边长/分辨率/顺序会清空该目录，只重跑勾选的窗口。"
-        + "分辨率「跟随全局」使用上面的「分辨率」，每个窗口可单独覆盖。");
-      customHint.style.whiteSpace = "normal";
-      customCard.appendChild(customHint);
+        + "分辨率「跟随全局」使用「拆层质量」里的「分辨率」，每个窗口可单独覆盖。");
 
       function updateCustomField(index, patch) {
         const next = customRegions.map((region, row) =>
@@ -4950,11 +4975,11 @@
       seedRow.appendChild(seedBtn);
       quality.appendChild(seedRow);
       line(quality, [{ label: "透明阈值", name: "alpha_threshold", fallback: 8 }]);
-      const qualityHint = el("div", "stlu-hint",
-        "方形全宽分区使用「分辨率上限」计算出的实际分辨率（见分区摘要）；"
-        + "上面的「分辨率」只影响均匀网格。透明阈值同时决定每块 PSD 和合并时的透明判定。"
+      const qualityHint = hint(
+        "「分辨率」是模型推理分辨率，三种分区都用它：均匀网格直接按块裁到该分辨率，"
+        + "方形分区按它推理（分区摘要里显示实际值），自定义窗口「跟随全局」也用它。"
+        + "透明阈值同时决定每块 PSD 和合并时的透明判定。"
         + "换种子不会清空目录：只重跑勾选的块，未勾选的块保留旧种子结果。");
-      quality.appendChild(qualityHint);
 
       const post = card("后处理");
       const postRow = el("div", "stlu-line");
@@ -4963,21 +4988,25 @@
       check(postRow, "用 LaMa 去背景", "use_lama", true);
       post.appendChild(postRow);
 
-      const guide = card("分块引导（只影响生成）");
-      const guideRow = el("div", "stlu-line");
-      guideRow.style.flexWrap = "wrap";
-      check(guideRow, "用已生成相邻块的重叠区做引导", "guide_context", true,
-        "顺序逐块生成时，把先完成的相邻块在重叠区的像素回填到当前块再拆层；"
-        + "只有「引导版」工作流会读取，普通四步流水线忽略。");
-      guide.appendChild(guideRow);
-      line(guide, [
-        { label: "羽化", name: "guide_feather", fallback: 32 },
-        { label: "强度%", name: "guide_strength", fallback: 40 },
-      ]);
-      line(guide, [{ label: "与原图容差", name: "guide_tolerance", fallback: 16 }]);
-      guide.appendChild(el("div", "stlu-hint",
-        "只回填生成结果与原图接近的像素；容差越小越保守，0 = 不过滤（会把补全内容也带过去）。"
-        + "强度 100 会用上一块的补全结果覆盖原图，容易带出不明物体/丢眼睛，建议 30-50。"));
+      // Only the full node exposes the sequential-guide knobs; the simple node
+      // runs the same four-step pipeline without STLU_GuidedLayers, so showing
+      // them there would be dead controls.
+      if (widgetOf(node, "guide_context")) {
+        const guide = card("分块引导（只影响生成）");
+        const guideRow = el("div", "stlu-line");
+        guideRow.style.flexWrap = "wrap";
+        check(guideRow, "用已生成相邻块的重叠区做引导", "guide_context", true,
+          "顺序逐块生成时，把先完成的相邻块在重叠区的像素回填到当前块再拆层；"
+          + "只有「引导版」工作流会读取，普通四步流水线忽略。");
+        guide.appendChild(guideRow);
+        line(guide, [
+          { label: "羽化", name: "guide_feather", fallback: 32 },
+          { label: "强度%", name: "guide_strength", fallback: 40 },
+        ]);
+        line(guide, [{ label: "与原图容差", name: "guide_tolerance", fallback: 16 }]);
+        hint("分块引导：只回填生成结果与原图接近的像素；容差越小越保守，0 = 不过滤（会把补全内容也带过去）。"
+          + "强度 100 会用上一块的补全结果覆盖原图，容易带出不明物体/丢眼睛，建议 30-50。");
+      }
 
       const output = card("输出位置");
       const outRow = el("div", "stlu-line");
@@ -5018,7 +5047,7 @@
       clearBtn.addEventListener("click", async () => {
         const dir = outputDirRel();
         if (!dir) return;
-        if (!window.confirm("清空 " + dir + " 里已生成的切块结果？此操作不可撤销。")) return;
+        if (!window.confirm(tr("清空 " + dir + " 里已生成的切块结果？此操作不可撤销。"))) return;
         clearBtn.disabled = true;
         try {
           const data = await postJson("/stlu/tiles/clear", { dir });
@@ -5060,9 +5089,7 @@
       check(extraRow, "depth 另存 PSD", "include_depth", false);
       check(extraRow, "原图作底图", "include_original", false);
       mergeBox.appendChild(extraRow);
-      const mergeHint = el("div", "stlu-hint", "");
-      mergeHint.style.whiteSpace = "normal";
-      mergeBox.appendChild(mergeHint);
+      const mergeHint = hint("");
       function syncMergeMode() {
         const grouped = !!widgetValue(node, "group_layers", true);
         if (seamInput) {
@@ -5085,6 +5112,9 @@
       groupCb.addEventListener("change", paintMergeHint);
       paintMergeHint();
 
+      // 说明文字统一收在最下面的折叠区。
+      root.appendChild(detailsCard);
+
       for (const w of node.widgets || []) hideWidget(w);
 
       function applyMode() {
@@ -5095,16 +5125,14 @@
         offsetRow.style.display = (strips || custom) ? "none" : "";
         alignRow.style.display = (strips || custom) ? "none" : "";
         stripRow.style.display = strips ? "" : "none";
-        stripRow2.style.display = strips ? "" : "none";
         stripHint.style.display = strips ? "" : "none";
         customCard.style.display = custom ? "" : "none";
-        qualityHint.style.display = (strips || custom) ? "" : "none";
         qualityHint.textContent = custom
-          ? "自定义窗口的「跟随全局」分辨率使用这里的「分辨率」；每个窗口可在列表里单独覆盖。"
+          ? "自定义窗口的「跟随全局」分辨率使用「拆层质量」里的「分辨率」；每个窗口可在列表里单独覆盖。"
             + "透明阈值同时决定每块 PSD 和合并时的透明判定。"
             + "换种子不会清空目录：只重跑勾选的窗口，未勾选的保留旧种子结果。"
-          : ("方形全宽分区使用「分辨率上限」计算出的实际分辨率（见分区摘要）；"
-            + "上面的「分辨率」只影响均匀网格。透明阈值同时决定每块 PSD 和合并时的透明判定。"
+          : ("「分辨率」是模型推理分辨率，三种分区都用它；方形分区的实际值见分区摘要。"
+            + "透明阈值同时决定每块 PSD 和合并时的透明判定。"
             + "换种子不会清空目录：只重跑勾选的块，未勾选的块保留旧种子结果。");
         cutHint.textContent = strips
           ? "方形全宽分区：每条一次推理看到完整左右，水平缝落在条之间；"
@@ -5252,7 +5280,7 @@
             planAppliedKey = "strips_pending|" + srcW + "|" + srcH + "|" +
               Math.max(0, Number(widgetValue(node, "overlap", 128)) || 0) + "|" +
               Number(widgetValue(node, "strip_max_side", 2048)) + "|" +
-              Number(widgetValue(node, "strip_max_resolution", 768)) + "|" +
+              Number(widgetValue(node, "resolution", 512)) + "|" +
               Number(widgetValue(node, "strip_margin", 32));
           } else if (mode === "custom_regions" && data.partition) {
             const p = data.partition;
@@ -6718,7 +6746,9 @@
       ctx.running = false;
       updateRunState(ctx);
       if (wasRunning) {
-        if (!ctx.statusEl || !/已生成|运行完成/.test(ctx.statusEl.textContent)) {
+        const m = i18n();
+        const shown = (m && m.raw(ctx.statusEl)) || (ctx.statusEl && ctx.statusEl.textContent) || "";
+        if (!ctx.statusEl || !/已生成|运行完成|Generated|Run finished/.test(shown)) {
           setStatus(ctx, "✓ 运行完成", "ok");
         }
         refresh(ctx);
@@ -6764,8 +6794,20 @@
       const ref = data && data.grid ? String(data.grid) : "";
       lastGridPath = ref && !ref.startsWith("{") ? ref : "";
       lastGridDoc = data && data.grid_doc ? String(data.grid_doc) : "";
+      const planId = data && data.partition && data.partition.plan_id;
       for (const entry of Array.from(gridStates)) {
-        try { entry.refresh(); } catch (e) { console.warn("[STLU] grid refresh", e); }
+        try {
+          // The transparent workflow plans inside a subgraph, so this event
+          // (not the node's own onExecuted) is what carries the selection
+          // the backend actually used back to the panel's widgets.
+          if (data && data.selection != null && entry.node) {
+            setWidget(entry.node, "select", String(data.selection));
+          }
+          if (planId && entry.node) {
+            setWidget(entry.node, "select_plan", String(planId));
+          }
+          entry.refresh();
+        } catch (e) { console.warn("[STLU] grid refresh", e); }
       }
     });
     listen("stlu.tiles", (data) => {
@@ -6839,7 +6881,7 @@
     const count = el("span", "stlu-tag", "…");
     head.appendChild(count);
     head.appendChild(el("span", "grow"));
-    const hint = el("span", "stlu-hint", "运行后显示分块");
+    const hint = el("span", "stlu-hint", "当前输出目录为空");
     head.appendChild(hint);
     root.appendChild(head);
 
@@ -6925,6 +6967,10 @@
 
     const state = {
       mode: "tiles", path: "", maxSide: 768, data: {}, loading: {},
+      // Per-tile model inputs handed over by ② (``stlu_guide`` in the node's
+      // own execution payload).  Not on disk: only the run that produced
+      // them can pin them to a tile row.
+      guide: {},
       // {tileIndex: Set(lowercase part names)} kept in the run folder's
       // ``_locks/`` store, outside everything a parameter-change reset wipes.
       locks: {},
@@ -7132,6 +7178,22 @@
       return String(widgetValue(node, "psd_path", "") || "").trim();
     }
 
+    // ①-0 参数包里的输出根目录就是 ③ 实际写盘的位置；挑结果文件夹时从
+    // 这里出发，免得每个人自己再从 output/ 一层层点下去。
+    function settingsOutDir() {
+      const graph = app.graph;
+      const nodes = (graph && graph._nodes) || [];
+      const settings = nodes.find(
+        (n) => n && (n.type === PIPELINE_SETTINGS || n.type === SIMPLE));
+      if (!settings) return "";
+      // 后端的运行目录是 out_dir/group（空 group 就落在 out_dir 本身）。
+      const dir = readOutDir(settings);
+      const group = String(widgetValue(settings, "group", "") || "")
+        .trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      if (!dir) return "";
+      return group ? dir + "/" + group : dir;
+    }
+
     function syncTabs() {
       for (const mode of MODES) {
         tabButtons[mode.key].classList.toggle("on", mode.key === state.mode);
@@ -7300,7 +7362,15 @@
       row.appendChild(who);
 
       // Merged group picture: blue frame + "合" badge, distinct from splits.
+      // The model input (green frame) stacks underneath it, not beside it --
+      // both are square so a column keeps the row one picture wide.
       const merge = mergePx();
+      const pair = el("div");
+      pair.style.display = "flex";
+      pair.style.flexDirection = "column";
+      pair.style.alignItems = "center";
+      pair.style.gap = "3px";
+      pair.style.flex = "0 0 auto";
       const frame = el("div");
       frame.style.position = "relative";
       frame.style.flex = "0 0 " + merge + "px";
@@ -7334,7 +7404,71 @@
       chip.style.pointerEvents = "none";
       frame.appendChild(chip);
       frame.addEventListener("click", () => showBig(item.image || {}, title + " · 合并"));
-      row.appendChild(frame);
+      pair.appendChild(frame);
+
+      // What the models actually saw for this tile: the crop after guide
+      // backfill and context padding.  It rides in on the node's own
+      // execution payload (temp thumbnails), so it only exists for tiles the
+      // current run really generated -- an empty dashed cell means "did not
+      // run this tile" (unchecked, or reused from an earlier run).
+      // Per-tile only: the "by part" tab has no tile to pin it to.
+      if (mode === "tiles") {
+        // This run's own payload wins (it is pinned to the tile by ②); after a
+        // browser refresh the payload is gone, so fall back to the copy the
+        // backend keeps next to the run in ``_guide/``.
+        const guided = state.guide[String(Number(item.index))];
+        const live = guided && guided.image ? guided.image : null;
+        const disk = !live && item.guide ? item.guide : null;
+        const side = mergePx();
+        const guide = el("div");
+        guide.style.position = "relative";
+        guide.style.flex = "0 0 " + side + "px";
+        guide.style.width = side + "px";
+        guide.style.height = side + "px";
+        guide.style.boxSizing = "border-box";
+        guide.style.borderRadius = "4px";
+        if (live || disk) {
+          guide.style.border = "1px solid rgba(86,178,107,.65)";
+          guide.style.background = "#101013";
+          guide.style.padding = "2px";
+          guide.style.cursor = "zoom-in";
+          const img = document.createElement("img");
+          img.src = live ? imageUrl(live)
+            : (item.guide_thumb ? apiUrl(item.guide_thumb) : imageUrl(disk));
+          img.alt = title + " · 实际输入";
+          img.title = title + " · 引导回填后送进模型的输入 · 点击放大";
+          img.style.display = "block";
+          img.style.width = "100%";
+          img.style.height = "100%";
+          img.style.objectFit = "contain";
+          guide.appendChild(img);
+          const chip = el("span", "", "入");
+          chip.style.position = "absolute";
+          chip.style.right = "1px";
+          chip.style.bottom = "1px";
+          chip.style.fontSize = "8px";
+          chip.style.lineHeight = "1.5";
+          chip.style.padding = "0 2px";
+          chip.style.borderRadius = "2px";
+          chip.style.background = "rgba(86,178,107,.9)";
+          chip.style.color = "#fff";
+          chip.style.pointerEvents = "none";
+          guide.appendChild(chip);
+          guide.addEventListener("click", () => showBig(live || disk,
+            title + " · 实际输入（引导回填后）"));
+        } else {
+          guide.style.border = "1px dashed #3a3a3c";
+          guide.style.display = "flex";
+          guide.style.alignItems = "center";
+          guide.style.justifyContent = "center";
+          guide.style.color = "#555";
+          guide.style.fontSize = "10px";
+          guide.title = "这次没有生成这块（未勾选，或用了上次的结果）";
+          guide.textContent = "—";
+        }
+        pair.appendChild(guide);
+      }
+      row.appendChild(pair);
 
       const strip = el("div");
       strip.style.flex = "1 1 auto";
@@ -7359,7 +7493,8 @@
       const can = !!(main && main.filename);
       overview.appendChild(el("span", "stlu-cardtitle", "总览"));
       if (!can) {
-        overview.appendChild(el("span", "stlu-hint", "运行后显示"));
+        // 面板会自动读取 ① 的输出目录；没有结果就只是空着，不提供手动挑目录。
+        overview.appendChild(el("span", "stlu-hint", "当前输出目录为空"));
         return;
       }
       const frame = el("div");
@@ -7429,7 +7564,7 @@
       hint.textContent = data.file
         ? "合并 PSD：" + data.file + (data.canvas
             ? " · " + data.canvas.join("×") : "")
-        : "运行后显示分块";
+        : "当前输出目录为空";
       syncCounts();
       const lockTotal = Object.values(state.locks)
         .reduce((total, set) => total + set.size, 0);
@@ -7467,6 +7602,14 @@
       hMerge.style.fontSize = "9px";
       hMerge.style.textAlign = "center";
       headRow.appendChild(hMerge);
+      if (state.mode === "tiles") {
+        const hGuide = el("span", "stlu-hint", "输入");
+        hGuide.style.flex = "0 0 " + mergePx() + "px";
+        hGuide.style.fontSize = "9px";
+        hGuide.style.textAlign = "center";
+        hGuide.title = "引导回填后真正送进模型的那张图";
+        headRow.appendChild(hGuide);
+      }
       const hSplit = el("span", "stlu-hint", "拆分图层");
       hSplit.style.flex = "1";
       hSplit.style.fontSize = "9px";
@@ -7476,12 +7619,17 @@
     }
 
     async function ensure(mode, force) {
-      const path = state.path || declaredPath();
+      const recorded = state.path || declaredPath();
+      if (!recorded && state.missed) return;
+      // ⑤ 没有自己的目录参数：没记过路径时先去 ① 的输出目录里找（运行目录
+      // 就是 out_dir/group），找到就直接显示，找不到才回到空状态让用户手动挑。
+      const path = recorded || settingsOutDir();
+      const guessed = !recorded && !!path;
       if (!path) {
         hint.textContent = "等待 ④ 的结果（连上并运行一次即可）";
+        render();
         return;
       }
-      state.path = path;
       if (!force && state.data[mode]) {
         render();
         return;
@@ -7500,13 +7648,23 @@
           getJson("/stlu/psd_preview?" + query.toString()),
           getJson("/stlu/locks?path=" + encodeURIComponent(path)).catch(() => null),
         ]);
+        state.path = path;
+        state.missed = false;
         state.data[mode] = data;
         if (lockDoc) state.locks = normalizeLocks(lockDoc.tiles);
         syncCounts();
         if (mode === state.mode) render();
       } catch (error) {
-        hint.textContent = String((error && error.message) || error);
-        hint.className = "stlu-hint attention";
+        if (guessed) {
+          // ① 的目录里没有合并结果：保持空状态，露出“浏览其他文件夹”按钮。
+          state.path = "";
+          state.missed = true;
+          delete state.data[mode];
+          render();
+        } else {
+          hint.textContent = String((error && error.message) || error);
+          hint.className = "stlu-hint attention";
+        }
       } finally {
         state.loading[mode] = false;
       }
@@ -7521,7 +7679,11 @@
         state.path = declaredPath();
         state.data = {};
         state.locks = {};
+        state.guide = {};
+        state.missed = false;
         if (state.path) ensure(state.mode, true);
+        // 没有记录路径时延后一帧再猜：① 的 widget 值可能还没恢复完。
+        else setTimeout(() => ensure(state.mode, true), 0);
       } catch (e) {
         console.warn("[STLU] PSD preview restore", e);
       }
@@ -7532,12 +7694,24 @@
     node.onExecuted = function (message) {
       const result = oldExecuted ? oldExecuted.apply(this, arguments) : undefined;
       try {
+        // ②'s per-tile model inputs arrive as temp thumbnails keyed by grid
+        // index.  Replace (never merge) so a run that generated nothing can
+        // not leave the previous run's pictures pinned to the rows.
+        const guided = message && message.stlu_guide;
+        if (Array.isArray(guided)) {
+          state.guide = {};
+          for (const entry of guided) {
+            if (!entry || entry.index == null || !entry.image) continue;
+            state.guide[String(Number(entry.index))] = entry;
+          }
+        }
         const payload = message && message.stlu_parts;
         const path = payload && payload.length && payload[0].path;
         if (path) {
           if (!node.properties) node.properties = {};
           node.properties.stlu_last_psd = String(path);
           state.path = String(path);
+          state.missed = false;
           state.data = {};
           state.locks = {};
           ensure(state.mode, true);
@@ -7561,6 +7735,9 @@
     if (initial) {
       state.path = initial;
       ensure(state.mode, true);
+    } else {
+      // 新建节点时 ① 可能还没进图，延后一帧再按 ① 的输出目录猜一次。
+      setTimeout(() => ensure(state.mode, true), 0);
     }
   }
 
@@ -7593,7 +7770,8 @@
         };
       }
 
-      if (nodeData.name === PIPELINE) {
+      if (nodeData.name === PIPELINE || nodeData.name === PIPELINE_SETTINGS
+          || nodeData.name === SIMPLE) {
         const hideCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
           const result = hideCreated ? hideCreated.apply(this, arguments) : undefined;
@@ -7614,6 +7792,8 @@
           && nodeData.name !== TILES && nodeData.name !== TILE_SELECT
           && nodeData.name !== TILE_MERGE && nodeData.name !== TILE_GRID
           && nodeData.name !== PIPELINE
+          && nodeData.name !== PIPELINE_SETTINGS
+          && nodeData.name !== SIMPLE
           && nodeData.name !== SELECT_TILES && nodeData.name !== REBUILD_PSD
           && nodeData.name !== SAVE_TILES && nodeData.name !== WAVE
           && nodeData.name !== TILE_PSD && nodeData.name !== WAVE_INDEX
@@ -7623,6 +7803,8 @@
       nodeType.prototype.onNodeCreated = function () {
         const result = onCreated ? onCreated.apply(this, arguments) : undefined;
         try {
+          const m = i18n();
+          if (m && m.enabled) m.labelCombos(this);
           if (nodeData.name === PLAN) setupPlan(this);
           else if (nodeData.name === BATCH) setupBatch(this);
           else if (nodeData.name === EDIT_BATCH) setupEditBatch(this);
@@ -7630,7 +7812,9 @@
           else if (nodeData.name === TILE_SELECT) setupTileSelect(this);
           else if (nodeData.name === TILE_MERGE) setupTileMerge(this);
           else if (nodeData.name === TILE_GRID) setupTileGrid(this);
-          else if (nodeData.name === PIPELINE) setupTileGrid(this);
+          else if (nodeData.name === PIPELINE
+            || nodeData.name === PIPELINE_SETTINGS
+            || nodeData.name === SIMPLE) setupTileGrid(this);
           else if (nodeData.name === SELECT_TILES) setupSelectTiles(this);
           else if (nodeData.name === REBUILD_PSD) setupRebuildPSD(this);
           else if (nodeData.name === SAVE_TILES) setupSaveTiles(this);

@@ -28,11 +28,25 @@ def alpha_bbox(alpha: np.ndarray, threshold: int = DEFAULT_ALPHA_THRESHOLD) -> O
 
 
 def _resize_rgba(arr: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize RGBA without letting the colour hidden under alpha 0 bleed in.
+
+    A straight-alpha resize averages the RGB stored under transparent pixels
+    (SeeThrough keeps the dark hair colour there) into the visible rim, so a
+    clean layer grows a pink fringe.  Premultiply, resize, un-premultiply, and
+    leave fully transparent pixels white.
+    """
     if arr.shape[1] == width and arr.shape[0] == height:
         return arr
-    im = Image.fromarray(np.asarray(arr, dtype=np.uint8), "RGBA")
+    src = np.asarray(arr, dtype=np.float32) / 255.0
+    alpha = src[..., 3:4]
+    prem = np.concatenate([src[..., :3] * alpha, alpha], axis=2)
+    im = Image.fromarray(np.rint(prem * 255.0).astype(np.uint8), "RGBA")
     im = im.resize((max(1, int(width)), max(1, int(height))), Image.Resampling.LANCZOS)
-    return np.array(im, dtype=np.uint8)
+    out = np.asarray(im, dtype=np.float32) / 255.0
+    alpha = out[..., 3:4]
+    rgb = np.where(alpha > 1e-6, out[..., :3] / np.maximum(alpha, 1e-6), 1.0)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return np.rint(np.concatenate([rgb, alpha], axis=2) * 255.0).astype(np.uint8)
 
 
 def _resize_alpha(alpha: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -54,7 +68,11 @@ def _clean_alpha(arr: np.ndarray, floor: int) -> np.ndarray:
     if int(floor) <= 0:
         return arr
     out = np.array(arr, dtype=np.uint8, copy=True)
-    out[..., 3][out[..., 3] <= int(floor)] = 0
+    dead = out[..., 3] <= int(floor)
+    out[..., 3][dead] = 0
+    # Straight alpha keeps colour under alpha 0; whitening it stops resamples
+    # from dragging dark/pink hidden colour into the visible rim.
+    out[..., :3][dead] = 255
     return out
 
 

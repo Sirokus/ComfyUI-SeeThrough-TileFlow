@@ -55,6 +55,23 @@ def _output_root() -> str:
     return _shared._output_root()
 
 
+def _relative_to_output(folder: str) -> str:
+    """``folder`` relative to the output root (``/``-separated), else None.
+
+    ComfyUI's /view only serves files under output/ (or temp/), so a picture
+    written anywhere else cannot be referenced by a ``subfolder``.
+    """
+    try:
+        full = os.path.abspath(folder)
+        root = os.path.abspath(_output_root())
+        rel = os.path.relpath(full, root)
+    except (OSError, ValueError):
+        return None
+    if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return None
+    return rel.replace(os.sep, "/")
+
+
 def _notify(event: str, payload: dict) -> None:
     return _shared._notify(event, payload)
 
@@ -75,276 +92,80 @@ def _seethrough_node_class(name: str):
     return _shared._seethrough_node_class(name)
 
 
-def _guide_feather_mask(height: int, width: int, feather: int) -> np.ndarray:
-    """1.0 in the middle of the overlap, fading to 0 at its edge."""
-    height = max(1, int(height))
-    width = max(1, int(width))
-    feather = max(0, int(feather))
-    if feather <= 0:
-        return np.ones((height, width), dtype=np.float32)
-    fy = min(float(feather), max(0.0, (height - 1) / 2.0))
-    fx = min(float(feather), max(0.0, (width - 1) / 2.0))
-    yy = np.arange(height, dtype=np.float32)
-    xx = np.arange(width, dtype=np.float32)
-    # A 1-2 px span cannot hold a ramp: treat that axis as fully guided.
-    wy = (np.ones(height, dtype=np.float32) if fy < 1.0
-          else np.clip(np.minimum(yy, height - 1 - yy) / fy, 0.0, 1.0))
-    wx = (np.ones(width, dtype=np.float32) if fx < 1.0
-          else np.clip(np.minimum(xx, width - 1 - xx) / fx, 0.0, 1.0))
-    return (wy[:, None] * wx[None, :]).astype(np.float32)
+# The stage logic lives in ``pipeline_stages`` so the fine-grained nodes in
+# ``nodes_transparent`` reuse exactly the same code.  Re-exported here so the
+# old tests keep reaching them through ``nodes`` / ``nodes_pipeline``.
+if __package__:  # ComfyUI loads the folder as a package
+    from .pipeline_stages import (  # noqa: F401
+        GUIDE_EMPTY, GUIDE_ERROR, GUIDE_OK, GUIDED_EMPTY_RETRIES,
+        _apply_tile_guide, _box_blur_3x3, _crop_tile_parts,
+        _guide_composite, _guide_composite_result, _guide_feather_mask,
+        _restore_locked_orphans, _run_seethrough_tile,
+        crop_tiles, describe_run, grid_info, guide_state, guide_tile,
+        make_plan, merge_run_doc, normalize_settings, pick_tiles, plan_context,
+        prepare_run, restore_locks, run_guided_tiles, save_original,
+        tile_context, tile_index_of, tile_is_empty, write_manifest,
+        write_tile_images, write_tile_psd,
+    )
+else:  # standalone import used by the tests and tools
+    from pipeline_stages import (  # noqa: F401
+        GUIDE_EMPTY, GUIDE_ERROR, GUIDE_OK, GUIDED_EMPTY_RETRIES,
+        _apply_tile_guide, _box_blur_3x3, _crop_tile_parts,
+        _guide_composite, _guide_composite_result, _guide_feather_mask,
+        _restore_locked_orphans, _run_seethrough_tile,
+        crop_tiles, describe_run, grid_info, guide_state, guide_tile,
+        make_plan, merge_run_doc, normalize_settings, pick_tiles, plan_context,
+        prepare_run, restore_locks, run_guided_tiles, save_original,
+        tile_context, tile_index_of, tile_is_empty, write_manifest,
+        write_tile_images, write_tile_psd,
+    )
 
 
-def _box_blur_3x3(arr: np.ndarray) -> np.ndarray:
-    """Edge-padded 3x3 mean, so a per-pixel gate stays spatially coherent."""
-    padded = np.pad(arr, 1, mode="edge")
-    return (padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:]
-            + padded[1:-1, :-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:]
-            + padded[2:, :-2] + padded[2:, 1:-1] + padded[2:, 2:]) / 9.0
+def run_pipeline_input(image, options=None, **overrides):
+    """The one implementation behind every ① input node.
 
-
-GUIDE_OK = "ok"
-GUIDE_EMPTY = "empty"
-GUIDE_ERROR = "error"
-
-def _guide_composite_result(parts: dict, alpha_threshold: int = 8) -> dict:
-    """Flatten one tile's parts, distinguishing a real empty result from a bug.
-
-    A fully transparent tile is a known model failure and is retried on a new
-    seed.  An exception or a malformed ``frame_size`` is not: retrying it only
-    burns two more diffusion runs and hides the real error, so it is reported
-    as ``error`` with a traceback.
+    ``options`` holds the node's widget/socket values exactly as ComfyUI
+    passes them; ``overrides`` pins settings a simplified node does not
+    expose (its panel has no widget for them, so the default would otherwise
+    silently be the guided one).  Returns the same ``{"ui", "result"}``
+    envelope both nodes emit.
     """
-    try:
-        layers = tile_psd.build_tile_layers(
-            parts, merge_parts=True, alpha_threshold=int(alpha_threshold))
-    except Exception as exc:  # noqa: BLE001 - reported to the node layer
-        return {
-            "status": GUIDE_ERROR,
-            "rgba": None,
-            "error": "%s: %s" % (type(exc).__name__, exc),
-            "traceback": traceback.format_exc(),
-        }
-    frame_h, frame_w = (int(v) for v in (parts.get("frame_size") or (0, 0))[:2])
-    if frame_h <= 0 or frame_w <= 0:
-        return {
-            "status": GUIDE_ERROR,
-            "rgba": None,
-            "error": "parts have an invalid frame_size: %r"
-                     % ((parts.get("frame_size"),)),
-            "traceback": "",
-        }
-    if not layers:
-        return {"status": GUIDE_EMPTY, "rgba": None, "error": "", "traceback": ""}
-    canvas = np.zeros((frame_h, frame_w, 4), dtype=np.uint8)
-    for layer in layers:
-        core_compose._alpha_over(canvas, layer["pixels"],
-                                 int(layer["left"]), int(layer["top"]))
-    if not canvas[..., 3].any():
-        return {"status": GUIDE_EMPTY, "rgba": None, "error": "", "traceback": ""}
-    return {"status": GUIDE_OK, "rgba": canvas, "error": "", "traceback": ""}
+    options = dict(options or {})
+    layerdiff_model = options.pop("layerdiff_model", None)
+    depth_model = options.pop("depth_model", None)
+    options.update(overrides)
+    settings = normalize_settings(**options)
+    plan = make_plan(image, settings, layerdiff_model, depth_model)
+    plan = pick_tiles(plan)
+    plan = plan_context(plan)
+    plan = prepare_run(plan, image)
+    tiles, indices = crop_tiles(image, plan)
+    describe_run(plan)
+    info = grid_info(plan)
+    grid_doc = json.dumps(plan["doc"], ensure_ascii=False, separators=(",", ":"))
+    info["grid_doc"] = grid_doc
+    batch = image if image.ndim == 4 else image[None]
+    frame = batch[0].detach().float().cpu()
+    return {
+        "ui": {"stlu_grid": [info]},
+        "result": (tiles, indices, grid_doc, frame[None].contiguous(),
+                   int(plan["resolution"]),
+                   int(plan["num_inference_steps"]),
+                   int(plan["depth_resolution"]), int(plan["seed"]),
+                   bool(settings["tblr_split"]),
+                   bool(settings["use_lama"])),
+    }
 
 
-def _guide_composite(parts: dict, alpha_threshold: int = 8):
-    """Backwards-compatible: the RGBA canvas, or ``None`` when unusable."""
-    return _guide_composite_result(parts, alpha_threshold).get("rgba")
-
-GUIDED_EMPTY_RETRIES = 2
-
-
-def _run_seethrough_tile(layer_node, depth_node, post_node, input_tile, model,
-                         depth_model, seed, resolution, steps, depth_res,
-                         tblr, lama, alpha_threshold):
-    """Generate -> depth -> post for one tile; return (parts, composite result)."""
-    layers_data, _preview = layer_node.generate(
-        input_tile, model, seed, resolution, steps)
-    # GenerateDepth returns (layers_depth, preview), not a bare object.
-    depth_data, _preview_depth = depth_node.generate(
-        layers_data, depth_model, seed, depth_res)
-    parts, _preview2 = post_node.process(depth_data, tblr, lama)
-    return parts, _guide_composite_result(parts, alpha_threshold)
-
-def _apply_tile_guide(tile, index: int, coords, generated: dict, guide: dict,
-                      alpha_threshold: int = 8, fixed=None, input_box=None,
-                      done=None):
-    """Paste already-generated neighbouring tiles into this tile's overlap.
-
-    ``fixed`` holds tiles cached from an earlier run: they are complete, so
-    they may guide a tile that comes before them in grid order too.  Tiles
-    produced earlier in *this* run are only used forward.
-
-    ``done`` names the tiles finished in this run so far.  The guided node
-    passes it because its tiles run in a user-defined order, where "index
-    smaller than mine" no longer says which tile came first.  Standalone
-    callers that omit it keep the original index-order contract.
-
-    ``coords`` describes the content (strip) boxes the generated tiles cover;
-    ``input_box`` is the larger window ① fed to the model when context
-    padding is on.  They are the same box when padding is off.
-    """
-    if not guide.get("enabled", True) or not generated:
-        return tile
-    strength = min(100.0, max(0.0, float(guide.get("strength", 40)))) / 100.0
-    if strength <= 0.0:
-        return tile
-    if index < 0 or index >= len(coords):
-        return tile
-    feather = int(guide.get("feather", 32))
-
-    device, dtype = tile.device, tile.dtype
-    arr = (tile[0].detach().float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-    height, width = arr.shape[:2]
-    x0, y0, x1, y1 = (int(v) for v in (input_box or coords[index]))
-    tile_w, tile_h = max(1, x1 - x0), max(1, y1 - y0)
-    scale_x = width / float(tile_w)
-    scale_y = height / float(tile_h)
-
-    changed = False
-    fixed = fixed or set()
-    done_set = None if done is None else set(done)
-    # Earlier tiles only, unless the neighbour is a finished tile cached from
-    # a previous run -- then its position in the queue does not matter.
-    for other in sorted(generated):
-        if other == index:
-            # A cached copy of this very tile must not seed itself.
-            continue
-        if done_set is not None:
-            if other not in done_set and other not in fixed:
-                continue
-        elif other >= index and other not in fixed:
-            continue
-        source = generated[other]
-        ox0, oy0 = max(x0, int(coords[other][0])), max(y0, int(coords[other][1]))
-        ox1, oy1 = min(x1, int(coords[other][2])), min(y1, int(coords[other][3]))
-        if ox0 >= ox1 or oy0 >= oy1:
-            continue
-
-        sx0 = int(coords[other][0])
-        sy0 = int(coords[other][1])
-        other_w = max(1, int(coords[other][2]) - sx0)
-        other_h = max(1, int(coords[other][3]) - sy0)
-        rgba = source
-        if rgba.shape[0] != other_h or rgba.shape[1] != other_w:
-            rgba = core_io.resize_rgba_premultiplied(rgba, other_w, other_h)
-
-        piece = rgba[oy0 - sy0:oy1 - sy0, ox0 - sx0:ox1 - sx0]
-        if piece.size == 0:
-            continue
-        dx0 = int(round((ox0 - x0) * scale_x))
-        dy0 = int(round((oy0 - y0) * scale_y))
-        dx1 = int(round((ox1 - x0) * scale_x))
-        dy1 = int(round((oy1 - y0) * scale_y))
-        dst_w, dst_h = dx1 - dx0, dy1 - dy0
-        if dst_w <= 0 or dst_h <= 0:
-            continue
-        if piece.shape[0] != dst_h or piece.shape[1] != dst_w:
-            piece = core_io.resize_rgba(piece, dst_w, dst_h)
-
-        weight = _guide_feather_mask(dst_h, dst_w, feather)
-        alpha = (piece[..., 3].astype(np.float32) / 255.0) * weight * strength
-        # Only carry forward pixels where the earlier tile's *reconstruction*
-        # agrees with what this tile's source image really shows.  SeeThrough
-        # repaints/completes its input per tile; pasting those invented pixels
-        # into the neighbour makes the model split the wrong thing (a half
-        # face, stray clothing).  Large disagreements stay on the source.
-        tolerance = float(guide.get("tolerance", 16) or 0)
-        if tolerance > 0.0:
-            source = arr[dy0:dy1, dx0:dx1].astype(np.float32)
-            diff = np.abs(piece[..., :3].astype(np.float32) - source).mean(axis=-1)
-            gate = np.clip(1.0 - diff / tolerance, 0.0, 1.0).astype(np.float32)
-            # Smooth the gate: a raw per-pixel threshold leaves salt-and-pepper
-            # holes right at the limit, which the model reads as a broken image.
-            alpha = alpha * _box_blur_3x3(gate)
-        if not np.any(alpha > 0.0):
-            continue
-        dst = arr[dy0:dy1, dx0:dx1].astype(np.float32)
-        src = piece[..., :3].astype(np.float32)
-        a = alpha[..., None]
-        arr[dy0:dy1, dx0:dx1] = np.clip(dst * (1.0 - a) + src * a, 0, 255).astype(np.uint8)
-        changed = True
-
-    if not changed:
-        return tile
-    out = torch.from_numpy(arr.astype(np.float32) / 255.0)[None]
-    return out.to(device=device, dtype=dtype)
-
-
-def _crop_tile_parts(parts, composite, content_box, input_box):
-    """Crop a context-padded tile's result back to its strip box.
-
-    ① may feed the model a window larger than the strip; PSD size, merge
-    geometry and guides all expect the strip box, so every part image/depth
-    and the composite RGBA are cut back here.  Parts that do not carry the
-    padded frame are left untouched (they were not produced from it).
-    """
-    if not input_box or not content_box:
-        return parts, composite
-    cx0, cy0, cx1, cy1 = (int(v) for v in content_box[:4])
-    ix0, iy0, ix1, iy1 = (int(v) for v in input_box[:4])
-    pad_w, pad_h = ix1 - ix0, iy1 - iy0
-    if pad_w <= 0 or pad_h <= 0 or cx1 <= cx0 or cy1 <= cy0:
-        return parts, composite
-
-    # The parts are in the MODEL's pixel space, which is not the padded
-    # window's pixel size: a 1950 px window comes back at ``resolution``
-    # (512).  Map the strip box into that space first.  Cutting with source
-    # pixels would slice a 512 px result at 128..1822, and then declaring the
-    # frame to be 1694 px puts that sliver in the PSD's top-left corner.
-    frame = parts.get("frame_size") or (0, 0)
-    frame_h, frame_w = int(frame[0]), int(frame[1])
-    if frame_w <= 0 or frame_h <= 0:
-        frame_w, frame_h = pad_w, pad_h
-    scale_x = frame_w / float(pad_w)
-    scale_y = frame_h / float(pad_h)
-    dx = max(0, int(round((cx0 - ix0) * scale_x)))
-    dy = max(0, int(round((cy0 - iy0) * scale_y)))
-    width = min(frame_w, int(round((cx1 - ix0) * scale_x))) - dx
-    height = min(frame_h, int(round((cy1 - iy0) * scale_y))) - dy
-    if width <= 0 or height <= 0:
-        return parts, composite
-    if dx == 0 and dy == 0 and (frame_w, frame_h) == (width, height):
-        return parts, composite
-
-    out = dict(parts)
-    tag2pinfo = {}
-    for tag, pinfo in (parts.get("tag2pinfo") or {}).items():
-        if not isinstance(pinfo, dict):
-            tag2pinfo[tag] = pinfo
-            continue
-        item = dict(pinfo)
-        for key in ("img", "depth"):
-            value = item.get(key)
-            if value is None:
-                continue
-            arr = np.asarray(value)
-            if (arr.ndim >= 2
-                    and arr.shape[0] == frame_h and arr.shape[1] == frame_w):
-                item[key] = np.ascontiguousarray(arr[dy:dy + height, dx:dx + width])
-        xyxy = item.get("xyxy")
-        if xyxy is not None and len(xyxy) >= 2:
-            moved = [min(width, max(0, int(xyxy[0]) - dx)),
-                     min(height, max(0, int(xyxy[1]) - dy))]
-            if len(xyxy) >= 4:
-                # Keep the box ordered: a part that sat fully outside the
-                # strip must not come back with its right/top below its left.
-                moved += [min(width, max(moved[0], int(xyxy[2]) - dx)),
-                          min(height, max(moved[1], int(xyxy[3]) - dy))]
-            else:
-                moved += list(xyxy[2:])
-            item["xyxy"] = moved
-        tag2pinfo[tag] = item
-    out["tag2pinfo"] = tag2pinfo
-    out["frame_size"] = (height, width)
-
-    if isinstance(composite, dict):
-        composite = dict(composite)
-        rgba = composite.get("rgba")
-        if rgba is not None:
-            arr = np.asarray(rgba)
-            if (arr.ndim == 3
-                    and arr.shape[0] == frame_h and arr.shape[1] == frame_w):
-                composite["rgba"] = np.ascontiguousarray(
-                    arr[dy:dy + height, dx:dx + width])
-    return out, composite
+# The simplified ① node's panel has no widgets for these; every other input
+# still behaves exactly like STLU_PipelineInput.  Dropping a widget is enough:
+# normalize_settings fills the shared DEFAULT_SETTINGS value for anything the
+# graph does not pass, so the fingerprint of the simple node is the guided
+# node's at its defaults instead of a second, divergent set of numbers.
+SIMPLE_INPUT_DROP = (
+    "guide_context", "guide_feather", "guide_strength", "guide_tolerance",
+    "context_pad", "strip_max_resolution",
+)
 
 
 class STLU_PipelineInput:
@@ -467,8 +288,8 @@ class STLU_PipelineInput:
                     "tooltip": "方形分区的目标边长（像素）。主体宽度 + 边距超过它时会自动放大到"
                                "能覆盖主体全宽的方形，不会竖直切开；面板会显示实际边长。"}),
                 "strip_max_resolution": ("INT", {"default": 768, "min": 512, "max": 2048, "step": 64,
-                    "tooltip": "方形分区的模型分辨率上限。默认 768 更稳；显存允许可调到 896/1024。"
-                               "实际值会显示在面板里。"}),
+                    "tooltip": "（已废弃，仅为兼容旧工作流保留）方形分区现在直接使用「拆层质量」卡里的"
+                               "「分辨率」，此值不再参与规划。"}),
                 "strip_margin": ("INT", {"default": 32, "min": 0, "max": 512, "step": 8,
                     "tooltip": "主体框四周留给模型的背景边距（像素）。主体几乎占满画面时会自动收窄。"}),
                 # Written by the ① panel together with a mapped selection.  It
@@ -515,380 +336,46 @@ class STLU_PipelineInput:
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
 
-    def execute(self, image, tile_width=1024, tile_height=1024, overlap=128,
-                select="all", resolution=512, num_inference_steps=30,
-                depth_resolution=-1, random_seed=0, tblr_split=True, use_lama=True,
-                alpha_threshold=8, out_dir="SeeThrough/我的自设/", group="",
-                filename_prefix="tile", merge_name="merged",
-                group_layers=True, include_depth=False,
-                include_original=False, guide_context=True,
-                guide_feather=32, guide_strength=40, guide_tolerance=16,
-                seam_feather=32, layerdiff_model=None, depth_model=None,
-                grid_offset_x=0, grid_offset_y=0,
-                partition_mode="均匀网格", strip_max_side=2048,
-                strip_max_resolution=768, strip_margin=32, select_plan="",
-                context_pad=0, custom_regions="[]"):
-        if image is None or not hasattr(image, "shape") or image.ndim < 3:
-            raise ValueError("STLU_PipelineInput: 需要连接 image（标准 LoadImage 即可）")
-        try:
-            (resolution, num_inference_steps, depth_resolution,
-             random_seed) = stlu_limits.check_all(
-                resolution, num_inference_steps, depth_resolution, random_seed)
-        except ValueError as exc:
-            raise ValueError("STLU_PipelineInput: %s" % exc) from exc
-        batch = image if image.ndim == 4 else image[None]
-        frame = batch[0].detach().float().cpu()
-        height, width = int(frame.shape[0]), int(frame.shape[1])
-        now = datetime.datetime.now()
-        created = now.strftime("%Y%m%d_%H%M%S")
-        partition_mode = str(partition_mode or "").strip()
-        is_strips = partition_mode == "方形全宽分区"
-        is_custom = partition_mode == region_plan.CUSTOM_LABEL
-        effective_resolution = int(resolution)
-        effective_depth_resolution = int(depth_resolution)
-        plan_meta: dict = {}
-        plan_warnings: list = []
-        fallback = None
-        # The run folder is needed before selection mapping (the previous
-        # manifest is the authoritative old geometry).
-        wave_dir = tile_psd.flat_directory(
-            _output_root(), str(out_dir or "SeeThrough"), str(group or ""))
-
-        if is_strips:
-            planned = _plan_strips_frame(
-                frame, width, height,
-                overlap=int(overlap), max_side=int(strip_max_side),
-                max_resolution=int(strip_max_resolution), margin=int(strip_margin),
-                tile_width=int(tile_width), tile_height=int(tile_height),
-                resolution=int(resolution),
-                grid_offset_x=int(grid_offset_x), grid_offset_y=int(grid_offset_y),
-                created=created)
-            doc = planned["doc"]
-            coords = planned["coords"]
-            effective_resolution = int(planned["resolution"])
-            plan_meta = planned["plan_meta"]
-            plan_warnings = list(planned["warnings"])
-            fallback = planned["fallback"]
-            if effective_depth_resolution > effective_resolution:
-                effective_depth_resolution = effective_resolution
-                plan_warnings.append(
-                    "深度分辨率高于分区层分辨率，已跟随层分辨率 %d。"
-                    % effective_resolution)
-        elif is_custom:
-            custom_warnings = []
-            regions = region_plan.parse_custom_regions(
-                custom_regions, width, height, custom_warnings)
-            doc = region_plan.custom_document(
-                regions, width, height,
-                global_resolution=int(effective_resolution),
-                created=created, overlap=int(overlap),
-                warnings=custom_warnings)
-            coords = doc["coords"]
-            plan_meta = dict(doc["partition_plan"])
-            plan_warnings = list(custom_warnings)
-            fallback = None
-        else:
-            doc = tile_psd.grid_document(
-                (width, height), (tile_width, tile_height), int(overlap),
-                source_image="", name="grid", created=created,
-                offset_x=int(grid_offset_x), offset_y=int(grid_offset_y),
-            )
-            coords = doc["coords"]
-        raw_select = str(select if select is not None else "all").strip()
-        picked = _resolve_picked_selection(
-            raw_select, coords, is_strips=is_strips, is_custom=is_custom,
-            planned_id=str(plan_meta.get("plan_id") or ""),
-            select_plan=str(select_plan or ""), previous_dir=wave_dir,
-            width=width, height=height, tile_width=int(tile_width),
-            tile_height=int(tile_height), overlap=int(overlap),
-            grid_offset_x=int(grid_offset_x), grid_offset_y=int(grid_offset_y))
-        if is_custom:
-            # Custom windows run in the order the user arranged them, not in
-            # index order.  A checked subset keeps that order too, because the
-            # guide only flows forward through the run.
-            order = list(plan_meta.get("order") or range(len(coords)))
-            chosen = set(int(i) for i in picked)
-            picked = [int(i) for i in order if int(i) in chosen]
-        if not picked:
-            mode_hint = "方形分区" if is_strips else "均匀网格"
-            raise ValueError(
-                "STLU_PipelineInput: 当前%s没有勾选任何块/条（select=%r）。"
-                "请在 ① 面板点「全选」或点选要生成的区域，再 Queue。"
-                % (mode_hint, raw_select))
-        encoded = "all" if len(picked) == len(coords) else encode_tile_selection(picked)
-        doc["selection"] = encoded
-
-        # Optional context padding: the model sees a window larger than the
-        # strip, so a leg-only strip also carries the torso above it.  The
-        # strip geometry (coords) is untouched -- ② crops the result back.
-        context_pad = max(0, min(512, int(context_pad or 0)))
-        context_boxes = {}
-        if context_pad > 0:
-            for index in picked:
-                x0, y0, x1, y1 = (int(v) for v in coords[index])
-                box = [max(0, x0 - context_pad), max(0, y0 - context_pad),
-                       min(width, x1 + context_pad), min(height, y1 + context_pad)]
-                if box != [x0, y0, x1, y1]:
-                    context_boxes[str(index)] = box
-            doc["context_boxes"] = context_boxes
-        doc["context_pad"] = int(context_pad)
-
-        # The picked folder IS the run folder.  Earlier runs live here too,
-        # which is what lets a partial re-run reuse their finished tiles.
-        rel = os.path.relpath(wave_dir, _output_root()).replace(os.sep, "/")
-        wave = os.path.basename(wave_dir.rstrip("/\\")) or "run"
-        fingerprint = _image_fingerprint(frame)
-        doc.setdefault("source", {})["fingerprint"] = fingerprint
-        # Sequential (guided) runs read this block: neighbouring tiles that
-        # already finished are composited back into the overlap before the
-        # next tile reaches SeeThrough.
-        guide_block = {
-            "enabled": bool(guide_context),
-            "feather": max(0, int(guide_feather)),
-            "strength": min(100, max(0, int(guide_strength))),
-            "tolerance": max(0, min(255, int(guide_tolerance))),
-        }
-        doc["guide"] = guide_block
-
-        # Everything that can change the pixels of a tile.  Merge-only options
-        # (group_layers / depth / original / seam_feather) are deliberately
-        # absent: changing them only needs ④ to run again, not a re-diffusion.
-        generation = {
-            "version": 1,
-            # Bumped whenever tile pixels can change; joins generation_id so
-            # a code update cannot silently reuse tiles made by older logic.
-            "algo_version": int(tile_psd.ALGO_VERSION),
-            "source": fingerprint,
-            "source_size": [int(width), int(height)],
-            "tile_size": [int(v) for v in doc["tile_size"]],
-            "overlap": int(doc["overlap"]),
-            "resolution": int(effective_resolution),
-            "num_inference_steps": int(num_inference_steps),
-            "depth_resolution": int(effective_depth_resolution),
-            "random_seed": int(random_seed),
-            "tblr_split": bool(tblr_split),
-            "use_lama": bool(use_lama),
-            "alpha_threshold": int(alpha_threshold),
-            "context_pad": int(context_pad),
-            "guide": guide_block,
-            "layerdiff_model": _model_identity(layerdiff_model),
-            "depth_model": _model_identity(depth_model),
-        }
-        if is_strips:
-            # Only geometry goes into the fingerprint: warnings/notes can
-            # change without changing a single pixel, and a warning-only
-            # difference must not clear a finished folder.
-            generation["partition"] = {
-                key: plan_meta.get(key)
-                for key in ("mode", "side", "resolution", "density", "overlap",
-                            "requested_overlap", "margin", "plan_id", "regions")
-                if plan_meta.get(key) is not None
-            }
-            if plan_meta.get("fallback"):
-                generation["partition"]["fallback"] = plan_meta["fallback"]
-            # A fallback run really is the uniform grid, including its phase.
-            if str(doc.get("mode") or "") == "uniform_fallback" and (
-                    int(grid_offset_x) or int(grid_offset_y)):
-                generation["offset"] = [int(grid_offset_x), int(grid_offset_y)]
-        elif is_custom:
-            # The region list is in run order, so moving a window up/down or
-            # changing a per-window resolution changes the fingerprint too:
-            # both change what the guide sees, and old tiles cannot be reused.
-            generation["partition"] = {
-                "mode": region_plan.CUSTOM_MODE,
-                "plan_id": str(plan_meta.get("plan_id") or ""),
-                "regions": [{"box": list(r["box"]),
-                             "resolution": int(r["resolution"])}
-                            for r in (plan_meta.get("regions") or [])],
-            }
-        # Only when the grid is actually shifted: keeping the key out at 0
-        # means folders written by the previous version stay compatible.
-        # Successful subject strips / custom windows never use the grid phase.
-        elif int(grid_offset_x) or int(grid_offset_y):
-            generation["offset"] = [int(grid_offset_x), int(grid_offset_y)]
-        gid = tile_psd.generation_id(generation)
-        doc["generation"] = generation
-        doc["generation_id"] = gid
-
-        # A changed pixel-affecting parameter means the old tiles cannot be
-        # trusted: the folder is cleared before anything runs, so stale tiles
-        # from another generation can never be mixed into the merge.  The
-        # selection still decides how much work happens -- an explicit subset
-        # is the user's instruction and is never widened to the whole grid,
-        # it only regenerates the checked tiles into the now-empty folder.
-        reset_info = None
-        explicit_subset = 0 < len(picked) < len(coords)
-        previous = tile_psd.read_manifest(wave_dir)
-        reset_keys = []
-        reset_reason = ""
-        old_generation = None
-        if previous is not None:
-            old_generation = previous.get("generation")
-        else:
-            # An interrupted run leaves tiles and generation.json behind but
-            # no manifest; that fingerprint still describes those tiles.
-            old_generation = (tile_psd.read_generation(wave_dir) or {}).get("generation")
-        if previous is not None and (not isinstance(old_generation, dict) or not old_generation):
-            reset_reason = "旧结果没有参数指纹"
-        elif isinstance(old_generation, dict) and old_generation:
-            # Seed / context padding are deliberately excluded: changing them
-            # regenerates only the checked tiles and leaves the rest of the
-            # folder usable.
-            reset_keys = [key for key in generation
-                          if key not in tile_psd.LOCAL_RERUN_KEYS
-                          and old_generation.get(key) != generation[key]]
-            # A key that only the old run has still counts: that is what
-            # moving the grid back to offset 0 looks like.
-            reset_keys += [key for key in old_generation
-                           if key not in tile_psd.LOCAL_RERUN_KEYS
-                           and key not in generation]
-            if reset_keys:
-                reset_reason = "生成参数已变"
-        if reset_reason and explicit_subset:
-            cleared = tile_psd.clear_run_outputs(wave_dir, previous)
-            tile_psd.verify_run_cleared(wave_dir)
-            reset_info = {
-                "required": True,
-                "partial": True,
-                "reason": reset_reason,
-                "keys": reset_keys,
-                "tiles": len(picked),
-                "removed": int(cleared.get("removed") or 0),
-            }
-            _notify("stlu.cache_reset", {
-                "dir": wave_dir,
-                "rel": rel,
-                "reason": reset_reason,
-                "keys": reset_keys,
-                "tiles": len(picked),
-                "partial": True,
-                "removed": reset_info["removed"],
-            })
-            print("[STLU] generation changed (%s) -> cleared %s, re-running only the "
-                  "%d selected tiles" % (
-                      ", ".join(reset_keys) or reset_reason, rel, len(picked)), flush=True)
-        elif reset_reason:
-            picked = list(range(len(coords)))
-            encoded = "all"
-            doc["selection"] = encoded
-            cleared = tile_psd.clear_run_outputs(wave_dir, previous)
-            tile_psd.verify_run_cleared(wave_dir)
-            reset_info = {
-                "required": True,
-                "reason": reset_reason,
-                "keys": reset_keys,
-                "tiles": len(picked),
-                "removed": int(cleared.get("removed") or 0),
-            }
-            _notify("stlu.cache_reset", {
-                "dir": wave_dir,
-                "rel": rel,
-                "reason": reset_reason,
-                "keys": reset_keys,
-                "tiles": len(picked),
-                "removed": reset_info["removed"],
-            })
-            print("[STLU] generation changed -> cleared %s, regenerating all %d tiles (%s)" % (
-                rel, len(picked), ", ".join(reset_keys) or reset_reason), flush=True)
-
-        out_info = {
-            "dir": wave_dir,
-            "rel": rel,
-            "wave": wave,
-            "flat": True,
-            "fingerprint": fingerprint,
-            "out_dir": str(out_dir or "SeeThrough"),
-            "group": str(group or "").strip(),
-            "prefix": str(filename_prefix or "tile"),
-            "alpha_threshold": int(alpha_threshold),
-            "merge_name": str(merge_name or "merged"),
-            "group_layers": bool(group_layers),
-            "include_depth": bool(include_depth),
-            "include_original": bool(include_original),
-            "seam_feather": max(0, int(seam_feather)),
-        }
-        if reset_info:
-            out_info["reset"] = reset_info
-        doc["out"] = out_info
-        try:
-            tile_psd.write_generation(wave_dir, generation, gid)
-        except OSError as exc:
-            raise RuntimeError(
-                "STLU_PipelineInput: 无法写入生成指纹 %s：%s。"
-                "请检查输出目录权限后重试。" % (wave_dir, exc)) from exc
-        grid_doc = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
-
-        # Strips are cut from the background-flattened frame when the planner
-        # could isolate the subject; otherwise the frame as loaded.
-        flat = planned.get("flat") if is_strips else None
-        source_frame = frame
-        if flat is not None:
-            source_frame = torch.from_numpy(
-                flat.astype(np.float32) / 255.0).to(frame.device)
-
-        tiles = []
-        indices = []
-        for index in picked:
-            box = context_boxes.get(str(index))
-            if box:
-                x0, y0, x1, y1 = box
-            else:
-                x0, y0, x1, y1 = (int(v) for v in coords[index])
-            crop = source_frame[int(y0):int(y1), int(x0):int(x1), :]
-            tiles.append(crop[None].contiguous())
-            indices.append(str(index))
-
-        info = {
-            "grid": "",
-            "grid_doc": grid_doc,
-            "dir": rel,
-            "mode": str(doc.get("mode") or "uniform"),
-            "partition": plan_meta,
-            "warnings": plan_warnings,
-            "fallback": fallback,
-            "count": int(doc["count"]),
-            "selected": len(picked),
-            "indices": indices,
-            "rows": int(doc["rows"]),
-            "columns": int(doc["columns"]),
-            "source": [int(width), int(height)],
-            "tile_size": [int(v) for v in doc["tile_size"]],
-            "overlap": int(doc["overlap"]),
-            "resolution": int(effective_resolution),
-            "selection": encoded,
-            "out": out_info,
-        }
-        _notify("stlu.grid", info)
-        if is_custom:
-            print("[STLU] input: %d/%d custom windows (%s) from %dx%d -> %s "
-                  "(%s, order %s)" % (
-                      len(picked), doc["count"],
-                      region_plan.summaries(plan_meta.get("regions") or [],
-                                            int(effective_resolution)),
-                      width, height, rel, encoded,
-                      ",".join(str(i) for i in picked)),
-                  flush=True)
-        elif is_strips and str(doc.get("mode") or "") == "subject_strips":
-            print("[STLU] input: %d/%d strips (side %d, resolution %d) from %dx%d -> %s (%s)" % (
-                len(picked), doc["count"], doc["tile_size"][0],
-                int(effective_resolution), width, height, rel, encoded),
-                flush=True)
-        else:
-            print("[STLU] input: %d/%d tiles (%dx%d) from %dx%d -> %s (%s)" % (
-                len(picked), doc["count"], doc["tile_size"][0], doc["tile_size"][1],
-                width, height, rel, encoded),
-                flush=True)
-        return {
-            "ui": {"stlu_grid": [info]},
-            "result": (tiles, indices, grid_doc, frame[None].contiguous(),
-                       int(effective_resolution), int(num_inference_steps),
-                       int(effective_depth_resolution), int(random_seed),
-                       bool(tblr_split), bool(use_lama)),
-        }
+    def execute(self, image, **options):
+        return run_pipeline_input(image, options)
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
+
+
+class STLU_SimpleInput(STLU_PipelineInput):
+    """The lightweight ① node: same planning, fewer knobs.
+
+    The input list comes from :class:`STLU_PipelineInput` with
+    :data:`SIMPLE_INPUT_DROP` removed, and the whole run is
+    :func:`run_pipeline_input` -- so geometry, selection, cache clearing and
+    the ``grid_doc`` contract are byte-for-byte the guided version's.  Only
+    the guided loop's widgets and the crop-back padding are gone: neither is
+    read by the plain four-step graph this node drives, and the shared
+    defaults fill their settings back in unchanged.
+
+    The inputs are derived rather than re-listed on purpose: a new shared
+    option reaches both nodes, and there is no second copy of the widget
+    order that could drift and shift an old workflow's saved values.
+    """
+
+    DESCRIPTION = (
+        "简化版 ①：只保留四步流水线真正会用到的开关（切块/选块、拆层质量、"
+        "分区、后处理、输出与合并），去掉顺序引导与块外上下文。规划、缓存和 "
+        "grid_doc 与完整版完全同源。"
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        types = STLU_PipelineInput.INPUT_TYPES()
+        optional = {name: spec for name, spec in types["optional"].items()
+                    if name not in SIMPLE_INPUT_DROP}
+        return {"required": dict(types["required"]), "optional": optional}
+
+    def execute(self, image, **options):
+        return run_pipeline_input(image, options)
+
 
 class STLU_GuidedLayers:
     """Run the SeeThrough chain tile by tile, feeding finished tiles forward.
@@ -955,32 +442,6 @@ class STLU_GuidedLayers:
     def execute(self, tiles, indices, layerdiff_model, depth_model, grid_doc="",
                 random_seed=42, resolution=512, num_inference_steps=30,
                 depth_resolution=-1, tblr_split=True, use_lama=True):
-        import comfy.model_management
-        import comfy.utils
-
-        layer_cls = _seethrough_node_class("SeeThrough_GenerateLayers")
-        depth_cls = _seethrough_node_class("SeeThrough_GenerateDepth")
-        post_cls = _seethrough_node_class("SeeThrough_PostProcess")
-        if not (layer_cls and depth_cls and post_cls):
-            raise RuntimeError(
-                "STLU_GuidedLayers: 找不到 SeeThrough 节点（ComfyUI-See-through 未加载？）")
-
-        layer_node, depth_node, post_node = layer_cls(), depth_cls(), post_cls()
-
-        model = _first(layerdiff_model)
-        depth_model = _first(depth_model)
-        seed = int(_first(random_seed, 42))
-        resolution = int(_first(resolution, 512))
-        steps = int(_first(num_inference_steps, 30))
-        depth_res = int(_first(depth_resolution, -1))
-        try:
-            (resolution, steps, depth_res,
-             seed) = stlu_limits.check_all(resolution, steps, depth_res, seed)
-        except ValueError as exc:
-            raise ValueError("STLU ②: %s" % exc) from exc
-        tblr = bool(_first(tblr_split, True))
-        lama = bool(_first(use_lama, True))
-
         doc = None
         raw_grid = _first(grid_doc, "")
         if str(raw_grid or "").strip():
@@ -988,155 +449,15 @@ class STLU_GuidedLayers:
                 doc = tile_psd.load_grid_ref(str(raw_grid))
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(
-                    "STLU ②: 无法读取 ① 的 grid_doc（%s）。"
-                    "请检查 ①→② 的 grid_doc 连线，然后重新 Queue ①。" % exc) from exc
-        guide = dict((doc or {}).get("guide") or {})
-        coords = list((doc or {}).get("coords") or [])
-        # User-placed windows may each carry their own model resolution.
-        # Uniform grid / strips fall through to the single widget value.
-        regions_by_index = {}
-        for region in ((doc or {}).get("partition_plan") or {}).get("regions") or []:
-            if not isinstance(region, dict):
-                continue
-            try:
-                regions_by_index[int(region["index"])] = int(region["resolution"])
-            except (KeyError, TypeError, ValueError):
-                continue
-        # Keys travel through JSON, so they arrive as strings.
-        context_boxes = {}
-        for key, box in ((doc or {}).get("context_boxes") or {}).items():
-            try:
-                context_boxes[int(key)] = [int(v) for v in box[:4]]
-            except (TypeError, ValueError, IndexError):
-                continue
-        if not coords:
-            raise ValueError(
-                "STLU ②: grid_doc 里没有块坐标，无法做引导。"
-                "请确认 ①→② 的 grid_doc 已连接，且 ① 正常完成。")
-        alpha_threshold = int(((doc or {}).get("out") or {}).get("alpha_threshold") or 8)
-
-        tiles = _list_values(tiles)
-        raw_indices = _list_values(indices)
-        total = len(tiles)
-        if not total:
-            return ([], [])
-
-        index_order = []
-        for pos in range(total):
-            raw_index = raw_indices[pos] if pos < len(raw_indices) else pos
-            try:
-                index_order.append(int(str(_first(raw_index, pos)).strip()))
-            except (TypeError, ValueError):
-                index_order.append(pos)
-
-        # Tiles an earlier run already finished in this same folder are real
-        # generated content: merge them as guide now, and step ③ puts them
-        # back into the manifest so a one-tile re-run still merges complete.
-        cached: dict = {}
+                    "STLU ②: 无法读取 ① 的 grid_doc（%s）/ cannot read grid_doc from ①: %s"
+                    " / check the ①→② grid_doc link, then re-queue ①." % (exc, exc)) from exc
+        state = guide_state({"doc": doc or {}})
+        state["doc"] = doc
         run_dir = str(((doc or {}).get("out") or {}).get("dir") or "")
-        if run_dir and guide.get("enabled", True):
-            try:
-                entries = tile_psd.cached_tile_entries(
-                    run_dir, doc, skip=index_order)
-            except Exception as exc:  # noqa: BLE001
-                entries = []
-                print("[STLU] guided: cannot read cached tiles: %s" % exc, flush=True)
-            for entry in entries:
-                rgba = tile_psd.composite_psd(
-                    os.path.join(run_dir, str(entry.get("file") or "")))
-                if rgba is not None:
-                    cached[int(entry["index"])] = rgba
-            if cached:
-                print("[STLU] guided: reusing %d finished tiles from %s" % (
-                    len(cached), run_dir), flush=True)
-
-        print("[STLU] guided: %d tiles, context=%s feather=%s strength=%s" % (
-            total, guide.get("enabled", True), guide.get("feather"),
-            guide.get("strength")), flush=True)
-
-        pbar = comfy.utils.ProgressBar(total)
-        generated: dict = dict(cached)
-        fixed = set(cached)
-        parts_out: list = []
-        indices_out: list = []
-
-        for pos, tile in enumerate(tiles):
-            index = index_order[pos]
-            comfy.model_management.throw_exception_if_processing_interrupted()
-
-            # Per-window resolution when the document names one; otherwise the
-            # single widget value (uniform grid / subject strips).
-            tile_res = int(regions_by_index.get(index, resolution))
-            tile_depth = depth_res if depth_res == -1 else min(depth_res, tile_res)
-            input_box = context_boxes.get(index)
-            input_tile = _apply_tile_guide(
-                tile, index, coords, generated, guide, alpha_threshold,
-                fixed=fixed, input_box=input_box, done=set(generated))
-
-            try:
-                parts, composite = _run_seethrough_tile(
-                    layer_node, depth_node, post_node, input_tile, model,
-                    depth_model, seed, tile_res, steps, tile_depth, tblr,
-                    lama, alpha_threshold)
-            except comfy.model_management.InterruptProcessingException:
-                raise
-            except Exception as exc:  # noqa: BLE001 - add the tile number
-                raise RuntimeError(
-                    "STLU ②: 第 %d 块生成失败（%s: %s）。\n%s"
-                    % (index, type(exc).__name__, exc,
-                       traceback.format_exc())) from exc
-            if composite["status"] == GUIDE_ERROR:
-                raise RuntimeError(
-                    "STLU ②: 第 %d 块合成失败（%s）。这是代码/部件数据错误，"
-                    "不是模型生成的空块；已停止本次运行。\n%s"
-                    % (index, composite.get("error") or "unknown",
-                       composite.get("traceback") or ""))
-
-            # An all-transparent result is a model collapse, not a real empty
-            # tile: retry this one tile on a new seed before giving up.  The
-            # input tile stays the same -- nothing about the guide changes.
-            attempt = 0
-            while composite["status"] == GUIDE_EMPTY and attempt < GUIDED_EMPTY_RETRIES:
-                attempt += 1
-                retry_seed = (seed + attempt * 0x9E3779B1) % (2 ** 32)
-                print("[STLU] guided: tile %d came back empty with seed %d, "
-                      "retrying on seed %d (%d/%d)" % (
-                          index, seed, retry_seed, attempt,
-                          GUIDED_EMPTY_RETRIES), flush=True)
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                try:
-                    parts, composite = _run_seethrough_tile(
-                        layer_node, depth_node, post_node, input_tile, model,
-                        depth_model, retry_seed, tile_res, steps, tile_depth,
-                        tblr, lama, alpha_threshold)
-                except comfy.model_management.InterruptProcessingException:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - add the tile number
-                    raise RuntimeError(
-                        "STLU ②: 第 %d 块在重试时生成失败（%s: %s）。\n%s"
-                        % (index, type(exc).__name__, exc,
-                           traceback.format_exc())) from exc
-                if composite["status"] == GUIDE_ERROR:
-                    raise RuntimeError(
-                        "STLU ②: 第 %d 块在重试时合成失败（%s）。\n%s"
-                        % (index, composite.get("error") or "unknown",
-                           composite.get("traceback") or ""))
-            if composite["status"] == GUIDE_EMPTY:
-                print("[STLU] guided: tile %d is still empty after %d "
-                      "retries" % (index, GUIDED_EMPTY_RETRIES), flush=True)
-            else:
-                if input_box:
-                    # The model saw the padded window; everything downstream
-                    # (merge geometry, PSD size, guides) wants the strip box.
-                    parts, composite = _crop_tile_parts(
-                        parts, composite, coords[index], input_box)
-                generated[index] = composite["rgba"]
-            parts_out.append(parts)
-            indices_out.append(str(index))
-            pbar.update(1)
-            print("[STLU] guided: tile %d done (%d/%d)" % (index, pos + 1, total),
-                  flush=True)
-
+        parts_out, indices_out, _guided, _composites = run_guided_tiles(
+            tiles, indices, state, run_dir, layerdiff_model, depth_model,
+            random_seed, resolution, num_inference_steps, depth_resolution,
+            tblr_split, use_lama)
         return (parts_out, indices_out)
 
 class STLU_TilePSD:
@@ -1179,11 +500,8 @@ class STLU_TilePSD:
     CATEGORY = CATEGORY
 
     def execute(self, parts, index, grid_doc="", alpha_threshold=8, wave_doc=""):
-        try:
-            tile_index = int(str(_first(index, "0")).strip())
-        except (TypeError, ValueError):
-            tile_index = 0
-
+        # Legacy facade: parse the JSON documents, then call the same stage
+        # functions the fine-grained ③ nodes use.
         doc = None
         raw_grid = _first(grid_doc, "")
         if str(raw_grid or "").strip():
@@ -1191,10 +509,9 @@ class STLU_TilePSD:
                 doc = tile_psd.load_grid_ref(str(raw_grid))
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(
-                    "STLU_TilePSD: 无法读取 ① 的 grid_doc（%s）。"
-                    "请检查 ①→③ 的 grid_doc 连线。" % exc) from exc
-        out = _grid_out(doc)
-
+                    "STLU_TilePSD: 无法读取 ① 的 grid_doc（%s）/ cannot read grid_doc from ①: %s"
+                    " / check the ①→③ grid_doc link." % (exc, exc)) from exc
+        out = dict(_grid_out(doc))
         wave = None
         raw_wave = _first(wave_doc, "")
         if str(raw_wave or "").strip():
@@ -1203,241 +520,30 @@ class STLU_TilePSD:
             wave = out
         if wave is None:
             raise ValueError(
-                "STLU_TilePSD: 需要 grid_doc（接 STLU_PipelineInput）或 wave_doc（旧版 STLU_Wave）")
-        wave_dir = str(wave["dir"])
-        prefix = str(wave.get("prefix") or out.get("prefix") or "tile")
+                "STLU_TilePSD: 需要 grid_doc（接 STLU_PipelineInput）或 wave_doc（旧版 STLU_Wave）"
+                " / connect grid_doc (STLU_PipelineInput) or wave_doc (legacy STLU_Wave)")
         if "alpha_threshold" in out:
             alpha_threshold = int(out["alpha_threshold"])
+        merged_out = dict(wave or {})
+        merged_out.update(out)
+        merged_out.setdefault("prefix", str(wave.get("prefix") or "tile"))
+        merged_out["alpha_threshold"] = int(alpha_threshold)
+        merged_out["dir"] = str(wave["dir"])
+        merged_doc = dict(doc or {})
+        merged_doc["out"] = merged_out
 
-        if not isinstance(parts, dict):
-            # ``None`` means the upstream node produced nothing at all.  That
-            # is an execution error, not the normal "this edge tile is empty"
-            # case (which arrives as a dict without ``tag2pinfo``).
-            raise ValueError(
-                "STLU_TilePSD: tile %d 没有收到部件（上游返回 %r）。"
-                "请检查 ② 是否正常完成。" % (tile_index, parts))
-        if str(parts.get("status") or "") == "error":
-            raise RuntimeError(
-                "STLU_TilePSD: tile %d 上游报告错误：%s"
-                % (tile_index, parts.get("error") or "unknown"))
-
-        # Locked parts: the per-tile locks set in the ⑤ preview panel.  The
-        # ``_locks/`` snapshot survives a folder reset, so it is tried first;
-        # the previous tile PSD is only a fallback for locks saved before the
-        # store existed.  Either source can revive a tile the new run left
-        # empty.
-        coords = (doc or {}).get("coords") or []
-        src = (doc or {}).get("source") or {}
-        source = None
-        try:
-            if int(src.get("width") or 0) > 0 and int(src.get("height") or 0) > 0:
-                source = [int(src["width"]), int(src["height"])]
-        except (TypeError, ValueError):
-            source = None
-        locks = []
-        seen_locks = set()
-        for name in tile_psd.tile_locks(wave_dir).get(tile_index, []):
-            name = str(name).strip()
-            if name and name.lower() not in seen_locks:
-                seen_locks.add(name.lower())
-                locks.append(name)
-        if locks:
-            parts = dict(parts)
-            restored, loaded = tile_psd.restore_locked_parts(
-                parts, wave_dir, tile_index, locks, coords=coords, source=source)
-            missing = [name for name in locks
-                       if name.strip().lower() not in loaded]
-            if missing:
-                old_path = tile_psd.find_tile_psd(wave_dir, prefix, tile_index)
-                if old_path:
-                    previous = tile_psd.read_manifest(wave_dir) or {}
-                    old_entry = None
-                    for entry in previous.get("tiles") or []:
-                        try:
-                            if int(entry.get("index", -1)) == tile_index:
-                                old_entry = entry
-                                break
-                        except (TypeError, ValueError):
-                            continue
-                    try:
-                        row, col = (tile_psd.tile_rc(coords, tile_index)
-                                    if coords else (0, 0))
-                        tile_folder = ("tile_%02d_r%d_c%d" % (tile_index, row, col)
-                                       if coords else "tile_%02d" % tile_index)
-                    except Exception:  # noqa: BLE001 - fall back to no depth reuse
-                        tile_folder = "tile_%02d" % tile_index
-                    images_dir = os.path.join(wave_dir, "images", tile_folder)
-                    restored.extend(tile_psd.replace_locked_parts(
-                        parts, old_path, missing, old_entry,
-                        images_dir=images_dir))
-            if restored:
-                print("[STLU] tile %d: kept locked parts: %s" % (
-                    tile_index, ", ".join(sorted(set(restored)))), flush=True)
-
-        if not (parts.get("tag2pinfo") or {}):
-            # Still nothing to write: skip the tile (an edge tile with no
-            # content and no locks to restore).
-            return {"ui": {"stlu_tile": [{"index": tile_index, "status": "empty"}]},
-                    "result": ({"index": tile_index, "status": "empty"},)}
-
-        frame = (parts.get("frame_size") or (0, 0))
-        if (int(frame[0]) <= 0 or int(frame[1]) <= 0) and (doc or {}).get("tile_size"):
-            tw, th = (int(v) for v in (doc["tile_size"] or [0, 0])[:2])
-            frame = (th, tw)
-            parts["frame_size"] = frame
-        tile_size = tuple(int(v) for v in ((doc or {}).get("tile_size") or (frame[1], frame[0])))
-        overlap = int((doc or {}).get("overlap") or 0)
-        src = (doc or {}).get("source") or {}
-        source_size = (int(src.get("width") or 0), int(src.get("height") or 0))
-        if source_size[0] <= 0 or source_size[1] <= 0:
-            source_size = None
-
-        try:
-            psd_manifest = tile_psd.write_tiles(
-                [parts],
-                _output_root(),
-                filename_prefix=prefix,
-                merge_parts=True,
-                alpha_threshold=int(alpha_threshold),
-                source_size=source_size,
-                tile_size=tile_size,
-                overlap=overlap,
-                tile_index_map=[tile_index],
-                write_depth=True,
-                original_rgba=None,
-                merge_group_layers=True,
-                include_original=True,
-                run_dir_abs=wave_dir,
-                write_manifest=False,
-                # The grid's own boxes, so a phased grid lands where it was cut.
-                tile_coords=(doc or {}).get("coords") or None,
-                grid_offset=(doc or {}).get("offset") or (0, 0),
-            )
-        except ValueError as exc:
-            # Say which tile came up empty: "every tile ended up empty" alone
-            # gives no way to tell this apart from a layout bug.
-            raise ValueError("STLU_TilePSD: tile %d: %s" % (tile_index, exc)) from exc
-        entry = psd_manifest["tiles"][0]
-
-        images_manifest = tile_psd.write_tile_images(
-            [parts],
-            _output_root(),
-            filename_prefix=prefix,
-            grid_doc=doc,
-            tile_index_map=[tile_index],
-            source_size=source_size,
-            original_rel="../original.png",
-            run_dir_abs=os.path.join(wave_dir, "images"),
-            write_index=False,
-        )
-        image_entry = images_manifest["tiles"][0]
-
-        # Refresh the lock snapshots from what was actually written.  This
-        # migrates locks that came from the old PSD and keeps every locked
-        # layer safe for the next time a parameter change clears the folder.
-        present = {str(tag).lower() for tag in (parts.get("tag2pinfo") or {})}
-        lock_names = [name for name in locks if name.strip().lower() in present]
-        if lock_names:
-            tile_psd.store_locked_parts(
-                wave_dir, tile_index, parts, lock_names,
-                tile_box=entry.get("tile"), canvas=entry.get("canvas"),
-                source=source)
-
-        record = {
-            "index": int(tile_index),
-            "status": "ok",
-            "entry": entry,
-            "image": image_entry,
-        }
-        print("[STLU] tile %d -> %s" % (tile_index, entry.get("file")), flush=True)
-        return {"ui": {"stlu_tile": [{"index": tile_index, "file": entry.get("file")}]},
+        plan = {"doc": merged_doc}
+        parts = restore_locks(parts, plan, index)
+        record = write_tile_psd(parts, plan, index)
+        if record.get("status") == "empty":
+            return {"ui": {"stlu_tile": [{"index": record["index"],
+                                          "status": "empty"}]},
+                    "result": ({"index": record["index"], "status": "empty"},)}
+        images = write_tile_images(parts, plan, index)
+        record["image"] = images.get("entry")
+        return {"ui": {"stlu_tile": [{"index": record["index"],
+                                      "file": record.get("file")}]},
                 "result": (record,)}
-
-def _restore_locked_orphans(wave_dir, doc, prefix, entries, image_entries,
-                            alpha_threshold):
-    """Rebuild tiles this run did not select from their locked-part snapshots.
-
-    A reset clears the folder down to the tiles this queue click generated, so
-    a locked part living in any other tile would disappear with it.  The
-    ``_locks/`` store survives the reset, so those tiles are written back with
-    just their locked layers and join the manifest (and therefore the merge).
-    """
-    locks = tile_psd.tile_locks(wave_dir)
-    if not locks:
-        return [], []
-    have = set()
-    for entry in entries:
-        try:
-            have.add(int(entry.get("index", -1)))
-        except (TypeError, ValueError):
-            continue
-    pending = [index for index in sorted(locks) if index not in have]
-    if not pending:
-        return [], []
-    coords = (doc or {}).get("coords") or []
-    src = (doc or {}).get("source") or {}
-    source = None
-    try:
-        source = [int(src["width"]), int(src["height"])]
-    except (KeyError, TypeError, ValueError):
-        source = None
-    tile_size = []
-    try:
-        tile_size = [int(v) for v in ((doc or {}).get("tile_size") or [])
-                     if v is not None][:2]
-    except (TypeError, ValueError):
-        tile_size = []
-    made_entries = []
-    made_images = []
-    for index in pending:
-        parts = tile_psd.snapshot_parts(
-            wave_dir, index, coords=coords, source=source)
-        if not parts:
-            print("[STLU] locked tile %d not restored: its crop layout changed"
-                  % index, flush=True)
-            continue
-        frame_h, frame_w = (int(v) for v in parts["frame_size"][:2])
-        size_pair = tile_size if len(tile_size) == 2 else [frame_w, frame_h]
-        try:
-            manifest = tile_psd.write_tiles(
-                [parts], _output_root(),
-                filename_prefix=prefix,
-                merge_parts=True,
-                alpha_threshold=int(alpha_threshold),
-                source_size=tuple(source) if source else None,
-                tile_size=tuple(size_pair),
-                overlap=int((doc or {}).get("overlap") or 0),
-                tile_index_map=[index],
-                write_depth=True,
-                original_rgba=None,
-                merge_group_layers=True,
-                include_original=False,
-                run_dir_abs=wave_dir,
-                write_manifest=False,
-                tile_coords=coords or None,
-                grid_offset=(doc or {}).get("offset") or (0, 0),
-            )
-            image_manifest = tile_psd.write_tile_images(
-                [parts], _output_root(),
-                filename_prefix=prefix,
-                grid_doc=doc,
-                tile_index_map=[index],
-                source_size=source,
-                original_rel="../original.png",
-                run_dir_abs=os.path.join(wave_dir, "images"),
-                write_index=False,
-            )
-        except (ValueError, OSError) as exc:
-            print("[STLU] could not restore locked tile %d: %s" % (index, exc),
-                  flush=True)
-            continue
-        made_entries.append(manifest["tiles"][0])
-        made_images.append(image_manifest["tiles"][0])
-        print("[STLU] restored tile %d from locked parts: %s" % (
-            index, ", ".join(sorted((parts.get("tag2pinfo") or {}).keys()))),
-            flush=True)
-    return made_entries, made_images
-
 
 class STLU_WaveIndex:
     """Stage ③: write the wave-wide manifest after every tile is saved.
@@ -1485,32 +591,17 @@ class STLU_WaveIndex:
     OUTPUT_NODE = True
 
     def execute(self, tiles, original, grid_doc="", wave_doc=""):
-        raw_records = [r for r in _list_values(tiles) if isinstance(r, dict)]
-        empty_tiles = [int(r.get("index", -1)) for r in raw_records
-                       if r.get("status") == "empty" or r.get("empty")]
-        records = [r for r in raw_records
-                   if r.get("status") not in ("empty", "error")
-                   and not r.get("empty")]
-
-        raw_grid = _first(grid_doc, "")
+        # Legacy facade over save_original + write_manifest.
         doc = None
+        raw_grid = _first(grid_doc, "")
         if str(raw_grid or "").strip():
             try:
                 doc = tile_psd.load_grid_ref(str(raw_grid))
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(
-                    "STLU_WaveIndex: 无法读取 ① 的 grid_doc（%s）。"
-                    "请检查 ①→③ 的 grid_doc 连线。" % exc) from exc
-        out = _grid_out(doc)
-        raw_seam = out.get("seam_feather")
-        if raw_seam is None:
-            raw_seam = tile_psd.DEFAULT_SEAM_FEATHER
-        # 0 is a legal alpha threshold (nothing counts as transparent), so
-        # only a missing value falls back to the default.
-        raw_alpha = out.get("alpha_threshold")
-        alpha_threshold = (tile_psd.DEFAULT_ALPHA_THRESHOLD if raw_alpha is None
-                           else int(raw_alpha))
-
+                    "STLU_WaveIndex: 无法读取 ① 的 grid_doc（%s）/ cannot read grid_doc from ①: %s"
+                    " / check the ①→③ grid_doc link." % (exc, exc)) from exc
+        out = dict(_grid_out(doc))
         wave = None
         if str(_first(wave_doc, "") or "").strip():
             wave = _wave_doc(wave_doc)
@@ -1518,241 +609,27 @@ class STLU_WaveIndex:
             wave = out
         if wave is None:
             raise ValueError(
-                "STLU_WaveIndex: 需要 grid_doc（接 STLU_PipelineInput）或 wave_doc（旧版 STLU_Wave）")
-        wave_dir = str(wave["dir"])
-        rel = str(out.get("rel") or wave.get("rel") or "")
-        prefix = str(out.get("prefix") or wave.get("prefix") or "tile")
-        group_name = str(out.get("group") or wave.get("group") or "")
-        wave_id_value = str(out.get("wave") or wave.get("wave") or "")
-        os.makedirs(wave_dir, exist_ok=True)
-
-        # The folder is fixed now, so it can already hold tiles from earlier
-        # runs.  Read that manifest BEFORE overwriting it: those tiles join
-        # this run's manifest (unless re-generated now) and therefore the
-        # automatic merge, which is what makes a partial re-run complete.
-        previous = tile_psd.read_manifest(wave_dir)
-
-        # The full pixel-affecting settings travel inside grid_doc.  Keep the
-        # document used for cache checks in sync so a folder written by a
-        # different resolution / seed / model can never be mixed in.
-        generation = dict((doc or {}).get("generation") or {})
-        generation_id = str((doc or {}).get("generation_id") or "")
-        if not generation:
-            stored = tile_psd.read_generation(wave_dir) or {}
-            generation = dict(stored.get("generation") or {})
-            generation_id = str(stored.get("generation_id") or "")
-        cache_doc = dict(doc or {})
-        cache_doc["generation"] = generation
-        cache_doc["generation_id"] = generation_id
-
-        # One untouched source per wave; images.json points at this copy
-        # instead of keeping a second identical PNG in images/.
-        original_name = ""
-        frame = _first(original)
-        fingerprint = str(out.get("fingerprint") or "")
-        if not fingerprint and frame is not None and hasattr(frame, "shape") and frame.ndim >= 4:
-            fingerprint = _image_fingerprint(frame[0])
-        if frame is not None and hasattr(frame, "shape") and frame.ndim >= 4:
-            try:
-                px = frame[0]
-                px = px.detach().cpu().numpy() if hasattr(px, "detach") else np.asarray(px)
-                rgba = np.clip(np.rint(np.asarray(px, dtype=np.float32) * 255.0),
-                               0, 255).astype(np.uint8)
-                if rgba.ndim == 3 and rgba.shape[-1] == 3:
-                    rgba = np.dstack([rgba, np.full(rgba.shape[:2], 255, np.uint8)])
-                from PIL import Image
-                Image.fromarray(np.ascontiguousarray(rgba), "RGBA").save(
-                    os.path.join(wave_dir, "original.png"), compress_level=3)
-                original_name = "original.png"
-            except Exception as exc:  # noqa: BLE001 - tiles still matter more
-                print("[STLU] original.png failed: %s" % exc, flush=True)
-
-        entries = []
-        image_entries = []
-        run_indices = set()
-        for record in records:
-            entry = dict(record.get("entry") or {})
-            entries.append(entry)
-            run_indices.add(int(entry.get("index", -1)))
-            image_entry = dict(record.get("image") or {})
-            if image_entry:
-                image_entries.append(image_entry)
-
-        # Finished tiles from earlier runs in this same folder.
-        try:
-            cached = tile_psd.cached_tile_entries(
-                wave_dir, cache_doc, skip=run_indices, manifest=previous)
-        except Exception as exc:  # noqa: BLE001
-            cached = []
-            print("[STLU] cannot reuse cached tiles: %s" % exc, flush=True)
-        reused_indices = []
-        if cached:
-            entries.extend(cached)
-            reused_indices = [int(e.get("index", -1)) for e in cached]
-            prev_images = {}
-            images_path = os.path.join(wave_dir, "images", "images.json")
-            if os.path.isfile(images_path):
-                try:
-                    with open(images_path, "r", encoding="utf-8") as handle:
-                        prev_doc = json.load(handle)
-                    prev_images = {int(t.get("index", -1)): t
-                                   for t in prev_doc.get("tiles") or []}
-                except Exception:  # noqa: BLE001
-                    prev_images = {}
-            have_images = {int(e.get("index", -1)) for e in image_entries}
-            for entry in cached:
-                index = int(entry.get("index", -1))
-                image_entry = prev_images.get(index)
-                if image_entry and index not in have_images:
-                    image_entries.append(dict(image_entry))
-
-        # Tiles the current selection did not touch (after a reset the folder
-        # holds only the selected ones).  Locked parts keep their own snapshot,
-        # so those tiles are rebuilt instead of silently vanishing.
-        restored_entries, restored_images = _restore_locked_orphans(
-            wave_dir, doc, prefix, entries, image_entries, alpha_threshold)
-        restored_indices = []
-        if restored_entries:
-            entries.extend(restored_entries)
-            image_entries.extend(restored_images)
-            restored_indices = [int(e.get("index", -1)) for e in restored_entries]
-
-        entries.sort(key=lambda e: int(e.get("index", -1)))
-        for slot, entry in enumerate(entries):
-            entry["slot"] = int(slot)
-        image_entries.sort(key=lambda e: int(e.get("index", -1)))
-        for slot, entry in enumerate(image_entries):
-            entry["slot"] = int(slot)
-
-        if not entries:
-            raise ValueError("STLU_WaveIndex: every tile ended up empty")
-        if reused_indices:
-            print("[STLU] reusing %d tiles from an earlier run: %s" % (
-                len(reused_indices), reused_indices), flush=True)
-
-        src = (doc or {}).get("source") or {}
-        if int(src.get("width") or 0) > 0 and int(src.get("height") or 0) > 0:
-            source_size = [int(src["width"]), int(src["height"])]
-        else:
-            source_size = [
-                max(int(e["tile"][2]) for e in entries),
-                max(int(e["tile"][3]) for e in entries),
-            ]
-        tile_size = [int(v) for v in ((doc or {}).get("tile_size") or entries[0]["canvas"])]
-        overlap = int((doc or {}).get("overlap") or 0)
-
-        richest = max(entries, key=lambda e: len(e.get("layers") or []))
-        preview_name = str(richest.get("preview") or "")
-        images_dir = os.path.relpath(os.path.join(wave_dir, "images"),
-                                     _output_root()).replace(os.sep, "/")
-
-        manifest = {
-            "dir": rel,
-            "prefix": prefix,
-            "merge_parts": True,
-            "source": source_size,
-            "tile_size": tile_size,
-            "overlap": overlap,
-            "offset": tile_psd._int_pair((doc or {}).get("offset")),
-            "preview": preview_name,
-            "original": original_name,
-            "has_depth": any(e.get("depth") for e in entries),
-            "group_layers": True,
-            "seam_feather": max(0, int(raw_seam)),
-            "alpha_threshold": int(alpha_threshold),
-            "mode": str((doc or {}).get("mode") or "uniform"),
-            "partition_plan": (doc or {}).get("partition_plan") or None,
-            "source_fingerprint": fingerprint,
-            "tiles": entries,
-            "count": len(entries),
-            "run_tiles": sorted(run_indices),
-            "reused_tiles": sorted(reused_indices),
-            "restored_tiles": sorted(restored_indices),
-            "generation": generation,
-            "generation_id": generation_id,
-            "images_dir": images_dir,
-            "group": group_name,
-            "wave": wave_id_value,
-            "prompt_id": _prompt_id(),
-        }
-        manifest_path = os.path.join(wave_dir, "manifest.json")
-        json_io.write_json_atomic(manifest_path, manifest)
-
-        images_doc = {
-            "version": 1,
-            "kind": tile_psd.IMAGES_KIND,
-            "dir": images_dir,
-            "prefix": prefix,
-            "source": source_size,
-            "tile_size": tile_size,
-            "overlap": overlap,
-            "offset": tile_psd._int_pair((doc or {}).get("offset")),
-            "original": "../original.png" if original_name else "",
-            "tiles": image_entries,
-            "count": len(image_entries),
-        }
-        images_dir_abs = os.path.join(wave_dir, "images")
-        os.makedirs(images_dir_abs, exist_ok=True)
-        json_io.write_json_atomic(
-            os.path.join(images_dir_abs, "images.json"), images_doc)
-
-        total = 0
-        for entry in entries:
-            path = os.path.join(wave_dir, str(entry.get("file") or ""))
-            if os.path.isfile(path):
-                total += os.path.getsize(path)
-
-        preview = None
-        preview_path = os.path.join(wave_dir, preview_name) if preview_name else ""
-        if preview_path and os.path.isfile(preview_path):
-            preview = {
-                "filename": preview_name,
-                "subfolder": rel,
-                "type": "output",
-                "v": int(os.path.getmtime(preview_path) * 1000),
-            }
-        info = {
-            "dir": rel,
-            "subfolder": rel,
-            "filename": entries[0].get("file"),
-            "count": len(entries),
-            "layers": len(entries[0].get("layers") or []),
-            "canvas": entries[0].get("canvas"),
-            "size": total,
-            "merged": True,
-            "merged_psd": None,
-            "merge_error": None,
-            "preview": preview,
-            "images_dir": images_dir,
-            "images_error": None,
-            "group": group_name,
-            "wave": wave_id_value,
-            "run_tiles": sorted(run_indices),
-            "reused_tiles": sorted(reused_indices),
-            "restored_tiles": sorted(restored_indices),
-            "empty_tiles": empty_tiles,
-            "generation_id": generation_id,
-            "algo_version": (generation or {}).get("algo_version"),
-            "error": None,
-        }
-        _notify("stlu.tiles", info)
-        print("[STLU] %d tile PSDs written: %s" % (len(entries), wave_dir), flush=True)
-        merge_doc = {
-            "dir": rel,
-            "name": str(out.get("merge_name") or "merged"),
-            "group_layers": bool(out.get("group_layers", True)),
-            "include_depth": bool(out.get("include_depth", False)),
-            "include_original": bool(out.get("include_original", False)),
-            "seam_feather": max(0, int(raw_seam)),
-            "alpha_threshold": int(alpha_threshold),
-            "wave": wave_id_value,
-            "prompt_id": _prompt_id(),
-        }
-        return {
-            "ui": {"stlu_tiles": [info]},
-            "result": (wave_dir, json.dumps(manifest, ensure_ascii=False, indent=2),
-                       json.dumps(merge_doc, ensure_ascii=False, separators=(",", ":"))),
-        }
+                "STLU_WaveIndex: 需要 grid_doc（接 STLU_PipelineInput）或 wave_doc（旧版 STLU_Wave）"
+                " / connect grid_doc (STLU_PipelineInput) or wave_doc (legacy STLU_Wave)")
+        merged_out = dict(wave or {})
+        merged_out.update(out)
+        merged_out.setdefault("prefix", str(wave.get("prefix") or "tile"))
+        merged_out["dir"] = str(wave["dir"])
+        merged_doc = dict(doc or {})
+        merged_doc["out"] = merged_out
+        plan = {"doc": merged_doc}
+        original_name = save_original(original, plan)
+        # 每块的 images/ 条目由 ③ 的逐块节点带在记录里，旧门面在这里取出来。
+        image_records = [{"entry": r["image"]} for r in (tiles or [])
+                         if isinstance(r, dict) and isinstance(r.get("image"), dict)]
+        result = write_manifest(tiles, image_records, original_name, plan)
+        manifest_json = json.dumps(result["manifest"], ensure_ascii=False,
+                                   indent=2)
+        merge_json = json.dumps(result["merge_doc"], ensure_ascii=False,
+                                separators=(",", ":"))
+        info = result["info"]
+        return {"ui": {"stlu_tiles": [info]},
+                "result": (merged_out["dir"], manifest_json, merge_json)}
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
@@ -1793,7 +670,7 @@ class STLU_RebuildPSD:
                 tiles="", alpha_threshold=8):
         raw_source = str(source or "").strip()
         if not raw_source:
-            raise ValueError("STLU_RebuildPSD: 选择一个已有的波次目录或 *_layers.json")
+            raise ValueError("STLU_RebuildPSD: 选择一个已有的波次目录或 *_layers.json / pick an existing run folder or a *_layers.json")
         source_path = _resolve_workspace_path(raw_source)
         if not os.path.exists(source_path):
             raise FileNotFoundError("image source not found: %s" % source_path)
@@ -1931,59 +808,146 @@ class STLU_TileMerge:
                 "group_layers": bool(group_layers),
                 "include_depth": bool(include_depth),
                 "include_original": bool(include_original),
-                "skipped": "没有指定分块目录",
+                "skipped": "没有指定分块目录 / no tile folder specified",
             }]}, "result": ("",)}
-
-        path = _resolve_workspace_path(rel)
-        if not os.path.isdir(path):
-            raise FileNotFoundError("tile run folder not found: %s" % path)
-        if not os.path.isfile(os.path.join(path, "manifest.json")):
-            raise FileNotFoundError(
-                "manifest.json not found in %s" % path)
 
         # The merge must use the same transparency cutoff the tiles were
         # written with; ① travels it through merge_doc, older runs only have
         # it in the manifest (merge_run reads it from there).
         raw_alpha = (parsed.get("alpha_threshold")
                      if isinstance(parsed, dict) else None)
-        info = tile_psd.merge_run(
-            path,
-            name=str(name or "merged"),
-            alpha_threshold=None if raw_alpha is None else int(raw_alpha),
-            group_layers=bool(group_layers),
-            # Depth is optional, but when it is exported it is always its own
-            # PSD -- merge never puts it inside the colour one.
-            include_depth=bool(include_depth),
-            include_original=bool(include_original),
-            seam_feather=max(0, int(seam_feather)),
-        )
-        info["dir"] = os.path.relpath(path, _output_root()).replace(os.sep, "/")
-
-        psd_path = os.path.join(path, info.get("file") or "")
-        payload = {
-            "dir": info["dir"],
-            "name": str(name or "merged"),
-            "group_layers": bool(group_layers),
-            "include_depth": bool(include_depth),
-            "include_original": bool(include_original),
-            "file": info.get("file"),
-            "preview": info.get("preview"),
-            "depth": info.get("depth"),
-            "depth_psd": info.get("depth_psd"),
-            "original": info.get("original"),
-            "canvas": info.get("canvas"),
-            "layers": info.get("layers"),
-            "groups": info.get("groups"),
-            "tiles": info.get("tiles"),
-            "notes": info.get("notes"),
-        }
-        _notify("stlu.tile_merge", payload)
-        print("[STLU] merged %d tiles -> %s" % (len(info.get("tiles") or []), psd_path), flush=True)
-        return {"ui": {"stlu_tile_merge": [payload]}, "result": (psd_path,)}
+        result = merge_run_doc({
+            "dir": rel,
+            "name": name,
+            "group_layers": group_layers,
+            "include_depth": include_depth,
+            "include_original": include_original,
+            "seam_feather": seam_feather,
+            "alpha_threshold": raw_alpha,
+        })
+        return {"ui": {"stlu_tile_merge": [result["payload"]]},
+                "result": (result["psd_path"],)}
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
+
+_GUIDE_THUMB_MAX = 384
+_GUIDE_INDEX = "inputs.json"
+
+
+def _write_guide_index(dest_dir: str, indices) -> None:
+    """Record which tiles have a persisted input picture.
+
+    The panel trusts this list rather than the bare PNGs, so pictures left
+    over from an earlier run (a bigger grid) never show up on a row that
+    this run did not generate.  Rewritten only when the content changes so
+    the file's mtime stays a usable cache stamp.
+    """
+    wanted = sorted(int(i) for i in indices)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        path = os.path.join(dest_dir, _GUIDE_INDEX)
+        data = json.dumps({"indices": wanted})
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                if fh.read() == data:
+                    _prune_guide_files(dest_dir, wanted)
+                    return
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        _prune_guide_files(dest_dir, wanted)
+    except OSError as exc:  # noqa: BLE001 - the panel just falls back to dash
+        print("[STLU] guide index not written: %s" % exc, flush=True)
+
+
+def _prune_guide_files(dest_dir: str, keep) -> None:
+    kept = set(int(i) for i in keep)
+    try:
+        names = os.listdir(dest_dir)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith("stlu_guide_") and name.endswith(".png")):
+            continue
+        try:
+            index = int(name[len("stlu_guide_"):-len(".png")])
+        except ValueError:
+            continue
+        if index in kept:
+            continue
+        try:
+            os.remove(os.path.join(dest_dir, name))
+        except OSError:
+            pass
+
+
+def _guide_thumb(tensor, index: int, dest_dir: str = "") -> dict:
+    """White-backed thumbnail of one tile's model input.
+
+    This is the debug picture ② used to hand to a PreviewImage: the tile
+    after guide backfill and context padding, i.e. exactly what the seam
+    models saw.  The ⑤ panel shows it on the tile's own row instead of a
+    second preview node flooding the queue with images.
+
+    With ``dest_dir`` the picture is also written there under a stable name
+    (so the panel can find it again after a refresh); otherwise only the
+    throwaway ``temp/`` copy is kept.
+    """
+    if tensor is None:
+        return {}
+    try:
+        arr = tensor.detach().cpu().float().numpy()
+    except Exception:  # noqa: BLE001 - plain numpy arrays are accepted too
+        arr = np.asarray(tensor, dtype=np.float32)
+    if arr.ndim == 4:
+        if not arr.shape[0]:
+            return {}
+        arr = arr[0]
+    if arr.ndim != 3 or arr.shape[-1] not in (1, 3, 4):
+        return {}
+    arr = np.clip(arr, 0.0, 1.0)
+    rgb = arr[..., :3]
+    if arr.shape[-1] == 4:
+        alpha = arr[..., 3:4]
+        rgb = rgb * alpha + (1.0 - alpha)
+    elif arr.shape[-1] == 1:
+        rgb = np.repeat(arr, 3, axis=-1)
+    from PIL import Image
+    image = Image.fromarray(
+        np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8), "RGB")
+    if max(image.width, image.height) > _GUIDE_THUMB_MAX:
+        scale = _GUIDE_THUMB_MAX / float(max(image.width, image.height))
+        image = image.resize(
+            (max(1, int(round(image.width * scale))),
+             max(1, int(round(image.height * scale)))),
+            Image.Resampling.LANCZOS)
+    if dest_dir:
+        # Persisted next to the run so the ⑤ panel can still show each tile's
+        # model input after a browser refresh (the temp file survives a
+        # refresh but nothing maps tile -> file once the payload is gone).
+        os.makedirs(dest_dir, exist_ok=True)
+        name = "stlu_guide_%02d.png" % int(index)
+        path = os.path.join(dest_dir, name)
+        image.save(path, compress_level=3)
+        sub = _relative_to_output(dest_dir)
+        if sub is not None:
+            return {"filename": name, "subfolder": sub, "type": "output",
+                    "v": int(os.path.getmtime(path) * 1000)}
+    temp = folder_paths.get_temp_directory()
+    os.makedirs(temp, exist_ok=True)
+    digest = hashlib.sha1(
+        ("%d|%d|%d|" % (index, image.width, image.height)).encode("utf-8")
+        + np.asarray(image).tobytes()).hexdigest()[:10]
+    name = "stlu_guide_%02d_%s.png" % (int(index), digest)
+    path = os.path.join(temp, name)
+    if not os.path.isfile(path):
+        image.save(path, compress_level=3)
+    return {"filename": name, "subfolder": "", "type": "temp",
+            "v": int(os.path.getmtime(path) * 1000)}
+
 
 class STLU_PSDPreview:
     """Show the merged PSD inside the graph through its own panel.
@@ -1993,11 +957,15 @@ class STLU_PSDPreview:
     tensor, while the panel drawn by ``web/stlu.js`` shows a compact overview
     plus the per-tile / per-part groups.  Point it at the ``psd_path`` output
     of ④, or at the run folder (it then picks ``merged.psd``).
+
+    ``guide_images`` is optional: ② can hand over the per-tile pictures it
+    actually fed the model, and the panel puts each on its tile's row.
     """
 
     DESCRIPTION = (
         "显示合并后的 PSD。接 ④ 的 psd_path，或直接填输出文件夹；面板先给全身总览，"
-        "再按块 / 按部位分组列出拆分图。纯 CPU。"
+        "再按块 / 按部位分组列出拆分图。老版把 ② 的 guided_inputs / indices "
+        "接进来，每块那一行还会多一张「输入」——引导回填后真正送进模型的图。纯 CPU。"
     )
 
     @classmethod
@@ -2013,6 +981,13 @@ class STLU_PSDPreview:
                 "show_parts": ("BOOLEAN", {"default": True,
                                            "tooltip": "兼容旧工作流的开关：面板现在始终"
                                                       "按块 / 按部位列出拆分图。"}),
+                "guide_images": ("IMAGE", {
+                    "forceInput": True,
+                    "tooltip": "② 的 guided_inputs：每块回填后真正送进模型的图；"
+                               "接上后「按块」每一行多一张「输入」缩略图。"}),
+                "guide_indices": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "② 的 indices，与 guided_inputs 一一对应。"}),
             },
         }
 
@@ -2025,10 +1000,11 @@ class STLU_PSDPreview:
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
 
-    def execute(self, psd_path, max_side=1600, show_parts=True):
+    def execute(self, psd_path, max_side=1600, show_parts=True,
+                guide_images=None, guide_indices=None):
         raw = str(psd_path or "").strip()
         if not raw:
-            raise ValueError("STLU_PSDPreview: 接上 ④ 的 psd_path（或填输出文件夹）")
+            raise ValueError("STLU_PSDPreview: 接上 ④ 的 psd_path（或填输出文件夹）/ connect ④'s psd_path (or fill in the output folder)")
         path = _resolve_workspace_path(raw)
         if os.path.isdir(path):
             manifest = tile_psd.read_manifest(path) or {}
@@ -2042,14 +1018,14 @@ class STLU_PSDPreview:
                     and not name.lower().endswith("_depth.psd")
                 ]
                 if not candidates:
-                    raise FileNotFoundError("PSD 预览：%s 里没有 .psd" % raw)
+                    raise FileNotFoundError("PSD preview: no .psd in %s" % raw)
                 path = os.path.join(path, candidates[0])
         if not os.path.isfile(path):
-            raise FileNotFoundError("PSD 预览：找不到 %s" % path)
+            raise FileNotFoundError("PSD preview: not found: %s" % path)
 
         rgba = tile_psd.composite_psd(path)
         if rgba is None:
-            raise ValueError("PSD 预览：读不出 %s" % path)
+            raise ValueError("PSD preview: cannot read %s" % path)
         arr = rgba.astype(np.float32) / 255.0
         alpha = arr[..., 3:4]
         rgb = np.clip(np.rint((arr[..., :3] * alpha + (1.0 - alpha)) * 255.0),
@@ -2072,6 +1048,13 @@ class STLU_PSDPreview:
             int(rgb.shape[1]), int(rgb.shape[0])), flush=True)
         tensor = torch.from_numpy(
             np.ascontiguousarray(rgb.astype(np.float32) / 255.0))[None]
+        # Keep this run's model inputs next to the PSD: the panel falls back
+        # to these copies when the browser is refreshed and the execution
+        # payload (stlu_guide) is gone.
+        guide_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "_guide")
+        guide = self._guide_payload(guide_images, guide_indices, guide_dir)
+        _write_guide_index(guide_dir, [item["index"] for item in guide])
+
         return {
             "ui": {
                 "stlu_parts": [{
@@ -2081,9 +1064,33 @@ class STLU_PSDPreview:
                     "path": os.path.abspath(path),
                     "canvas": [width, height],
                 }],
+                # Per-tile model inputs travel with the panel instead of a
+                # separate PreviewImage: one small PNG per tile, keyed by the
+                # grid index so the panel pins it to the right row.
+                "stlu_guide": guide,
             },
             "result": (tensor,),
         }
+
+    @staticmethod
+    def _guide_payload(guide_images, guide_indices, dest_dir=""):
+        if guide_images is None:
+            return []
+        frames = guide_images if isinstance(guide_images, (list, tuple)) \
+            else [guide_images]
+        raw_indices = (guide_indices if isinstance(guide_indices, (list, tuple))
+                       else [guide_indices])
+        out = []
+        for pos, frame in enumerate(frames):
+            raw = raw_indices[pos] if pos < len(raw_indices) else pos
+            try:
+                index = int(str(raw).strip())
+            except (TypeError, ValueError):
+                index = pos
+            ref = _guide_thumb(frame, index, dest_dir)
+            if ref:
+                out.append({"index": index, "image": ref})
+        return out
 
 
     @classmethod
@@ -2093,6 +1100,7 @@ class STLU_PSDPreview:
 
 NODE_CLASS_MAPPINGS = {
     "STLU_PipelineInput": STLU_PipelineInput,
+    "STLU_SimpleInput": STLU_SimpleInput,
     "STLU_GuidedLayers": STLU_GuidedLayers,
     "STLU_TilePSD": STLU_TilePSD,
     "STLU_WaveIndex": STLU_WaveIndex,
@@ -2105,6 +1113,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "STLU_TileMerge": "SeeThrough ④ 合并分格 PSD",
     "STLU_PSDPreview": "SeeThrough ⑤ 预览合并 PSD",
     "STLU_PipelineInput": "SeeThrough ① 用户输入（只改这里）",
+    "STLU_SimpleInput": "SeeThrough ① 用户输入（简化版）",
     "STLU_TilePSD": "SeeThrough ③ 每块存 PSD（自动逐块）",
     "STLU_GuidedLayers": "SeeThrough ② 顺序拆层（带重叠引导）",
     "STLU_WaveIndex": "SeeThrough ③ 写清单（全部块完成后）",
@@ -2113,6 +1122,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 __all__ = [
     "STLU_PipelineInput",
+    "STLU_SimpleInput",
     "STLU_GuidedLayers",
     "STLU_TilePSD",
     "STLU_WaveIndex",
@@ -2131,4 +1141,25 @@ __all__ = [
     "_apply_tile_guide",
     "_crop_tile_parts",
     "_seethrough_node_class",
+    # Stage functions shared with the fine-grained nodes.
+    "crop_tiles",
+    "describe_run",
+    "grid_info",
+    "guide_state",
+    "guide_tile",
+    "make_plan",
+    "merge_run_doc",
+    "normalize_settings",
+    "pick_tiles",
+    "plan_context",
+    "prepare_run",
+    "restore_locks",
+    "run_guided_tiles",
+    "save_original",
+    "tile_context",
+    "tile_index_of",
+    "tile_is_empty",
+    "write_manifest",
+    "write_tile_images",
+    "write_tile_psd",
 ]

@@ -24,11 +24,28 @@ COMFY_ROOT = os.path.dirname(os.path.dirname(PKG_DIR))
 
 REQUIRED = (
     "STLU_PipelineInput",
+    "STLU_SimpleInput",
     "STLU_GuidedLayers",
     "STLU_TilePSD",
     "STLU_WaveIndex",
     "STLU_TileMerge",
     "STLU_PSDPreview",
+    # Transparent (fine-grained) variant: one node per visible step.
+    "STLU_PipelineSettings",
+    "STLU_PlanGrid",
+    "STLU_PickTiles",
+    "STLU_PlanContext",
+    "STLU_PrepareRun",
+    "STLU_CropTiles",
+    "STLU_GuideTile",
+    "STLU_SeqTileLoop",
+    "STLU_CropBack",
+    "STLU_RestoreLocks",
+    "STLU_WriteTilePSD",
+    "STLU_WriteTileImages",
+    "STLU_SaveOriginal",
+    "STLU_WriteManifest",
+    "STLU_MergeTiles",
 )
 
 _failures = []
@@ -81,7 +98,7 @@ def main():
     mappings = getattr(module, "NODE_CLASS_MAPPINGS", {})
     names = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
     check(bool(mappings), "NODE_CLASS_MAPPINGS is not empty (%d)" % len(mappings))
-    check(len(mappings) == 29, "all 29 nodes register (%d)" % len(mappings))
+    check(len(mappings) == 45, "all 45 nodes register (%d)" % len(mappings))
     check(set(names) == set(mappings), "every node has a display name")
 
     missing = [name for name in REQUIRED if name not in mappings]

@@ -81,7 +81,10 @@ def test_signatures():
     for name, cls in stlu.NODE_CLASS_MAPPINGS.items():
         types = cls.INPUT_TYPES()
         wanted = list(types.get("required", {})) + list(types.get("optional", {}))
-        params = set(inspect.signature(cls.execute).parameters)
+        signature = inspect.signature(cls.execute).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.values()):
+            continue  # **options takes the whole widget set (STLU_PipelineInput)
+        params = set(signature)
         params.discard("self")
         missing = [key for key in wanted if key not in params]
         if missing:

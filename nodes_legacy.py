@@ -632,7 +632,8 @@ class STLU_AssemblePSD:
             "canvas": [int(canvas.shape[1]), int(canvas.shape[0])],
             "size": os.path.getsize(psd_path) if os.path.isfile(psd_path) else 0,
             "preview": None,
-            "error": report.get("psd_error") or (None if report.get("psd") else "PSD 未生成"),
+            "error": report.get("psd_error") or (None if report.get("psd") else
+                                                 "PSD 未生成 / PSD not generated"),
         }
         if preview_png and os.path.isfile(preview_png):
             pfolder, pname = _output_rel(preview_png)
@@ -870,7 +871,7 @@ class STLU_TileGrid:
     def execute(self, image, tile_width=1024, tile_height=1024, overlap=128,
                 select="all"):
         if image is None or not hasattr(image, "shape") or image.ndim < 3:
-            raise ValueError("STLU_TileGrid: 需要连接 image（标准 LoadImage 即可）")
+            raise ValueError("STLU_TileGrid: 需要连接 image（标准 LoadImage 即可）/ image input required")
         batch = image if image.ndim == 4 else image[None]
         frame = batch[0].detach().float().cpu()
         height, width = int(frame.shape[0]), int(frame.shape[1])
@@ -884,7 +885,7 @@ class STLU_TileGrid:
         raw_select = str(select if select is not None else "all").strip()
         picked = parse_tile_selection(raw_select, len(coords))
         if not picked:
-            raise ValueError("STLU_TileGrid: 没有勾选任何块（select=%r）" % raw_select)
+            raise ValueError("STLU_TileGrid: 没有勾选任何块（select=%r）/ no tiles selected" % raw_select)
         encoded = "all" if len(picked) == len(coords) else encode_tile_selection(picked)
         doc["selection"] = encoded
         grid_doc = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
@@ -967,7 +968,7 @@ class STLU_SelectTiles:
         raw_select = str(_first(select, "all") or "all").strip()
         picked = parse_tile_selection(raw_select, len(tiles_list))
         if not picked:
-            raise ValueError("STLU_SelectTiles: 没有勾选任何块（select=%r）" % raw_select)
+            raise ValueError("STLU_SelectTiles: 没有勾选任何块（select=%r）/ no tiles selected" % raw_select)
 
         index_values = [str(v) for v in _list_values(indices)]
         if len(index_values) != len(tiles_list):
@@ -991,7 +992,7 @@ class STLU_SelectTiles:
             try:
                 doc = tile_psd.load_grid_ref(str(doc_ref))
             except Exception as exc:  # noqa: BLE001
-                raise ValueError("STLU_SelectTiles: grid_doc 解析失败: %s" % exc)
+                raise ValueError("STLU_SelectTiles: grid_doc 解析失败 / failed to parse grid_doc: %s" % exc)
             doc["selection"] = encoded
             out_doc = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
         else:
@@ -1153,7 +1154,7 @@ class STLU_TilesPSD:
                 tiles=tile_subset,
             )
         elif not parts_list:
-            raise ValueError("STLU_TilesPSD: 连接 parts，或在「来源」里选已生成的图片目录")
+            raise ValueError("STLU_TilesPSD: 连接 parts，或在「来源」里选已生成的图片目录 / connect parts, or pick a generated image folder in Source")
         else:
             source_size = None
             original_rgba = None
@@ -1201,6 +1202,7 @@ class STLU_TilesPSD:
                     # keeping a second identical copy in images/.
                     original_rel="../original.png" if original_rgba is not None else None,
                     run_dir_abs=os.path.join(wave_dir, "images"),
+                    alpha_threshold=int(_first(alpha_threshold, 8)),
                 )
                 images_dir = images_manifest["dir"]
             except Exception as exc:  # noqa: BLE001 - PSDs still matter more

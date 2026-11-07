@@ -423,7 +423,7 @@ def _flatten_background(rgb: np.ndarray, subject: dict, arr: np.ndarray):
 
 
 def _plan_strips_frame(frame, width: int, height: int, *,
-                       overlap: int, max_side: int, max_resolution: int,
+                       overlap: int, max_side: int,
                        margin: int, tile_width: int, tile_height: int,
                        resolution: int, grid_offset_x: int, grid_offset_y: int,
                        created: str) -> dict:
@@ -439,7 +439,7 @@ def _plan_strips_frame(frame, width: int, height: int, *,
         plan = tile_strips.plan_from_subject(
             width, height, subject,
             overlap=int(overlap), max_side=int(max_side),
-            max_resolution=int(max_resolution), margin=int(margin),
+            margin=int(margin), resolution=int(resolution),
         )
         # ComfyUI's LoadImage drops alpha and keeps the RGB of transparent
         # pixels, so a cut-out character often reaches us over a solid
@@ -451,7 +451,7 @@ def _plan_strips_frame(frame, width: int, height: int, *,
     except Exception as exc:  # noqa: BLE001 - visible fallback, not a crash
         plan = {
             "ok": False, "fallback": "uniform",
-            "error": "分区规划失败: %s" % exc, "warnings": [],
+            "error": "分区规划失败 / partition planning failed: %s" % exc, "warnings": [],
         }
 
     if plan.get("ok"):
@@ -485,7 +485,8 @@ def _plan_strips_frame(frame, width: int, height: int, *,
     )
     fallback = {
         "code": "planner",
-        "message": str(plan.get("error") or "无法用方形分区覆盖主体"),
+        "message": str(plan.get("error") or "无法用方形分区覆盖主体"
+                                          " / cannot cover the subject with square partitions"),
     }
     warnings = list(plan.get("warnings") or []) + [fallback["message"]]
     meta = {

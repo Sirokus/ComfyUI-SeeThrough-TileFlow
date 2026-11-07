@@ -133,14 +133,14 @@ def test_subject_run(tmp):
     check(indices == ["0"] and len(tiles) == 1, "only the checked strip is handed on")
     check(tuple(tiles[0].shape) == (1, 1726, 1726, 3),
           "the crop is a square region (%s)" % (tuple(tiles[0].shape),))
-    check(res == 768, "actual strip resolution is used (%s)" % res)
+    check(res == 512, "the strip uses the quality card resolution (%s)" % res)
     check(depth == -1, "depth follows the strip resolution")
     check(doc["selection"] == "0", "selection is encoded for the strip plan")
     generation = doc["generation"]
     check("partition" in generation and generation["partition"]["plan_id"],
           "generation fingerprint carries the partition plan")
     check(generation["tile_size"] == [1726, 1726] and
-          generation["resolution"] == 768,
+          generation["resolution"] == 512,
           "generation carries the strip geometry/resolution")
     check("offset" not in generation, "grid phase is not part of a strip run")
     info = out["ui"]["stlu_grid"][0]
@@ -148,7 +148,7 @@ def test_subject_run(tmp):
           (info.get("partition") or {}).get("plan_id"),
           "UI payload carries the executed plan")
     plan = doc["partition_plan"]
-    check(plan["side"] == 1726 and plan["resolution"] == 768,
+    check(plan["side"] == 1726 and plan["resolution"] == 512,
           "partition plan reports side/resolution")
     check(doc["coords"][0][0] <= 34 and doc["coords"][0][2] >= 1696,
           "the first strip spans the subject width")

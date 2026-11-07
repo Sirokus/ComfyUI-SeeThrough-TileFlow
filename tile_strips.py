@@ -128,7 +128,10 @@ def detect_subject(rgb: np.ndarray, alpha: Optional[np.ndarray] = None,
             foreground = np.ones((height, width), dtype=bool)
             source = "full"
             warnings.append(
-                "没有检测到稳定的平坦背景，主体框退回整幅图；分区仍会按整幅图宽度进行。")
+                "没有检测到稳定的平坦背景，主体框退回整幅图；分区仍会按整幅图宽度进行。"
+                " / no stable flat background was detected; the subject box"
+                " falls back to the whole image and partitions still use the"
+                " full image width.")
 
     fg = np.ascontiguousarray(foreground.astype(np.uint8))
     count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(fg, 8)
@@ -147,7 +150,7 @@ def detect_subject(rgb: np.ndarray, alpha: Optional[np.ndarray] = None,
         components = [{"area": int(height * width),
                        "box": (0, 0, int(width), int(height))}]
         source = "full"
-        warnings.append("前景检测为空，主体框退回整幅图。")
+        warnings.append("前景检测为空，主体框退回整幅图 / foreground detection empty; subject box falls back to the whole image")
 
     largest = max(components, key=lambda item: int(item["area"]))
     largest_area = max(1, int(largest["area"]))
@@ -166,13 +169,16 @@ def detect_subject(rgb: np.ndarray, alpha: Optional[np.ndarray] = None,
             ignored_count += 1
     if ignored_count:
         warnings.append(
-            "忽略 %d 个小于主体 0.5%% 的碎点（共 %d px）。" % (ignored_count, ignored_pixels))
+            "忽略 %d 个小于主体 0.5%% 的碎点（共 %d px）。"
+            " / ignored %d specks smaller than 0.5%% of the subject"
+            " (%d px total)."
+            % (ignored_count, ignored_pixels, ignored_count, ignored_pixels))
 
     bbox = _union_box([item["box"] for item in kept])
     if bbox is None:
         bbox = (0, 0, int(width), int(height))
         source = "full"
-        warnings.append("主体框为空，退回整幅图。")
+        warnings.append("主体框为空，退回整幅图 / empty subject box; falling back to the whole image")
     x0, y0, x1, y1 = bbox
     return {
         "bbox": [int(x0), int(y0), int(x1), int(y1)],
@@ -190,7 +196,8 @@ def detect_subject(rgb: np.ndarray, alpha: Optional[np.ndarray] = None,
 
 def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
                         *, overlap: int = 256, max_side: int = 2048,
-                        max_resolution: int = 768, margin: int = 32) -> Dict[str, Any]:
+                        max_resolution: int = 768, margin: int = 32,
+                        resolution: Optional[int] = None) -> Dict[str, Any]:
     """Plan a deterministic top-to-bottom stack of square subject-wide windows.
 
     ``max_side`` is a preferred cap, not a hard one.  When the subject needs a
@@ -198,6 +205,12 @@ def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
     the canvas' short side) and reports it.  A square that cannot fit the
     subject at all (a very wide subject on a short canvas) still falls back to
     the uniform grid; the planner never cuts the subject vertically.
+
+    ``resolution`` — when given, it is the model resolution directly (the
+    same value as the pipeline's quality setting), clamped to the model's
+    supported range.  ``max_resolution`` is only used when ``resolution`` is
+    omitted (legacy callers/tests): the square is derived from ``side`` and
+    capped by it.
     """
     width = max(1, int(width))
     height = max(1, int(height))
@@ -210,7 +223,8 @@ def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
     if sw <= 0 or sh <= 0:
         return {
             "ok": False, "fallback": "uniform",
-            "error": "主体框为空，无法规划方形分区。",
+            "error": "主体框为空，无法规划方形分区。"
+                     " / the subject box is empty; cannot plan square partitions.",
             "warnings": warnings, "subject": _subject_meta(subject),
         }
 
@@ -225,21 +239,29 @@ def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
     if effective_margin < margin:
         warnings.append(
             "主体太宽，边距从 %d px 收窄到 %d px；方形窗口仍覆盖主体全宽。"
-            % (margin, effective_margin))
+            " / the subject is too wide, so the margin shrank from %d px to"
+            " %d px; the square window still covers the full subject width."
+            % (margin, effective_margin, margin, effective_margin))
     required_side = sw + 2 * effective_margin
     if required_side > hard_square:
         return {
             "ok": False, "fallback": "uniform",
             "error": ("主体宽度 %d px 加上边距后超过画布短边 %d px，"
                       "方形窗口无法完整覆盖主体；不会竖直切开主体。"
-                      % (required_side, hard_square)),
+                      " / the subject width of %d px plus margins exceeds the"
+                      " canvas' short side of %d px, so a square window cannot"
+                      " cover it; the subject will not be split vertically."
+                      % (required_side, hard_square, required_side, hard_square)),
             "warnings": warnings, "subject": _subject_meta(subject),
         }
     max_square = min(hard_square, max(max_side, required_side))
     if max_side < required_side:
         warnings.append(
             "区域最大边 %d px 小于覆盖主体所需的 %d px，已自动放大到 %d px；"
-            "不会竖直切开主体。" % (max_side, required_side, max_square))
+            "不会竖直切开主体。" % (max_side, required_side, max_square)
+            + " / the area cap of %d px is below the %d px needed to cover the"
+              " subject, so it grew to %d px; the subject will not be split"
+              " vertically." % (max_side, required_side, max_square))
 
     y_top = max(0, y0 - effective_margin)
     y_bottom = min(height, y1 + effective_margin)
@@ -272,7 +294,9 @@ def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
             if n > subject_h + 1:
                 return {
                     "ok": False, "fallback": "uniform",
-                    "error": "无法在方形上限内覆盖主体高度，请调大 strip_max_side。",
+                    "error": "无法在方形上限内覆盖主体高度，请调大 strip_max_side。"
+                             " / cannot cover the subject height within the"
+                             " square cap; raise strip_max_side.",
                     "warnings": warnings, "subject": _subject_meta(subject),
                 }
         side = min(side, max_square)
@@ -300,14 +324,21 @@ def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
         actual_overlap = min(
             int(coords[index][3] - coords[index + 1][1])
             for index in range(len(coords) - 1))
-    resolution = max(MIN_RESOLUTION,
-                     min(int(max_resolution), _ceil64(side / DENSITY)))
-    resolution = min(MODEL_MAX_RESOLUTION, resolution)
-    capped = resolution < _ceil64(side / DENSITY)
-    if capped:
-        warnings.append(
-            "分区边长 %d px，模型分辨率被上限截到 %d；遮罩密度约 %.2f 源像素/遮罩像素。"
-            % (side, resolution, side / float(max(1, resolution))))
+    if resolution is None:
+        resolution = max(MIN_RESOLUTION,
+                         min(int(max_resolution), _ceil64(side / DENSITY)))
+        resolution = min(MODEL_MAX_RESOLUTION, resolution)
+        capped = resolution < _ceil64(side / DENSITY)
+        if capped:
+            warnings.append(
+                "分区边长 %d px，模型分辨率被上限截到 %d；遮罩密度约 %.2f 源像素/遮罩像素。"
+                " / the partition side is %d px, so the model resolution was"
+                " capped at %d; mask density is about %.2f source px per mask px."
+                % (side, resolution, side / float(max(1, resolution)),
+                   side, resolution, side / float(max(1, resolution))))
+    else:
+        resolution = max(MIN_RESOLUTION,
+                         min(MODEL_MAX_RESOLUTION, int(resolution)))
     density = side / float(max(1, resolution))
     plan_id = hashlib.sha1(json.dumps({
         "coords": coords,
@@ -333,7 +364,8 @@ def plan_subject_strips(width: int, height: int, subject: Dict[str, Any],
 def plan_from_subject(width: int, height: int, subject: Dict[str, Any], *,
                       overlap: int = 256, max_side: int = 2048,
                       max_resolution: int = 768,
-                      margin: int = 32) -> Dict[str, Any]:
+                      margin: int = 32,
+                      resolution: Optional[int] = None) -> Dict[str, Any]:
     """Plan from an already detected subject (no full-size pixel work).
 
     Split out from :func:`plan_from_rgb` so a caller that caches subject
@@ -343,7 +375,7 @@ def plan_from_subject(width: int, height: int, subject: Dict[str, Any], *,
     """
     plan = plan_subject_strips(
         width, height, subject, overlap=overlap, max_side=max_side,
-        max_resolution=max_resolution, margin=margin)
+        max_resolution=max_resolution, margin=margin, resolution=resolution)
     plan["subject_detection"] = {
         "source": subject.get("source"),
         "bbox": list(subject.get("bbox") or []),
@@ -355,13 +387,14 @@ def plan_from_subject(width: int, height: int, subject: Dict[str, Any], *,
 
 def plan_from_rgb(rgb: np.ndarray, *, overlap: int = 256,
                   max_side: int = 2048, max_resolution: int = 768,
-                  margin: int = 32) -> Dict[str, Any]:
+                  margin: int = 32,
+                  resolution: Optional[int] = None) -> Dict[str, Any]:
     """Convenience entry point used by the node and standalone tests."""
     height, width = np.asarray(rgb).shape[:2]
     subject = detect_subject(rgb)
     return plan_from_subject(
         width, height, subject, overlap=overlap, max_side=max_side,
-        max_resolution=max_resolution, margin=margin)
+        max_resolution=max_resolution, margin=margin, resolution=resolution)
 
 
 def strips_document(plan: Dict[str, Any], width: int, height: int,

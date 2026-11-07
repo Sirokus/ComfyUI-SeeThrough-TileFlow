@@ -74,7 +74,9 @@ def parse_custom_regions(
     if limit < SIZE_MIN:
         raise ValueError(
             "自定义分区需要至少 %d px 的画布，当前 %dx%d 太小。"
-            % (SIZE_MIN, width, height))
+            " / custom partitions need a canvas of at least %d px;"
+            " the current %dx%d is too small."
+            % (SIZE_MIN, width, height, SIZE_MIN, width, height))
     warn = warnings if warnings is not None else []
 
     raw = (text or "").strip()
@@ -83,15 +85,16 @@ def parse_custom_regions(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError("custom_regions 不是有效 JSON：%s" % exc) from exc
+        raise ValueError("custom_regions 不是有效 JSON / custom_regions is not valid JSON: %s" % exc) from exc
     if not isinstance(data, list):
-        raise ValueError("custom_regions 必须是数组（每个元素一个正方形窗口）")
+        raise ValueError("custom_regions 必须是数组 / custom_regions must be an array (one square window per element)")
 
     regions: List[Dict[str, Any]] = []
     seen = set()
     for index, item in enumerate(data):
         if not isinstance(item, dict):
-            warn.append("第 %d 个窗口格式不对，已跳过。" % (index + 1))
+            warn.append("第 %d 个窗口格式不对，已跳过 / window %d skipped: bad format"
+                        % (index + 1, index + 1))
             continue
         try:
             raw_size = float(item.get("size", 0))
@@ -102,15 +105,16 @@ def parse_custom_regions(
             y = int(round(float(item.get("y", 0))))
             res = int(round(float(item.get("res", 0))))
         except (TypeError, ValueError):
-            warn.append("第 %d 个窗口的坐标/边长不是数字，已跳过。" % (index + 1))
+            warn.append("第 %d 个窗口的坐标/边长不是数字，已跳过 / window %d skipped: x/size is not numeric"
+                        % (index + 1, index + 1))
             continue
         if size < SIZE_MIN:
-            warn.append("第 %d 个窗口边长太小，已放大到 %d px。"
-                        % (index + 1, SIZE_MIN))
+            warn.append("第 %d 个窗口边长太小，已放大到 %d px / window %d size too small, scaled up to %d px"
+                        % (index + 1, SIZE_MIN, index + 1, SIZE_MIN))
             size = SIZE_MIN
         if size > limit:
-            warn.append("第 %d 个窗口边长超过画布短边，已收到 %d px。"
-                        % (index + 1, limit))
+            warn.append("第 %d 个窗口边长超过画布短边，已收到 %d px / window %d exceeds the canvas short side, clamped to %d px"
+                        % (index + 1, limit, index + 1, limit))
             size = limit
         x = _clamp(x, 0, width - size)
         y = _clamp(y, 0, height - size)
@@ -120,18 +124,18 @@ def parse_custom_regions(
             rounded = _round_step(res)
             if rounded < RES_MIN:
                 if rounded != res:
-                    warn.append("第 %d 个窗口分辨率已调整到 %d。"
-                                % (index + 1, RES_MIN))
+                    warn.append("第 %d 个窗口分辨率已调整到 %d / window %d resolution adjusted to %d"
+                                % (index + 1, RES_MIN, index + 1, RES_MIN))
                 rounded = RES_MIN
             if rounded > RES_MAX:
-                warn.append("第 %d 个窗口分辨率超过上限，已收到 %d。"
-                            % (index + 1, RES_MAX))
+                warn.append("第 %d 个窗口分辨率超过上限，已收到 %d / window %d resolution above the limit, clamped to %d"
+                            % (index + 1, RES_MAX, index + 1, RES_MAX))
                 rounded = RES_MAX
             res = rounded
         key = (x, y, size)
         if key in seen:
-            warn.append("第 %d 个窗口与前面的窗口完全重复，已跳过。"
-                        % (index + 1))
+            warn.append("第 %d 个窗口与前面的窗口完全重复，已跳过 / window %d duplicates an earlier window, skipped"
+                        % (index + 1, index + 1))
             continue
         seen.add(key)
         name = _NAME_STRIP.sub(" ", str(item.get("name") or "")).strip()
@@ -146,7 +150,9 @@ def parse_custom_regions(
     if not regions:
         raise ValueError(
             "自定义分区没有有效的正方形窗口。请在 ① 面板点「＋ 新窗口」，"
-            "拖动和缩放后再 Queue。")
+            "拖动和缩放后再 Queue。"
+            " / custom partitions contain no valid square window; click"
+            " \"+ New window\" in the ① panel, drag and resize it, then queue.")
     return regions
 
 
@@ -195,7 +201,7 @@ def custom_document(
     width, height = int(width), int(height)
     regions = list(regions)
     if not regions:
-        raise ValueError("自定义分区没有窗口")
+        raise ValueError("自定义分区没有窗口 / custom partitions contain no windows")
 
     coords: List[List[int]] = []
     plan_regions: List[Dict[str, Any]] = []
