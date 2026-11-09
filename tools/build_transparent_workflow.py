@@ -8,7 +8,7 @@ four subgraphs built from the fine-grained nodes in ``nodes_transparent``:
 
     ① 计划与切块   PlanGrid -> PickTiles -> PlanContext -> PrepareRun -> CropTiles
     ② 顺序拆层     SeqTileLoop (the one loop that must stay Python)
-    ③ 存盘         RestoreLocks -> WriteTilePSD / WriteTileImages -> SaveOriginal
+    ③ 存盘         WriteTilePSD / WriteTileImages -> SaveOriginal -> WriteManifest
                    -> WriteManifest
     ④ 合并         MergeTiles (one indivisible algorithm, kept whole)
 
@@ -317,8 +317,6 @@ def build_loop_subgraph():
          "type": "SEETHROUGH_PARTS", "label": "parts"},
         {"id": _uuid("loop/out/indices"), "name": "indices", "type": "STRING",
          "label": "indices"},
-        {"id": _uuid("loop/out/guided"), "name": "guided_inputs",
-         "type": "IMAGE", "label": "guided_inputs"},
         {"id": _uuid("loop/out/composites"), "name": "composites",
          "type": "IMAGE", "label": "composites"},
     ]
@@ -331,11 +329,10 @@ def build_loop_subgraph():
         inner_link(6, 1, 0, -20, 0, "SEETHROUGH_PARTS"),
         inner_link(7, 1, 1, -20, 1, "STRING"),
         inner_link(8, 1, 2, -20, 2, "IMAGE"),
-        inner_link(9, 1, 3, -20, 3, "IMAGE"),
     ]
     sg = {
         "id": SG_LOOP, "version": 1, "revision": 0,
-        "state": {"lastGroupId": 0, "lastNodeId": 1, "lastLinkId": 9,
+        "state": {"lastGroupId": 0, "lastNodeId": 1, "lastLinkId": 8,
                   "lastRerouteId": 0},
         "config": {},
         "name": "② 顺序拆层（循环保留 Python）",
@@ -347,24 +344,22 @@ def build_loop_subgraph():
         "extra": {},
         "category": "", "description": (
             "② 唯一无法用无环节点图表达的部分：第 N 块要看到第 N-1 块生成的像素。"
-            "循环内部每一步（回填 / 三步链 / 重试 / 裁回）都是独立函数，"
-            "guided_inputs 和 composites 两个输出已在外层接了预览。"),
+            "循环内部每一步（回填 / 三步链 / 裁回）都是独立函数，"
+            "composites 输出可直接接预览，看每块合成后的结果。"),
     }
     return _finish_subgraph(sg, "loop")
 
 
 def build_save_subgraph():
     nodes = [
-        make_node(1, "STLU_RestoreLocks", (40, 140), (300, 110),
-                  "③-1 恢复锁定部件（只读）"),
-        make_node(2, "STLU_WriteTilePSD", (380, 40), (320, 110),
-                  "③-2 写单块 PSD"),
-        make_node(3, "STLU_WriteTileImages", (380, 200), (320, 110),
-                  "③-3 写单块图层图"),
-        make_node(4, "STLU_SaveOriginal", (40, 320), (300, 100),
-                  "③-4 存原图"),
-        make_node(5, "STLU_WriteManifest", (760, 120), (340, 160),
-                  "③-5 写清单（manifest + images + 折入旧块）"),
+        make_node(2, "STLU_WriteTilePSD", (40, 40), (320, 110),
+                  "③-1 写单块 PSD"),
+        make_node(3, "STLU_WriteTileImages", (40, 200), (320, 110),
+                  "③-2 写单块图层图"),
+        make_node(4, "STLU_SaveOriginal", (40, 360), (300, 100),
+                  "③-3 存原图"),
+        make_node(5, "STLU_WriteManifest", (440, 120), (340, 160),
+                  "③-4 写清单（manifest + images + 折入旧块）"),
     ]
     inputs = [
         {"id": _uuid("save/in/parts"), "name": "parts",
@@ -383,27 +378,24 @@ def build_save_subgraph():
          "type": "STLU_MERGE", "label": "merge_doc"},
     ]
     links = [
-        inner_link(1, -10, 0, 1, 0, "SEETHROUGH_PARTS"),
-        inner_link(2, -10, 1, 1, 2, "STRING"),
-        inner_link(3, -10, 2, 1, 1, "STLU_PLAN"),
-        inner_link(4, 1, 0, 2, 0, "SEETHROUGH_PARTS"),
-        inner_link(5, -10, 1, 2, 2, "STRING"),
-        inner_link(6, -10, 2, 2, 1, "STLU_PLAN"),
-        inner_link(7, 1, 0, 3, 0, "SEETHROUGH_PARTS"),
-        inner_link(8, -10, 1, 3, 2, "STRING"),
-        inner_link(9, -10, 2, 3, 1, "STLU_PLAN"),
-        inner_link(10, -10, 3, 4, 0, "IMAGE"),
-        inner_link(11, -10, 2, 4, 1, "STLU_PLAN"),
-        inner_link(12, 2, 0, 5, 0, "STLU_TILE"),
-        inner_link(13, 3, 0, 5, 1, "STLU_TILE_IMAGES"),
-        inner_link(14, 4, 0, 5, 2, "STRING"),
-        inner_link(15, -10, 2, 5, 3, "STLU_PLAN"),
-        inner_link(16, 5, 0, -20, 0, "STLU_MANIFEST"),
-        inner_link(17, 5, 1, -20, 1, "STLU_MERGE"),
+        inner_link(1, -10, 0, 2, 0, "SEETHROUGH_PARTS"),
+        inner_link(2, -10, 1, 2, 2, "STRING"),
+        inner_link(3, -10, 2, 2, 1, "STLU_PLAN"),
+        inner_link(4, -10, 0, 3, 0, "SEETHROUGH_PARTS"),
+        inner_link(5, -10, 1, 3, 2, "STRING"),
+        inner_link(6, -10, 2, 3, 1, "STLU_PLAN"),
+        inner_link(7, -10, 3, 4, 0, "IMAGE"),
+        inner_link(8, -10, 2, 4, 1, "STLU_PLAN"),
+        inner_link(9, 2, 0, 5, 0, "STLU_TILE"),
+        inner_link(10, 3, 0, 5, 1, "STLU_TILE_IMAGES"),
+        inner_link(11, 4, 0, 5, 2, "STRING"),
+        inner_link(12, -10, 2, 5, 3, "STLU_PLAN"),
+        inner_link(13, 5, 0, -20, 0, "STLU_MANIFEST"),
+        inner_link(14, 5, 1, -20, 1, "STLU_MERGE"),
     ]
     sg = {
         "id": SG_SAVE, "version": 1, "revision": 0,
-        "state": {"lastGroupId": 0, "lastNodeId": 5, "lastLinkId": 17,
+        "state": {"lastGroupId": 0, "lastNodeId": 5, "lastLinkId": 14,
                   "lastRerouteId": 0},
         "config": {},
         "name": "③ 存盘",
@@ -414,9 +406,8 @@ def build_save_subgraph():
         "nodes": nodes, "links": links, "groups": [],
         "extra": {},
         "category": "", "description": (
-            "③ 拆成五个可见步骤：恢复锁定（只读）→ 写 PSD → 写分层 PNG → "
-            "存原图 → 写清单。写清单会把同目录上一轮已经完成的块折进来，"
-            "并恢复还有锁定快照的孤儿块。"),
+            "③ 拆成四个可见步骤：写 PSD → 写分层 PNG → 存原图 → 写清单。"
+            "写清单会把同目录上一轮已经完成的块折进来。"),
     }
     return _finish_subgraph(sg, "save")
 
@@ -471,15 +462,13 @@ NOTE = """# SeeThrough 四步分块流水线（透明版）
 面板和全部参数都在这一个节点上，但它自己什么都不算，只把参数打包成 `settings` 往下传。
 
 - **① 计划与切块**：规划网格 → 选块 → 上下文外扩 → 准备运行 → 裁剪。
-  其中只有「准备运行」会写盘（写 generation.json、参数变了清空旧结果）。
+  其中只有「准备运行」会写盘（写 generation.json、参数变了只提示不清空；清空要手动点「清空此目录」）。
 - **② 顺序拆层**：唯一必须保留 Python 的循环——第 N 块要看到第 N-1 块生成的像素。
-  `guided_inputs` / `composites` 两个输出接在外层预览上，能直接看每块实际吃了什么。
-- **③ 存盘**：恢复锁定部件（只读）→ 写单块 PSD → 写单块分层 PNG → 存原图 → 写清单。
+  `composites` 输出接在外层预览上，能直接看每块合成后的结果。
+- **③ 存盘**：写单块 PSD → 写单块分层 PNG → 存原图 → 写清单。
 - **④ 合并**：接缝归属 / 缩放 / 整部件例外 / 分层组装是一整块算法，保留为单节点；
   `report` 输出列出它做了什么。
-- **⑤ 预览**：合并 PSD 的全身总览 + 按块 / 按部位分组。② 的 `guided_inputs`
-  和 `indices` 接在这一个节点上，「按块」每一行多一张「输入」——引导回填后
-  真正送进模型的那张图（只有本次跑过的块才有）。
+- **⑤ 预览**：合并 PSD 的全身总览 + 按块 / 按部位分组。接 ④ 的 `psd_path`。
 
 ## 用法
 1. 在 LoadImage 选图，在 ①-0 面板勾选要跑的块（未勾选不跑 GPU）。
@@ -487,8 +476,7 @@ NOTE = """# SeeThrough 四步分块流水线（透明版）
 3. 结果在 `output/<根目录>/<分类?>/`。
 
 ## 调试入口
-- 生成中途不再弹预览：每块实际喂给模型的输入就在 ⑤ 面板「按块」的「输入」列，
-  合成结果就是同一行的「合并」图和拆分图层。
+- 生成中途不再弹预览：每块合成结果就是 ⑤ 面板「按块」同一行的「合并」图和拆分图层。
 - 想手动重跑合并：④ 子图单独 Queue 即可（输入 merge_doc 来自 ③）。
 """
 
@@ -624,10 +612,6 @@ def build_document(existing=None):
             {"localized_name": "show_parts", "name": "show_parts",
              "type": "BOOLEAN", "shape": 7,
              "widget": {"name": "show_parts"}, "link": None},
-            {"localized_name": "guide_images", "name": "guide_images",
-             "type": "IMAGE", "link": None},
-            {"localized_name": "guide_indices", "name": "guide_indices",
-             "type": "STRING", "link": None},
         ],
         "outputs": [{"localized_name": "preview", "name": "preview",
                      "type": "IMAGE", "links": []}],
@@ -657,11 +641,6 @@ def build_document(existing=None):
 
     connect(save, 1, merge, 0, "STLU_MERGE")
     connect(merge, 0, preview, 0, "STRING")
-    # ②'s per-tile model inputs go straight to the panel's tile rows: the
-    # "what did the seam models actually see" check lives where the results
-    # are read, not in a preview that flashes by mid-run.
-    connect(loop, 2, preview, 3, "IMAGE")
-    connect(loop, 1, preview, 4, "STRING")
 
     note = add({
         "type": "MarkdownNote", "pos": [-560, 60], "size": [540, 900],

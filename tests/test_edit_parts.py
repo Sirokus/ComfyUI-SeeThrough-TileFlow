@@ -279,6 +279,56 @@ def test_expand():
     print("expand ok (%d nodes)" % len(expand))
 
 
+def test_expand_crop_reference():
+    _ok(os.path.isfile(TEMPLATE), "template missing: %s" % TEMPLATE)
+    geometry = {
+        "crop_size": [64, 64], "crop_box": [0, 0, 64, 64],
+        "box": [8, 8, 56, 56], "size": [64, 64], "target": [128, 128],
+        "out_file": "layer.png", "file": "source.png",
+    }
+    base = {
+        "crop_file": "crop.png", "width": 64, "height": 64,
+        "resolution": 64, "geometry": geometry,
+    }
+    parts = [
+        dict(base, name="with ref", prompt="with ref", ref_file="ref.png"),
+        dict(base, name="no ref", prompt="no ref", ref_file=""),
+    ]
+    external = {"model": ["11", 0], "clip": ["12", 0], "vae": ["13", 0]}
+    expand, _psd, _saves = edit_expand.build_expand(
+        workflow_path=TEMPLATE, parts=parts, external=external, seed=7,
+        out_dir_rel="SeeThrough/_test_crop", layers_json_path="",
+        psd_name="", psd_plan="plan.json", crop_mode=True,
+        key="green", tolerance=12.0, softness=6.0, protect=True, despill=0.65,
+        negative_prompt="", cfg=1.0, resolution=0, scheduler="euler",
+        sigmas="1.0, 0.5, 0", width=0, height=0,
+    )
+
+    loads = [n for n in expand.values() if n["class_type"] == "STLU_LoadCrop"]
+    _ok(len(loads) == 3, "two crops + one reference expected, got %d" % len(loads))
+    ref_loads = [n for n in loads if n["inputs"].get("file") == "ref.png"]
+    _ok(len(ref_loads) == 1, "the reference block is read once")
+    _ok(ref_loads[0]["inputs"].get("width") == 0
+        and ref_loads[0]["inputs"].get("height") == 0,
+        "the reference keeps its native size for the encoder")
+
+    encoders = [n for n in expand.values()
+                if n["class_type"] == "TextEncodeQwenImage21"]
+    _ok(len(encoders) == 2, "one encoder per part")
+    by_prompt = {e["inputs"].get("prompt"): e for e in encoders}
+    image_1 = by_prompt["with ref"]["inputs"].get("images.image_1")
+    image_2 = by_prompt["with ref"]["inputs"].get("images.image_2")
+    _ok(isinstance(image_1, list) and image_1[0] in expand
+        and expand[image_1[0]]["inputs"].get("file") == "crop.png",
+        "image_1 must be the crop: %r" % (image_1,))
+    _ok(isinstance(image_2, list) and image_2[0] in expand
+        and expand[image_2[0]]["inputs"].get("file") == "ref.png",
+        "image_2 must be the reference block: %r" % (image_2,))
+    _ok(by_prompt["no ref"]["inputs"].get("images.image_2") is None,
+        "no reference selected means no image_2 wire")
+    print("crop reference expand ok (%d nodes)" % len(expand))
+
+
 if __name__ == "__main__":
     test_catalogue()
     test_catalogue_rows()
@@ -288,4 +338,5 @@ if __name__ == "__main__":
     test_chroma_protect()
     test_layers_and_psd()
     test_expand()
+    test_expand_crop_reference()
     print("\nall edit-part tests passed")

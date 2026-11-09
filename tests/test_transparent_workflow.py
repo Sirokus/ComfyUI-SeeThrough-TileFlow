@@ -107,39 +107,32 @@ def main():
         check(len(image_links) >= 2,
               "LoadImage feeds both the settings node and the plan subgraph")
 
-        # ⑤ owns every picture: the merged PSD plus ②'s per-tile model
-        # inputs.  A PreviewImage mid-run only flooded the queue with images
-        # nobody asked for, so the transparent file must not carry one.
+        # A PreviewImage mid-run only flooded the queue with images nobody
+        # asked for, so the transparent file must not carry one.
         previews = [node for node in doc["nodes"]
                     if node["type"] == "PreviewImage"]
         check(not previews,
               "no mid-run PreviewImage nodes (%d)" % len(previews))
-        loop_instance = next(node for node in doc["nodes"]
-                             if node["type"] == builder.SG_LOOP)
         psd_preview = next(node for node in doc["nodes"]
                            if node["type"] == "STLU_PSDPreview")
-        guide_links = [link for link in doc["links"]
-                       if isinstance(link, list)
-                       and link[1] == loop_instance["id"]
-                       and link[3] == psd_preview["id"]]
-        slots = {psd_preview["inputs"][link[4]].get("name")
-                 for link in guide_links}
-        check(slots == {"guide_images", "guide_indices"},
-              "the loop's guided inputs and indices feed the ⑤ panel (%s)"
-              % (sorted(s for s in slots if s) or "nothing"))
         connected = {psd_preview["inputs"][link[4]].get("name")
                      for link in doc["links"] if isinstance(link, list)
                      and link[3] == psd_preview["id"]}
-        check("psd_path" in connected,
-              "④'s merge still feeds the ⑤ panel")
+        check(connected == {"psd_path"},
+              "the ⑤ panel takes only ④'s merged PSD (%s)"
+              % (sorted(s for s in connected if s) or "nothing"))
 
     real = os.path.join(WORKFLOW_DIR, builder.TARGET_FILE)
+    subgraphs = []
     if os.path.isfile(real):
+        with open(real, encoding="utf-8") as fh:
+            subgraphs = (json.load(fh).get("definitions") or {}).get("subgraphs") or []
+    if subgraphs:
         problems = builder.validate(real)
         check(not problems, "the shipped workflow passes the contract (%s)"
               % ("; ".join(problems[:3]) or "no problems"))
     else:
-        print("  skip the shipped workflow is not present")
+        print("  skip the shipped workflow is not the split-step variant")
 
     if _failures:
         print("\nFAILED:", len(_failures))

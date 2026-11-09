@@ -1,4 +1,4 @@
-"""Plan / edit-parts / 4K-mask nodes (the non-tile workflows).
+"""Edit-parts / 4K-mask nodes (the non-tile workflows).
 
 They share the original image-edit and PSD helpers with the tile pipeline via
 ``nodes_shared``; none of them run on the guided ①-⑤ path.
@@ -22,7 +22,7 @@ import folder_paths
 if __package__:  # ComfyUI loads the folder as a package
     from . import (core_compose, core_geometry, core_io, core_mask4k, core_plan,
                    core_reference, edit_expand, edit_parts, psd_reader,
-                   psd_writer, subgraph_clone, tile_psd, tile_strips)
+                   psd_writer, tile_psd, tile_strips)
     from .stlu import json_io, limits as stlu_limits
 else:  # standalone import used by the tests and tools
     import core_compose
@@ -35,7 +35,6 @@ else:  # standalone import used by the tests and tools
     import edit_parts
     import psd_reader
     import psd_writer
-    import subgraph_clone
     import tile_psd
     import tile_strips
     from stlu import json_io, limits as stlu_limits
@@ -56,80 +55,6 @@ DEFAULT_EDIT_SIGMAS = (
     "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, "
     "0.414568, 0"
 )
-
-# ---------------------------------------------------------------------------
-# 4K part masks (CPU): reference-guided outline + geometric iris completion
-# ---------------------------------------------------------------------------
-
-MASK4K_MODES = list(core_mask4k.MASK_MODES)
-
-class STLU_Plan:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "layers_json": ("STRING", {"default": DEFAULT_LAYERS_JSON}),
-                "select": ("STRING", {"default": "all"}),
-                "exclude": ("STRING", {"default": ""}),
-                "size_rules": ("STRING", {"default": DEFAULT_SIZE_RULES, "multiline": True}),
-                # 留空 = 拆层文件夹下的 UpScale（相对 output，不存在则新建）。
-                "out_dir": ("STRING", {"default": ""}),
-                "canvas_size": ("INT", {"default": 2048, "min": 256, "max": 8192, "step": 8}),
-                "skip_empty": ("BOOLEAN", {"default": True}),
-                "empty_coverage": ("FLOAT", {"default": 0.0005, "min": 0.0, "max": 0.2, "step": 0.0001}),
-                # Local crop refinement: generate inside a window of real
-                # context instead of the whole (incomplete) part frame.
-                "focus_crop": ("BOOLEAN", {"default": True}),
-                "focus_margin": ("INT", {"default": core_plan.FOCUS_MARGIN, "min": 0, "max": 256, "step": 8}),
-                "focus_context": (["backdrop", "reference"], {"default": "backdrop"}),
-                "focus_prompt": ("STRING", {"default": core_plan.DEFAULT_FOCUS_PROMPT, "multiline": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING")
-    RETURN_NAMES = ("plan", "plan_path", "total", "report")
-    FUNCTION = "execute"
-    CATEGORY = CATEGORY
-
-    def execute(self, layers_json, select, exclude, size_rules, out_dir, canvas_size,
-                skip_empty=True, empty_coverage=0.0005,
-                focus_crop=True, focus_margin=core_plan.FOCUS_MARGIN,
-                focus_context="backdrop", focus_prompt=core_plan.DEFAULT_FOCUS_PROMPT):
-        output_root = _output_root()
-        plan = core_plan.build_plan(
-            layers_json=layers_json,
-            output_root=output_root,
-            select=select,
-            exclude=exclude,
-            size_rules_text=size_rules,
-            out_dir=out_dir,
-            canvas_size=canvas_size,
-            skip_empty=bool(skip_empty),
-            empty_coverage=float(empty_coverage),
-            focus_crop=bool(focus_crop),
-            focus_margin=focus_margin,
-            focus_context=focus_context,
-            focus_prompt=focus_prompt,
-        )
-        plan_text = core_plan.plan_to_text(plan)
-        plan_dir = os.path.join(output_root, plan["out_dir"])
-        os.makedirs(plan_dir, exist_ok=True)
-        prefix = core_plan.safe_name(plan["source"].get("prefix") or "seethrough")
-        plan_path = os.path.join(plan_dir, prefix + "_plan.json")
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan, f, ensure_ascii=False, indent=2)
-        return (plan_text, plan_path, int(plan["total"]), core_plan.plan_report(plan))
-
-    @classmethod
-    def IS_CHANGED(cls, layers_json, select, exclude, size_rules, out_dir, canvas_size,
-                   skip_empty=True, empty_coverage=0.0005,
-                   focus_crop=True, focus_margin=core_plan.FOCUS_MARGIN,
-                   focus_context="backdrop", focus_prompt=core_plan.DEFAULT_FOCUS_PROMPT):
-        parts = [layers_json, select, exclude, size_rules, out_dir, str(canvas_size),
-                 str(skip_empty), str(empty_coverage), str(focus_crop),
-                 str(focus_margin), str(focus_context), str(focus_prompt)]
-        fp = _plan_fingerprint(layers_json)
-        return core_plan.sha1_text("|".join(parts) + "|" + fp)
 
 class STLU_EditPartsBatch:
     """Extract every Live2D part with an image-edit model, in one run.
@@ -304,161 +229,6 @@ class STLU_EditPartsBatch:
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
 
-def _layer_output_matches(layer: dict, output_root: str) -> bool:
-    """True when this layer's upscaled PNG already exists at the planned size.
-
-    A re-run then skips layers that finished last time instead of paying the
-    model reload for each of them again.  Delete the PNG to force a redo.
-    """
-    target_file = str(layer.get("target_file") or "").strip()
-    target = layer.get("target") or {}
-    tw, th = int(target.get("w") or 0), int(target.get("h") or 0)
-    if not target_file or tw <= 0 or th <= 0:
-        return False
-    path = os.path.join(output_root, target_file)
-    if not os.path.isfile(path):
-        return False
-    try:
-        from PIL import Image
-
-        with Image.open(path) as im:
-            width, height = im.size
-    except Exception:  # noqa: BLE001
-        return False
-    return max(width, height) == max(tw, th)
-
-class STLU_UpscaleBatch:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "plan": ("STRING", {"default": ""}),
-                "reference": ("IMAGE",),
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
-                "vae": ("VAE",),
-            },
-            "optional": {
-                "plan_path": ("STRING", {"default": ""}),
-                "pe_clip": ("CLIP",),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xFFFFFFFF, "step": 1}),
-                "workflow_json": ("STRING", {"default": ""}),
-            },
-            "hidden": {
-                "dynprompt": "DYNPROMPT",
-                "unique_id": "UNIQUE_ID",
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("last_saved", "report")
-    FUNCTION = "execute"
-    CATEGORY = CATEGORY
-
-    def execute(self, plan, reference, model, clip, vae, plan_path="", pe_clip=None,
-                seed=42, workflow_json="", dynprompt=None, unique_id=None):
-        plan_data = _load_plan(plan)
-        output_root = _output_root()
-        selected, skipped, selected_names = [], [], []
-        for layer in plan_data["layers"]:
-            if not layer.get("selected"):
-                continue
-            if _layer_output_matches(layer, output_root):
-                skipped.append(layer["name"])
-            else:
-                selected.append(layer["z"])
-                selected_names.append(layer["name"])
-        if not selected:
-            note = "all selected layers already upscaled at the planned size"
-            if skipped:
-                note += " (delete their PNGs under UpScale/ to redo)"
-            _notify("stlu.start", {"total": 0, "layers": [], "skipped": skipped,
-                                   "out_dir": plan_data.get("out_dir")})
-            return ("", json.dumps({"total": 0, "skipped": skipped, "note": note},
-                                   ensure_ascii=False))
-
-        _notify("stlu.start", {
-            "total": len(selected),
-            "layers": selected_names,
-            "skipped": skipped,
-            "out_dir": plan_data.get("out_dir"),
-        })
-
-        if dynprompt is None or unique_id is None:
-            raise RuntimeError("STLU_UpscaleBatch needs dynprompt/unique_id hidden inputs")
-
-        node = dynprompt.get_node(unique_id)
-        node_inputs = node.get("inputs", {})
-
-        def _link(name):
-            value = node_inputs.get(name)
-            if not isinstance(value, list) or len(value) != 2:
-                raise RuntimeError("STLU_UpscaleBatch input %r is not linked" % name)
-            return [str(value[0]), int(value[1])]
-
-        reference_link = _link("reference")
-        model_link = _link("model")
-        clip_link = _link("clip")
-        vae_link = _link("vae")
-        pe_link = node_inputs.get("pe_clip")
-        if isinstance(pe_link, list) and len(pe_link) == 2:
-            pe_link = [str(pe_link[0]), int(pe_link[1])]
-        else:
-            pe_link = clip_link
-
-        external = {
-            "reference": reference_link,
-            "model": model_link,
-            "clip": clip_link,
-            "vae": vae_link,
-            "pe_clip": pe_link,
-        }
-
-        wf_path = (workflow_json or "").strip() or subgraph_clone.default_workflow_path()
-        if not os.path.isfile(wf_path):
-            raise FileNotFoundError("workflow_json not found: %s" % wf_path)
-
-        plan_ref = (plan_path or "").strip() or plan
-        expand, last_save, report = subgraph_clone.build_expand(
-            workflow_path=wf_path,
-            plan=plan_data,
-            plan_ref=plan_ref,
-            external=external,
-            seed=int(seed),
-            layer_indices=selected,
-        )
-        if last_save is None:
-            return ("", json.dumps({"total": 0}, ensure_ascii=False))
-
-        report_text = json.dumps({
-            "total": len(selected),
-            "skipped": skipped,
-            "workflow": wf_path,
-            "layers": report,
-        }, ensure_ascii=False, indent=2)
-        return {
-            "result": (last_save.out(0), report_text),
-            "expand": expand,
-        }
-
-    @classmethod
-    def IS_CHANGED(cls, plan, *args, **kwargs):
-        wf = kwargs.get("workflow_json") or ""
-        wf_fp = core_plan.file_fingerprint(wf) if wf and os.path.isfile(wf) else "default"
-        # Pending layers are part of the signature: once a layer's PNG lands,
-        # the next run must re-expand for the remaining ones instead of
-        # returning the previous (partly skipped) result from the cache.
-        try:
-            plan_data = _load_plan(plan)
-            root = _output_root()
-            pending = ",".join(
-                str(layer["z"]) for layer in plan_data["layers"]
-                if layer.get("selected") and not _layer_output_matches(layer, root)
-            )
-        except Exception:  # noqa: BLE001
-            pending = "?"
-        return core_plan.sha1_text("%s|%s|%s|%s" % (
-            _plan_fingerprint(plan), wf_fp, kwargs.get("seed"), pending))
 
 def _plan_layer(plan_data, index):
     layers = plan_data.get("layers") or []
@@ -499,6 +269,12 @@ def _mask_preview_image(guide, mask, width=384):
 
 def _mask_to_tensor(mask):
     return torch.from_numpy(np.asarray(mask, dtype=np.float32))[None]
+
+# ---------------------------------------------------------------------------
+# 4K part masks (CPU): reference-guided outline + geometric iris completion
+# ---------------------------------------------------------------------------
+
+MASK4K_MODES = list(core_mask4k.MASK_MODES)
 
 class STLU_Mask4K:
     """The complete 4K outline of one layer.
@@ -695,25 +471,19 @@ def _contact_sheet(images, sheet_width):
 
 
 NODE_CLASS_MAPPINGS = {
-    "STLU_Plan": STLU_Plan,
     "STLU_EditPartsBatch": STLU_EditPartsBatch,
-    "STLU_UpscaleBatch": STLU_UpscaleBatch,
     "STLU_Mask4K": STLU_Mask4K,
     "STLU_Mask4KBatch": STLU_Mask4KBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "STLU_Plan": "SeeThrough Upscale Plan",
-    "STLU_UpscaleBatch": "SeeThrough Upscale Batch",
     "STLU_Mask4K": "SeeThrough 4K Part Mask (CPU)",
     "STLU_Mask4KBatch": "SeeThrough 4K Masks Batch (CPU)",
     "STLU_EditPartsBatch": "Live2D Edit Extract Parts (Batch)",
 }
 
 __all__ = [
-    "STLU_Plan",
     "STLU_EditPartsBatch",
-    "STLU_UpscaleBatch",
     "STLU_Mask4K",
     "STLU_Mask4KBatch",
 ]

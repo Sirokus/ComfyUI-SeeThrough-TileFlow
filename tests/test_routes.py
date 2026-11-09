@@ -145,13 +145,6 @@ def main():
     check(data["url"].startswith("/view?"), "preview url")
     check(len(data["notes"]) > 0, "empty layers reported")
 
-    print("[/stlu/wf]")
-    data = body(asyncio.run(routes.check_workflow(Req(path=""))))
-    check(data["exists"] is True, "default subgraph template found")
-    check(data["name"].endswith(".json"), "template name reported")
-    data = body(asyncio.run(routes.check_workflow(Req(path="D:/nope/missing.json"))))
-    check(data["exists"] is False, "missing template reported")
-
     print("[/stlu/imgsize]")
     ref = os.path.join(COMFY_ROOT, "input", "Qwen_image_2.1_00029_Improve_1K_mouse.png")
     if os.path.isfile(ref):
@@ -187,6 +180,23 @@ def main():
         scope="input", path="../escape.png", overlap="256",
         max_side="2048", max_resolution="768", margin="32")))
     check(resp.status in (400, 403, 404), "strip plan traversal rejected (%d)" % resp.status)
+
+    print("[/stlu/fs_ls]")
+    resp = asyncio.run(routes.fs_list(Req()))
+    data = body(resp)
+    check(resp.status == 200 and data["at_root"] and data["dirs"],
+          "no path lists the drive roots (%d)" % len(data.get("dirs") or []))
+    out_abs = routes._scope_root("output")
+    resp = asyncio.run(routes.fs_list(Req(path=out_abs)))
+    data = body(resp)
+    check(resp.status == 200 and data["path"] == out_abs,
+          "an absolute folder lists (%s)" % data.get("path"))
+    check(all(f["name"].lower().endswith(".psd") for f in data["files"]),
+          "only .psd files are listed")
+    resp = asyncio.run(routes.fs_list(Req(path="SeeThrough")))
+    check(resp.status == 400, "a relative path is rejected (%d)" % resp.status)
+    resp = asyncio.run(routes.fs_list(Req(path=os.path.join(out_abs, "nope.psd"))))
+    check(resp.status == 404, "a missing folder is reported (%d)" % resp.status)
 
     print()
     if _failures:

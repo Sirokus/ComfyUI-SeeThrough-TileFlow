@@ -24,7 +24,6 @@ COMFY_ROOT = os.path.dirname(os.path.dirname(PKG_DIR))
 
 REQUIRED = (
     "STLU_PipelineInput",
-    "STLU_SimpleInput",
     "STLU_GuidedLayers",
     "STLU_TilePSD",
     "STLU_WaveIndex",
@@ -40,12 +39,17 @@ REQUIRED = (
     "STLU_GuideTile",
     "STLU_SeqTileLoop",
     "STLU_CropBack",
-    "STLU_RestoreLocks",
     "STLU_WriteTilePSD",
     "STLU_WriteTileImages",
     "STLU_SaveOriginal",
     "STLU_WriteManifest",
     "STLU_MergeTiles",
+    # PSD-upscale flow: finished PSD -> crops -> Qwen edit -> PSD.
+    "STLU_PsdPrepare",
+    "STLU_LoadCrop",
+    "STLU_CutToLayer",
+    "STLU_PsdAssemble",
+    "STLU_PsdUpscale",
 )
 
 _failures = []
@@ -98,7 +102,7 @@ def main():
     mappings = getattr(module, "NODE_CLASS_MAPPINGS", {})
     names = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
     check(bool(mappings), "NODE_CLASS_MAPPINGS is not empty (%d)" % len(mappings))
-    check(len(mappings) == 45, "all 45 nodes register (%d)" % len(mappings))
+    check(len(mappings) == 47, "all 47 nodes register (%d)" % len(mappings))
     check(set(names) == set(mappings), "every node has a display name")
 
     missing = [name for name in REQUIRED if name not in mappings]
@@ -116,7 +120,7 @@ def main():
           % (stray or "none"))
     legacy = [name for name, cls in mappings.items()
               if "Legacy" in str(getattr(cls, "CATEGORY", ""))]
-    check(len(legacy) == 17, "the 17 legacy nodes stay under /Legacy (%d)" % len(legacy))
+    check(len(legacy) == 16, "the 16 legacy nodes stay under /Legacy (%d)" % len(legacy))
 
     if _failures:
         print("\nFAILED:", len(_failures))

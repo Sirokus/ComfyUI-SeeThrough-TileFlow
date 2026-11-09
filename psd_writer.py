@@ -3,9 +3,11 @@
 Only what the SeeThrough layer-upscale flow needs is implemented:
 
 * 8 bit per channel, RGB colour mode, 4 channels (R, G, B, A)
-* one PSD layer per input layer, normal blend mode, 100 % opacity
+* one PSD layer per input layer, per-layer blend key and opacity
+* folders written as the usual pair of ``lsct`` divider records
 * optional PackBits RLE compression (default) or raw channel data
-* merged composite image written as RGBA
+* merged composite image written as RGBA (non-normal blends preview as
+  normal; the layered file keeps the real blend keys)
 
 The structure follows the Adobe Photoshop File Format specification; it is
 verified by ``tests/test_offline.py`` (decoded back with a strict reader and
@@ -123,6 +125,24 @@ def _section_divider_block(kind: str) -> bytes:
     return b"8BIM" + b"lsct" + struct.pack(">I", len(payload)) + payload
 
 
+def _blend_bytes(value: Any) -> bytes:
+    """Four-byte blend key (``b"norm"``, ``b"mul "`` ...); normal on garbage."""
+    if isinstance(value, bytes) and len(value) == 4:
+        return value
+    if isinstance(value, str):
+        raw = value.encode("latin-1", "replace")[:4]
+        if len(raw) == 4:
+            return raw
+    return BLEND_NORMAL
+
+
+def _opacity_byte(value: Any) -> int:
+    try:
+        return max(0, min(255, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 255
+
+
 def _layer_record(
     name: str,
     top: int,
@@ -133,6 +153,8 @@ def _layer_record(
     layer_id: int,
     extra_block: bytes = b"",
     flags: int = 0,
+    blend: bytes = BLEND_NORMAL,
+    opacity: int = 255,
 ) -> bytes:
     rec = bytearray()
     rec += struct.pack(">4i", int(top), int(left), int(bottom), int(right))
@@ -142,8 +164,8 @@ def _layer_record(
         rec += struct.pack(">I", int(length))
 
     rec += b"8BIM"
-    rec += BLEND_NORMAL
-    rec += bytes([255, 0, int(flags), 0])  # opacity, clipping, flags, filler
+    rec += _blend_bytes(blend)
+    rec += bytes([_opacity_byte(opacity), 0, int(flags), 0])  # opacity, clipping, flags, filler
 
     extra = bytearray()
     extra += struct.pack(">I", 0)  # layer mask data length
@@ -211,12 +233,14 @@ def _expand_groups(layers: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for layer in layers:
         if layer.get("type") == "group":
             hidden = bool(layer.get("hidden"))
+            blend = _blend_bytes(layer.get("blend"))
+            opacity = _opacity_byte(layer.get("opacity"))
             flat.append({"type": GROUP_END, "name": _GROUP_END_NAME,
-                         "hidden": hidden})
+                         "hidden": hidden, "blend": b"pass", "opacity": 255})
             flat.extend(_expand_groups(layer.get("children") or []))
             flat.append({"type": GROUP_START,
                          "name": str(layer.get("name") or "group"),
-                         "hidden": hidden})
+                         "hidden": hidden, "blend": blend, "opacity": opacity})
         else:
             flat.append(layer)
     return flat
@@ -230,7 +254,9 @@ def _normalise_layers(layers: Iterable[Dict[str, Any]], width: int, height: int)
     normalised: List[Dict[str, Any]] = []
     for layer in layers:
         if layer.get("type") in (GROUP_START, GROUP_END):
-            marker = {"type": layer["type"], "name": str(layer.get("name") or "")}
+            marker = {"type": layer["type"], "name": str(layer.get("name") or ""),
+                      "blend": _blend_bytes(layer.get("blend")),
+                      "opacity": _opacity_byte(layer.get("opacity"))}
             if layer.get("hidden"):
                 marker["hidden"] = True
             normalised.append(marker)
@@ -261,6 +287,8 @@ def _normalise_layers(layers: Iterable[Dict[str, Any]], width: int, height: int)
             "left": left,
             "top": top,
             "pixels": np.ascontiguousarray(pixels),
+            "blend": _blend_bytes(layer.get("blend")),
+            "opacity": _opacity_byte(layer.get("opacity")),
         }
         if layer.get("hidden"):
             item["hidden"] = True
@@ -269,6 +297,13 @@ def _normalise_layers(layers: Iterable[Dict[str, Any]], width: int, height: int)
 
 
 def _composite(width: int, height: int, layers: Sequence[Dict[str, Any]]) -> np.ndarray:
+    """Preview composite of the visible layers.
+
+    Blend modes other than ``norm`` are composited as normal here: the merged
+    image is only a preview, the real blending is done by the PSD editor from
+    the per-layer records.  Layer opacity is honoured because it changes what
+    the reader sees even for a normal blend.
+    """
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     # Folders are records in this list (bottom -> top), so a hidden folder
     # hides everything between its two markers.  The header comes *after*
@@ -281,7 +316,12 @@ def _composite(width: int, height: int, layers: Sequence[Dict[str, Any]]) -> np.
             continue
         if layer.get("hidden") or suppressed[index]:
             continue
-        im = Image.fromarray(layer["pixels"], "RGBA")
+        pixels = layer["pixels"]
+        opacity = int(layer.get("opacity", 255))
+        if opacity < 255:
+            pixels = pixels.copy()
+            pixels[..., 3] = (pixels[..., 3].astype(np.uint16) * max(0, opacity) // 255).astype(np.uint8)
+        im = Image.fromarray(pixels, "RGBA")
         canvas.alpha_composite(im, (layer["left"], layer["top"]))
     return np.array(canvas, dtype=np.uint8)
 
@@ -329,6 +369,11 @@ def write_psd(
                 extra_block=_section_divider_block(
                     "start" if layer["type"] == GROUP_START else "end"),
                 flags=_visibility_flags(24, bool(layer.get("hidden"))),
+                # Photoshop writes pass on the closing divider; keep it that
+                # way so a read -> write round trip is byte-faithful.
+                blend=(b"pass" if layer["type"] == GROUP_END
+                       else layer.get("blend", BLEND_NORMAL)),
+                opacity=layer.get("opacity", 255),
             )
         else:
             pixels = layer["pixels"]
@@ -342,6 +387,8 @@ def write_psd(
                 lengths,
                 layer_id=idx + 1,
                 flags=_visibility_flags(0, bool(layer.get("hidden"))),
+                blend=layer.get("blend", BLEND_NORMAL),
+                opacity=layer.get("opacity", 255),
             )
         for ch in channel_payloads[idx]:
             channel_blob += ch

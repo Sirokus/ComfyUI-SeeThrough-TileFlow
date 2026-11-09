@@ -50,7 +50,6 @@ def grid_json(tmp):
     doc["out"] = {"dir": tmp, "alpha_threshold": 8}
     generation = {"version": 1, "algo_version": 1, "random_seed": 42}
     doc["generation"] = generation
-    doc["generation_id"] = tile_psd.generation_id(generation)
     return json.dumps(doc, ensure_ascii=False)
 
 
@@ -109,7 +108,7 @@ def main():
             nodes_shared._seethrough_node_class = original
         check(calls["n"] == 1, "an error is not retried (%d call)" % calls["n"])
 
-        print("[an empty tile is retried twice]")
+        print("[an empty tile is recorded and the run moves on]")
         calls["n"] = 0
 
         class EmptyPost:
@@ -125,7 +124,7 @@ def main():
                 grid_doc=[raw_grid], random_seed=42)
         finally:
             nodes_shared._seethrough_node_class = original
-        check(calls["n"] == 3, "one try plus two empty retries (%d calls)" % calls["n"])
+        check(calls["n"] == 1, "an empty tile is not retried (%d call)" % calls["n"])
         check(len(parts_out) == 1 and indices_out == ["0"],
               "the empty tile still reaches stage 3 as an empty record")
 

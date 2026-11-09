@@ -133,8 +133,14 @@ class EditSubgraph:
                key: str, tolerance: float, softness: float, protect: bool,
                despill: float, negative_prompt: str, cfg: float,
                resolution: int, scheduler: str, sigmas: str,
-               width: int, height: int):
-        """Append one clone per part; return the list of SaveLayer nodes."""
+               width: int, height: int, crop_mode: bool = False):
+        """Append one clone per part; return the list of save nodes.
+
+        In ``crop_mode`` every part is a PSD crop: the clone is fed a
+        ``STLU_LoadCrop`` instead of a shared reference image, its sampling
+        size follows the part, and the tail cuts the edited result back to
+        the layer with ``STLU_CutToLayer`` instead of chroma-keying it.
+        """
         saves: List[Any] = []
         all_encoders: List[Any] = []
         all_gates: List[Any] = []
@@ -143,6 +149,28 @@ class EditSubgraph:
             prefix = "ep%d" % index
             created: Dict[int, Any] = {}
             gate_by_node: Dict[int, Any] = {}
+
+            # Crop mode: the clone is edited at the crop's work size, not at
+            # the batch-wide sampling size.
+            load_crop = None
+            load_ref = None
+            part_w, part_h, part_res = int(width), int(height), int(resolution)
+            if crop_mode:
+                part_w = max(1, int(part["width"]))
+                part_h = max(1, int(part["height"]))
+                part_res = max(1, int(part["resolution"]))
+                load_crop = graph.node(
+                    "STLU_LoadCrop", id="%s_crop" % prefix,
+                    file=part["crop_file"], width=part_w, height=part_h,
+                )
+                # Optional high-resolution reference: the same frame cut out
+                # at the crop's box, read at its native size so the encoder
+                # downscales it once (it does the ~resolution^2 fit itself).
+                if str(part.get("ref_file") or "").strip():
+                    load_ref = graph.node(
+                        "STLU_LoadCrop", id="%s_ref" % prefix,
+                        file=part["ref_file"], width=0, height=0,
+                    )
 
             for node_id, node in self.nodes.items():
                 ct = node.get("type")
@@ -187,7 +215,7 @@ class EditSubgraph:
                         elif name == "negative_prompt":
                             base[name] = negative_prompt
                         else:
-                            base[name] = int(resolution)
+                            base[name] = part_res if crop_mode else int(resolution)
                         continue
                     link = self.links.get(int(link_id))
                     if link is None:
@@ -199,7 +227,13 @@ class EditSubgraph:
                         sgin = self.sg_inputs[slot] if slot < len(self.sg_inputs) else {}
                         sname = str(sgin.get("name") or "")
                         if sname == "images.image_1":
-                            base[name] = external["reference"]
+                            if crop_mode:
+                                base[name] = load_crop.out(0)
+                            else:
+                                base[name] = external["reference"]
+                        elif (sname == "images.image_2" and crop_mode
+                              and load_ref is not None):
+                            base[name] = load_ref.out(0)
                         elif sname == "negative_prompt":
                             base[name] = negative_prompt
                         elif sname == "cfg":
@@ -209,15 +243,15 @@ class EditSubgraph:
                         elif sname == "switch_1":
                             base[name] = False   # raw prompt, no enhancer text
                         elif sname == "width":
-                            base[name] = int(width)
+                            base[name] = part_w
                         elif sname == "height":
-                            base[name] = int(height)
+                            base[name] = part_h
                         elif sname == "scheduler":
                             base[name] = str(scheduler)
                         elif sname == "seed":
                             base[name] = int(seed) + int(index)
                         elif sname == "resolution":
-                            base[name] = int(resolution)
+                            base[name] = part_res
                         elif str(sgin.get("type")) == "IMAGE":
                             base.pop(name, None)   # image_2..10 unused
                         else:
@@ -247,7 +281,7 @@ class EditSubgraph:
                 if ct == "TextEncodeQwenImage21":
                     base["prompt"] = part["prompt"]
                     base["negative_prompt"] = negative_prompt
-                    base["resolution"] = int(resolution)
+                    base["resolution"] = part_res
                 if ct == "CFGGuider":
                     base["cfg"] = float(cfg)
                 if ct == "KSamplerSelect":
@@ -257,8 +291,8 @@ class EditSubgraph:
                 if ct == "ComfySwitchNode":
                     base["switch"] = False
                 if ct == "EmptyLatentImage":
-                    base["width"] = int(width)
-                    base["height"] = int(height)
+                    base["width"] = part_w
+                    base["height"] = part_h
                     base["batch_size"] = 1
 
                 for key_name, value in base.items():
@@ -268,6 +302,37 @@ class EditSubgraph:
             if out_id not in created:
                 raise ValueError("subgraph output comes from a skipped node: %s" % out_id)
             image = created[out_id].out(out_slot)
+
+            if crop_mode:
+                # Two ways back: a locked edit keeps the source silhouette and
+                # is cut with the crop's own alpha; a key edit repaints the
+                # part on a flat key and is keyed out at the restore step.
+                if str(part.get("silhouette") or "lock") == "key":
+                    kwargs = {
+                        "image": image,
+                        "geometry": json.dumps(part["geometry"]),
+                        "key_color": key,
+                        "tolerance": float(tolerance),
+                        "softness": float(softness),
+                        "protect": bool(protect),
+                        "despill": float(despill),
+                    }
+                    # The crop itself is the colour guide, so a part that is
+                    # genuinely the key colour survives.  A new layer's crop is
+                    # the key canvas; there is nothing to protect.
+                    if part.get("key_reference", True):
+                        kwargs["reference"] = load_crop.out(0)
+                    save = graph.node("STLU_KeyCut", id="%s_keycut" % prefix,
+                                      **kwargs)
+                else:
+                    save = graph.node(
+                        "STLU_CutToLayer", id="%s_cut" % prefix,
+                        image=image,
+                        alpha=load_crop.out(1),
+                        geometry=json.dumps(part["geometry"]),
+                    )
+                saves.append(save)
+                continue
 
             chroma = graph.node(
                 "STLU_ChromaToAlpha", id="%s_chroma" % prefix,
@@ -322,7 +387,13 @@ def load_template(workflow_path: str) -> EditSubgraph:
 
 def build_expand(workflow_path: str, parts: List[Dict[str, Any]],
                  external: Dict[str, Any], seed: int, out_dir_rel: str,
-                 layers_json_path: str, psd_name: str, **options):
+                 layers_json_path: str, psd_name: str, psd_plan: str = "",
+                 **options):
+    """Clone the edit subgraph per part and chain the output nodes.
+
+    ``psd_plan`` switches the tail from the chroma-key layer merge to the
+    PSD-upscale assembler, which rebuilds the full layered document.
+    """
     template = load_template(workflow_path)
     graph = GraphBuilder()
     saves = template.expand(graph, parts, external, seed, out_dir_rel, **options)
@@ -337,12 +408,20 @@ def build_expand(workflow_path: str, parts: List[Dict[str, Any]],
         if prev is not None:
             kwargs["prev"] = prev
         prev = graph.node("STLU_Barrier", id="ep_save_bar%d" % i, **kwargs).out(0)
-    psd = graph.node(
-        "STLU_PartsPSD", id="ep_psd",
-        layers_json=layers_json_path,
-        trigger=prev,
-        psd_filename=psd_name,
-    )
+    if psd_plan:
+        psd = graph.node(
+            "STLU_PsdAssemble", id="ep_psd",
+            plan_json=psd_plan,
+            trigger=prev,
+            psd_filename=psd_name,
+        )
+    else:
+        psd = graph.node(
+            "STLU_PartsPSD", id="ep_psd",
+            layers_json=layers_json_path,
+            trigger=prev,
+            psd_filename=psd_name,
+        )
     expand = graph.finalize()
     for node_id, info in expand.items():
         for name, value in (info.get("inputs") or {}).items():

@@ -96,7 +96,6 @@ def write_old_manifest(run_dir):
         "overlap": 256,
         "offset": [0, 0],
         "generation": generation,
-        "generation_id": "old",
         "tiles": tiles,
         "count": 2,
     }
@@ -168,19 +167,21 @@ def test_current_selection(doc):
 
 
 def test_old_selection_mapping(tmp):
-    print("[① old uniform selection maps by source area, not by index]")
+    print("[① an old uniform folder is cleared when the partition type changes]")
     frame = synthetic_frame()
     old_dir = os.path.join(tmp, "SeeThrough", "Mapped")
     write_old_manifest(old_dir)
     out, tiles, indices, _grid_doc, _original, doc, _res, _depth = run_node(
         frame, "0,1", "SeeThrough/Mapped", select_plan="")
-    check(indices == ["0"] and len(tiles) == 1,
-          "the old top-row selection maps to the first strip only (%s)" % indices)
-    check(doc["selection"] == "0", "the mapped selection is written into the doc")
     reset = (doc.get("out") or {}).get("reset") or {}
-    check(reset.get("required") is True, "switching from uniform clears the old folder")
-    check("partition" in (reset.get("keys") or []),
-          "the mode change is named in the reset keys (%s)" % (reset.get("keys"),))
+    check(reset.get("required") is False and reset.get("changed") is True,
+          "switching from uniform reports a reset (%s)" % (reset,))
+    check("分区方式" in str(reset.get("reason") or ""),
+          "the mode change is the stated reason (%s)" % (reset.get("reason"),))
+    check(indices == ["0", "1", "2"],
+          "the cleared folder runs every strip (%s)" % indices)
+    check(not os.path.isfile(os.path.join(old_dir, "manifest.json")),
+          "the old uniform manifest is cleared")
     rgb = np.clip(np.rint(synthetic_frame()[0].numpy() * 255.0),
                   0, 255).astype(np.uint8)
     expected = tile_strips.plan_from_rgb(

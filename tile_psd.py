@@ -15,7 +15,6 @@ created from a single part: ``eyel``/``eyer`` -> ``eyes``, ``hairf``/
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import os
 import re
@@ -27,12 +26,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from . import psd_reader, psd_writer
+    from . import psd_reader, psd_writer, region_plan
     from .core_compose import _alpha_over, alpha_bbox
     from .stlu import json_io
 except ImportError:  # pragma: no cover - standalone import
     import psd_reader
     import psd_writer
+    import region_plan
     from core_compose import _alpha_over, alpha_bbox
     from stlu import json_io
 
@@ -49,7 +49,9 @@ DEFAULT_SEAM_FEATHER = 32
 # 2: context_pad tiles are cut back in the model's pixel space, not the source
 # window's.  Runs from 1 with padding wrote 512 px parts into a 1694 px PSD,
 # so those tile PSDs must never be reused.
-ALGO_VERSION = 2
+# 3: v3 head layers are dropped on non-head tiles, so tiles generated before
+# this fix contain invented faces/eyes and must not be reused.
+ALGO_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +120,38 @@ def merge_group_name(tag: str) -> str:
     return tag
 
 
-def _depth(pinfo: Dict[str, Any]) -> float:
+def _depth(pinfo: Dict[str, Any], fallback: float = 1.0) -> float:
     try:
-        return float(pinfo.get("depth_median", 1.0))
+        return float(pinfo.get("depth_median", fallback))
     except (TypeError, ValueError):
-        return 1.0
+        return float(fallback)
+
+
+def _has_depth(pinfo: Dict[str, Any]) -> bool:
+    try:
+        float(pinfo["depth_median"])
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _depth_fallback(tag2pinfo: Dict[str, Any]) -> float:
+    """Far-end depth for parts the depth model did not cover.
+
+    GenerateDepth only walks the v2 body parts, so a v3 ``head`` layer never
+    gets a median.  1.0 (farthest) is the safe place for it -- deliberately,
+    relative to the tile's own range, so it sits at the bottom of the stack
+    instead of floating among real parts.
+    """
+    known = []
+    for pinfo in tag2pinfo.values():
+        if not isinstance(pinfo, dict) or pinfo.get("img") is None:
+            continue
+        try:
+            known.append(float(pinfo["depth_median"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return max(known) if known else 1.0
 
 
 def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
@@ -277,17 +306,22 @@ def build_tile_layers(
         key = merge_group_name(tag) if merge_parts else tag
         groups.setdefault(key, []).append((tag, pinfo))
 
+    fallback = _depth_fallback(tag2pinfo)
+    undepved = []
+
     layers: List[Dict[str, Any]] = []
     for name, items in groups.items():
         # Far first, so the nearest item ends up on top when compositing.
-        items.sort(key=lambda item: _depth(item[1]), reverse=True)
+        items.sort(key=lambda item: _depth(item[1], fallback), reverse=True)
+        if any(not _has_depth(pinfo) for _, pinfo in items):
+            undepved.append(name)
 
         if merge_parts and len(items) > 1:
             composed = _compose_group([p for _, p in items], frame_h, frame_w, int(alpha_threshold))
             if composed is None:
                 continue
             pixels, left, top = composed
-            depth = min(_depth(p) for _, p in items)
+            depth = min(_depth(p, fallback) for _, p in items)
             sources = [tag for tag, _ in items]
         else:
             tag, pinfo = items[0]
@@ -298,7 +332,7 @@ def build_tile_layers(
             pixels = arr[t:b, l:r].copy()
             left = int(pinfo.get("xyxy", [0, 0])[0]) + int(l)
             top = int(pinfo.get("xyxy", [0, 0])[1]) + int(t)
-            depth = _depth(pinfo)
+            depth = _depth(pinfo, fallback)
             sources = [tag]
 
         layers.append({
@@ -309,6 +343,11 @@ def build_tile_layers(
             "depth_median": float(depth),
             "sources": sources,
         })
+
+    if undepved:
+        print("[STLU] psd: no depth for %s (v3 head layer); stacked at the "
+              "far end %.3f" % (", ".join(sorted(undepved)), fallback),
+              flush=True)
 
     # PSD bottom -> top is far -> near.
     layers.sort(key=lambda layer: layer["depth_median"], reverse=True)
@@ -470,7 +509,6 @@ def write_tiles(
     run_dir_abs: Optional[str] = None,
     write_manifest: bool = True,
     generation: Optional[Dict[str, Any]] = None,
-    generation_id: str = "",
     tile_coords: Optional[Sequence[Sequence[int]]] = None,
     grid_offset: Sequence[int] = (0, 0),
 ) -> Dict[str, Any]:
@@ -586,7 +624,7 @@ def write_tiles(
             except Exception:  # noqa: BLE001
                 depth_name = ""
 
-        entries.append({
+        entry = {
             "index": int(index),
             "slot": int(slot),
             "file": name,
@@ -605,7 +643,15 @@ def write_tiles(
                 # own depth instead of guessing from per-tile layer indices.
                 "depth_median": float(layer["depth_median"]),
             } for layer in layers],
-        })
+        }
+        if generation:
+            # Same two numbers for every tile, but kept per entry so the ⑤
+            # preview can label each tile without reading the manifest root.
+            entry["seeds"] = {
+                "layer": generation.get(SEED_KEY),
+                "depth": generation.get(DEPTH_SEED_KEY),
+            }
+        entries.append(entry)
 
     if not entries:
         raise ValueError("every tile ended up empty")
@@ -637,7 +683,6 @@ def write_tiles(
         "tiles": entries,
         "count": len(entries),
         "generation": generation or {},
-        "generation_id": str(generation_id or ""),
     }
     if merge_after:
         try:
@@ -839,54 +884,17 @@ def read_manifest(run_dir: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Generation fingerprint: everything that can change the pixels of a tile
+# Generation record: the settings that produced the tiles, kept for reference
 # ---------------------------------------------------------------------------
+# Nothing compares it automatically.  The tiles in a folder are always reused
+# as they are; only the explicit tile selection decides what is regenerated and
+# only the manual clear button (or a structural mismatch -- another partition
+# type / another source image, see ``cache_mismatch_reason``) empties a folder.
 
 GENERATION_FILE = "generation.json"
 
-# Settings that only affect the checked tiles: geometry and every other
-# setting stay identical, so finished tiles remain valid and a change to any
-# of these regenerates the selection without clearing the folder.  Keeping
-# them out of the identity is what makes a seed / context change a targeted
-# re-run instead of a full reset.
 SEED_KEY = "random_seed"
-LOCAL_RERUN_KEYS = (SEED_KEY, "context_pad")
-
-
-def generation_identity(generation: Dict[str, Any]) -> Dict[str, Any]:
-    """The part of ``generation`` that decides tile compatibility."""
-    return {key: value for key, value in generation.items()
-            if key not in LOCAL_RERUN_KEYS}
-
-
-def generation_id(generation: Dict[str, Any]) -> str:
-    """Stable hash of the generation parameters (dict order does not matter)."""
-    try:
-        payload = json.dumps(generation_identity(generation), sort_keys=True,
-                             ensure_ascii=False, separators=(",", ":"),
-                             default=str)
-    except (TypeError, ValueError):
-        payload = str(generation_identity(generation))
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-def generation_matches(old: Optional[Dict[str, Any]],
-                       new: Dict[str, Any],
-                       keys: Optional[Sequence[str]] = None) -> bool:
-    """True when every compared key matches (nested values compared as data).
-
-    ``keys`` defaults to every key of ``new`` except the seed; extra keys in
-    ``old`` (model identities, for a caller that does not load models) are
-    ignored.
-    """
-    if not isinstance(old, dict) or not isinstance(new, dict):
-        return False
-    compared = (list(keys) if keys is not None
-                else [key for key in new if key not in LOCAL_RERUN_KEYS])
-    for key in compared:
-        if key not in old or old[key] != new[key]:
-            return False
-    return True
+DEPTH_SEED_KEY = "depth_random_seed"
 
 
 def read_generation(run_dir: str) -> Optional[Dict[str, Any]]:
@@ -901,14 +909,12 @@ def read_generation(run_dir: str) -> Optional[Dict[str, Any]]:
     return doc if isinstance(doc, dict) else None
 
 
-def write_generation(run_dir: str, generation: Dict[str, Any],
-                     gid: str = "") -> str:
+def write_generation(run_dir: str, generation: Dict[str, Any]) -> str:
     """Persist the full generation block next to the tiles (for inspection)."""
     os.makedirs(run_dir, exist_ok=True)
     payload = {
-        "version": 1,
+        "version": 2,
         "generation": generation,
-        "generation_id": str(gid or generation_id(generation)),
     }
     path = os.path.join(run_dir, GENERATION_FILE)
     json_io.write_json_atomic(path, payload)
@@ -919,8 +925,8 @@ class ClearFailed(RuntimeError):
     """The output folder could not be reset completely.
 
     Continuing after a partial clear is unsafe: the surviving PSDs belong to
-    the previous generation but would look like ordinary files in the folder,
-    so they could be reused as guide/merge input under the new fingerprint.
+    the previous folder contents but would look like ordinary files in the
+    folder, so they could be reused as guide/merge input.
     """
 
     def __init__(self, run_dir: str, failures: Sequence[Tuple[str, str]]):
@@ -955,6 +961,19 @@ def verify_run_cleared(run_dir: str) -> None:
         raise ClearFailed(run_dir, survivors)
 
 
+def discard_legacy_locks(run_dir: str) -> bool:
+    """Remove the ``_locks/`` store an older version of this pack wrote."""
+    path = os.path.join(os.path.abspath(str(run_dir or "")), "_locks")
+    if not os.path.isdir(path):
+        return False
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:  # noqa: BLE001
+        print("[STLU] cannot remove %s: %s" % (path, exc), flush=True)
+        return False
+    return True
+
+
 def clear_run_outputs(run_dir: str,
                       manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Delete the files this pipeline wrote into ``run_dir``.
@@ -962,8 +981,8 @@ def clear_run_outputs(run_dir: str,
     Called only when a result-affecting parameter changed.  Every PSD,
     ``*_preview.png`` / ``*_depth.png``, the wave documents and ``images/``
     are removed; unrelated files the user put in the folder are left alone.
-    The ``_locks/`` snapshot store is deliberately kept: that is what lets a
-    user-locked part survive the clear and come back on the next run.
+    A ``_locks/`` store left by an older version is removed as well; the lock
+    feature no longer exists.
 
     Any file that cannot be removed raises :class:`ClearFailed` instead of
     printing and continuing: a partial reset must never let old tiles look
@@ -1019,6 +1038,9 @@ def clear_run_outputs(run_dir: str,
         except OSError as exc:  # noqa: BLE001
             failures.append((images_dir, str(exc)))
             print("[STLU] cannot remove %s: %s" % (images_dir, exc), flush=True)
+
+    if discard_legacy_locks(run_dir):
+        removed.append("_locks/")
 
     if failures:
         raise ClearFailed(run_dir, failures)
@@ -1112,11 +1134,8 @@ def scan_tile_entries(
     ``allow_unlisted`` controls whether a PSD the manifest does not mention is
     rebuilt from its layers and adopted:
 
-    * ``False`` -- the manifest is the authoritative list.  Needed after a
-      generation change: a locked/leftover PSD from the old run must not look
-      like current output.
-    * ``True``  -- adopt unlisted PSDs, for a genuinely interrupted run whose
-      ``generation.json`` already matched.
+    * ``False`` -- the manifest is the authoritative list.
+    * ``True``  -- adopt unlisted PSDs (an interrupted run, hand-copied tiles).
     * ``None`` (default) -- adopt only when there is no manifest with tiles.
     """
     directory = str(run_dir or "")
@@ -1214,47 +1233,137 @@ def scan_tile_entries(
     return ordered
 
 
-def cache_compatible(manifest: Optional[Dict[str, Any]],
-                     grid_doc: Optional[Dict[str, Any]]) -> bool:
-    """Can this folder's old tiles join a run with ``grid_doc``?"""
+def cache_mismatch_reason(manifest: Optional[Dict[str, Any]],
+                          grid_doc: Optional[Dict[str, Any]]) -> str:
+    """Why this folder's tiles cannot join a run with ``grid_doc`` ("" = they can).
+
+    Only structural differences count: another partition type, another source
+    image, or a grid whose boxes moved.  A custom window array is compared as a
+    set (its ``tile_size`` is only the largest side), so appending or reordering
+    windows keeps every existing tile; only a box that disappeared or moved
+    clears the folder.  Diffusion settings are never compared -- changing the
+    seed or the models only changes *which* tiles this run regenerates.  A
+    non-empty result means the caller clears the whole folder first (with a
+    prompt), so nothing stale can join the guide or the merge.
+    """
     if not isinstance(manifest, dict) or not isinstance(manifest.get("tiles"), list):
-        return False
-    if not grid_doc:
-        return True
-    source = grid_doc.get("source") or {}
-    want = [int(source.get("width") or 0), int(source.get("height") or 0)]
-    have = [int(v) for v in (manifest.get("source") or [0, 0])[:2]]
+        return ""
+    if not manifest.get("tiles"):
+        return ""
+    doc = grid_doc or {}
+    old_mode = str(manifest.get("mode") or "uniform")
+    new_mode = str(doc.get("mode") or "uniform")
+    if old_mode != new_mode:
+        return "分区方式不同（%s -> %s）" % (old_mode, new_mode)
+    source = doc.get("source") or {}
+    try:
+        want = [int(source.get("width") or 0), int(source.get("height") or 0)]
+        have = [int(v) for v in (manifest.get("source") or [0, 0])[:2]]
+    except (TypeError, ValueError):
+        want, have = [0, 0], [0, 0]
     if want[0] > 0 and want != have:
-        return False
-    want_tiles = [int(v) for v in (grid_doc.get("tile_size") or [])]
+        return "原图尺寸不同（%dx%d -> %dx%d）" % (have[0], have[1], want[0], want[1])
+    old_print = str(manifest.get("source_fingerprint") or "")
+    new_print = str(source.get("fingerprint") or "")
+    if old_print and new_print and old_print != new_print:
+        return "原图不同"
+    is_custom = old_mode == region_plan.CUSTOM_MODE
+    want_tiles = [int(v) for v in (doc.get("tile_size") or [])]
     have_tiles = [int(v) for v in (manifest.get("tile_size") or [])]
-    if want_tiles and have_tiles and want_tiles != have_tiles:
-        return False
-    if int(grid_doc.get("overlap") or 0) != int(manifest.get("overlap") or 0):
-        return False
+    # A custom document's tile_size is only the largest side, a compatibility
+    # field -- appending a bigger window must not clear the smaller ones.
+    if (not is_custom and want_tiles and have_tiles and
+            want_tiles != have_tiles):
+        return "分块尺寸不同（%s -> %s）" % (have_tiles, want_tiles)
+    if int(doc.get("overlap") or 0) != int(manifest.get("overlap") or 0):
+        return "分块重叠不同（%s -> %s）" % (manifest.get("overlap"), doc.get("overlap"))
     # Same size/overlap but a different phase means the old tiles sit in boxes
     # this run no longer uses; their pixels would land in the wrong place.
     try:
         old_offset = [int(v) for v in (manifest.get("offset") or [0, 0])[:2]]
-        new_offset = [int(v) for v in (grid_doc.get("offset") or [0, 0])[:2]]
+        new_offset = [int(v) for v in (doc.get("offset") or [0, 0])[:2]]
     except (TypeError, ValueError):
         old_offset, new_offset = [0, 0], [0, 0]
     if old_offset != new_offset:
-        return False
-    old_print = str(manifest.get("source_fingerprint") or "")
-    new_print = str(source.get("fingerprint") or "")
-    if old_print and new_print and old_print != new_print:
-        return False
-    # Generation parameters (resolution / steps / seed / models / ...) are
-    # stricter than geometry: a match here means the cached pixels were made
-    # by the same settings.  A missing id on either side only happens for
-    # documents written before the fingerprint existed.  On a mismatch
-    # PipelineInput clears the folder first, so nothing stale can join.
-    old_gen = str(manifest.get("generation_id") or "")
-    new_gen = str((grid_doc or {}).get("generation_id") or "")
-    if old_gen and new_gen and old_gen != new_gen:
-        return False
-    return True
+        return "分块偏移不同（%s -> %s）" % (old_offset, new_offset)
+    # The boxes themselves: same size/overlap/offset but different windows
+    # (a moved custom region, another strip plan) still moves every pixel.
+    try:
+        coords = [[int(v) for v in c[:4]] for c in (doc.get("coords") or [])]
+    except (TypeError, ValueError):
+        coords = []
+    if coords:
+        if is_custom:
+            # Windows are an unordered set: appending or reordering the array
+            # keeps every old box usable.  Only a box that disappeared or
+            # moved invalidates its cached tile.
+            known = {tuple(c) for c in coords}
+            for tile in manifest.get("tiles") or []:
+                try:
+                    box = tuple(int(v) for v in (tile.get("tile") or [])[:4])
+                except (TypeError, ValueError):
+                    continue
+                if box and box not in known:
+                    return "分块位置不同"
+        else:
+            for tile in manifest.get("tiles") or []:
+                try:
+                    index = int(tile.get("index"))
+                    box = [int(v) for v in (tile.get("tile") or [])[:4]]
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(coords) and box and box != coords[index]:
+                    return "分块位置不同"
+    return ""
+
+
+def _remap_custom_entries(entries: Sequence[Dict[str, Any]],
+                          grid_doc: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Re-key adopted tiles by box for an unordered custom window array.
+
+    A custom layout is compared as a set (``cache_mismatch_reason``), so a
+    reorder or an insertion leaves old tiles with the right pixels but the
+    wrong index.  ``write_manifest`` assigns slots in index order, so an
+    un-remapped entry would land on another window's slot.  Each entry is
+    given the position its box occupies in ``coords``; a box no longer
+    present keeps its entry (the folder mismatch check would have cleared the
+    run anyway, and dropping it here would only lose pixels).
+    """
+    doc = grid_doc or {}
+    boxes: List[Optional[Tuple[int, int, int, int]]] = []
+    for coord in doc.get("coords") or []:
+        try:
+            boxes.append(tuple(int(v) for v in coord[:4]))
+        except (TypeError, ValueError):
+            boxes.append(None)
+    if not boxes:
+        return list(entries)
+    used = set()
+    remapped: List[Dict[str, Any]] = []
+    for entry in entries:
+        try:
+            box = tuple(int(v) for v in (entry.get("tile") or [])[:4])
+        except (TypeError, ValueError):
+            remapped.append(entry)
+            continue
+        target = None
+        for index, candidate in enumerate(boxes):
+            if candidate == box and index not in used:
+                target = index
+                break
+        if target is None:
+            remapped.append(entry)
+            continue
+        used.add(target)
+        if int(entry.get("index", -1)) == target:
+            remapped.append(entry)
+            continue
+        moved = dict(entry)
+        moved["index"] = target
+        moved["row"] = 0
+        moved["col"] = target
+        remapped.append(moved)
+    return remapped
 
 
 def cached_tile_entries(
@@ -1263,569 +1372,26 @@ def cached_tile_entries(
     skip: Sequence[int] = (),
     manifest: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Finished tiles from an earlier run in the same folder.
+    """Every finished tile already sitting in ``run_dir`` -- the folder is the cache.
 
-    ``skip`` holds the indices this run is re-generating: their old copies
-    must not be merged (or used as guide), only their fresh output.
+    Nothing is compared here: whatever tile PSDs the folder holds belong to the
+    current partition, because a different partition type / source image clears
+    the whole folder before the run (``cache_mismatch_reason``).  PSDs the
+    manifest does not list -- an interrupted run, or files copied in by hand --
+    are rebuilt from their layers and adopted.  ``skip`` holds the indices
+    regenerated now: their stale copies must not be merged (or used as guide),
+    only the fresh output.
     """
     if not run_dir or not os.path.isdir(run_dir):
         return []
     manifest = manifest if manifest is not None else read_manifest(run_dir)
-    if cache_compatible(manifest, grid_doc):
-        # The manifest describes the current generation: it is the complete
-        # list of tiles that may join, so never go hunting for unlisted PSDs.
-        allow_unlisted = False
-    else:
-        # An interrupted run leaves its PSDs behind but never writes
-        # manifest.json.  The folder's generation.json still records the
-        # settings that made them, so those tiles can join as long as the
-        # current run uses the same ones.
-        interrupted = not isinstance(manifest, dict) or not manifest.get("tiles")
-        stored = (read_generation(run_dir) or {}).get("generation") or {}
-        wanted = (grid_doc or {}).get("generation") or {}
-        if (not interrupted or not stored or not wanted
-                or not generation_matches(stored, wanted)):
-            return []
-        manifest = {}
-        allow_unlisted = True
+    entries = scan_tile_entries(
+        run_dir, grid_doc, manifest or {}, allow_unlisted=True)
+    if str((grid_doc or {}).get("mode") or "") == region_plan.CUSTOM_MODE:
+        entries = _remap_custom_entries(entries, grid_doc)
     skip_set = {int(i) for i in skip}
-    return [entry for entry in scan_tile_entries(
-                run_dir, grid_doc, manifest, allow_unlisted=allow_unlisted)
+    return [entry for entry in entries
             if int(entry.get("index", -1)) not in skip_set]
-
-
-# ---------------------------------------------------------------------------
-# Locked parts: keep the finished copy of a part on a targeted re-run
-# ---------------------------------------------------------------------------
-
-def find_tile_psd(run_dir: str, prefix: str, index: int) -> Optional[str]:
-    """The tile PSD an earlier run left for ``index`` (newest file wins)."""
-    directory = str(run_dir or "")
-    if not directory or not os.path.isdir(directory):
-        return None
-    exact = []
-    loose = []
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return None
-    for name in names:
-        if not name.lower().endswith(".psd") or name.lower().endswith("_depth.psd"):
-            continue
-        match = TILE_FILE_RE.match(name)
-        if not match:
-            continue
-        try:
-            if int(match.group("index")) != int(index):
-                continue
-        except (TypeError, ValueError):
-            continue
-        path = os.path.join(directory, name)
-        loose.append(path)
-        if str(match.group("prefix") or "").lower() == str(prefix or "").lower():
-            exact.append(path)
-    candidates = exact or loose
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0.0)
-
-
-def _load_part_depth(images_dir: str, name: str) -> Optional[np.ndarray]:
-    """The per-part depth PNG an earlier run saved for ``name`` (if any)."""
-    if not images_dir:
-        return None
-    path = os.path.join(str(images_dir), _safe_stem(name) + "_depth.png")
-    if not os.path.isfile(path):
-        return None
-    try:
-        from PIL import Image
-        with Image.open(path) as image:
-            return np.array(image.convert("L"), dtype=np.uint8)
-    except Exception:  # noqa: BLE001 - depth is a bonus, never a failure
-        return None
-
-
-def replace_locked_parts(
-    parts: Dict[str, Any],
-    old_psd_path: str,
-    locks: Sequence[str],
-    old_entry: Optional[Dict[str, Any]] = None,
-    images_dir: str = "",
-) -> List[str]:
-    """Swap freshly generated parts for the copies saved in an earlier PSD.
-
-    ``parts`` is mutated in place (callers pass a shallow copy): every locked
-    tag is removed from ``tag2pinfo`` and the earlier layer with the same name
-    takes its place.  Because both the tile PSD and the per-part PNGs are
-    written from ``tag2pinfo``, the preserved pixels stay consistent.
-    """
-    wanted = {str(n).strip().lower() for n in (locks or []) if str(n).strip()}
-    if not wanted or not os.path.isfile(old_psd_path):
-        return []
-    try:
-        data = psd_reader.read_psd(old_psd_path)
-    except Exception as exc:  # noqa: BLE001 - a broken old PSD is not fatal
-        print("[STLU] locked parts: cannot read %s: %s" % (old_psd_path, exc), flush=True)
-        return []
-
-    old_layers = []
-    for layer in data.get("layers") or []:
-        if str(layer.get("kind") or "layer") != "layer" or layer.get("hidden"):
-            continue
-        if (int(layer.get("right", 0)) <= int(layer.get("left", 0))
-                or int(layer.get("bottom", 0)) <= int(layer.get("top", 0))):
-            continue
-        old_layers.append(layer)
-
-    depths: Dict[str, float] = {}
-    for entry in (old_entry or {}).get("layers") or []:
-        try:
-            depths[str(entry.get("name") or "").lower()] = float(entry.get("depth_median", 1.0))
-        except (TypeError, ValueError):
-            continue
-
-    tag2pinfo = dict(parts.get("tag2pinfo") or {})
-    parts["tag2pinfo"] = tag2pinfo
-    kept: List[str] = []
-    order_total = max(1, len(old_layers) - 1)
-    seen_locked = set()
-    for order, layer in enumerate(old_layers):
-        name = str(layer.get("name") or "")
-        key = name.lower()
-        if key not in wanted:
-            continue
-        seen_locked.add(key)
-        for tag in [t for t in tag2pinfo if str(t).lower() == key]:
-            tag2pinfo.pop(tag, None)
-        px = np.ascontiguousarray(layer.get("pixels"))
-        if px.ndim != 3 or px.shape[-1] != 4:
-            continue
-        height, width = int(px.shape[0]), int(px.shape[1])
-        left, top = int(layer.get("left", 0)), int(layer.get("top", 0))
-        depth = depths.get(key)
-        if depth is None:
-            # PSD records run bottom -> top, which is far -> near.
-            depth = 1.0 - (order / float(order_total))
-        pinfo = {
-            "img": px,
-            "xyxy": [left, top, left + width, top + height],
-            "depth_median": float(depth),
-        }
-        saved_depth = _load_part_depth(images_dir, name)
-        if saved_depth is not None and saved_depth.shape[:2] == px.shape[:2]:
-            pinfo["depth"] = saved_depth
-        tag2pinfo[name] = pinfo
-        kept.append(name)
-
-    # A locked part the earlier tile did not have still means "keep the old
-    # state": drop the freshly generated copy instead of reviving it.
-    for key in sorted(wanted - seen_locked):
-        for tag in [t for t in tag2pinfo if str(t).lower() == key]:
-            tag2pinfo.pop(tag, None)
-        kept.append(key)
-    return kept
-
-
-# ---------------------------------------------------------------------------
-# Lock store: per-tile part snapshots that survive a run-folder clear
-# ---------------------------------------------------------------------------
-#
-# ``clear_run_outputs`` removes every PSD in the run folder, so a lock that
-# only pointed at "the layer inside the old PSD" disappeared together with it.
-# The store below keeps a copy of each locked layer in ``<run>/_locks/`` -- a
-# directory the clear deliberately leaves alone.  A later run (even after a
-# parameter change wiped the folder) restores the pixels from this copy, and a
-# tile that is not re-generated at all can be rebuilt from its locked parts.
-
-LOCK_DIR = "_locks"
-LOCK_INDEX = "index.json"
-
-
-def lock_dir(run_dir: str) -> str:
-    return os.path.join(str(run_dir or ""), LOCK_DIR)
-
-
-def lock_index_path(run_dir: str) -> str:
-    return os.path.join(lock_dir(run_dir), LOCK_INDEX)
-
-
-def read_lock_index(run_dir: str) -> Dict[str, Any]:
-    """The lock store document (empty when nothing was ever locked)."""
-    empty = {"version": 1, "source": [], "tiles": {}}
-    path = lock_index_path(run_dir)
-    if not run_dir or not os.path.isfile(path):
-        return empty
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            doc = json.load(handle)
-    except Exception as exc:  # noqa: BLE001 - a broken store is not fatal
-        print("[STLU] locks: cannot read %s: %s" % (path, exc), flush=True)
-        return empty
-    if not isinstance(doc, dict):
-        return empty
-    if not isinstance(doc.get("tiles"), dict):
-        doc["tiles"] = {}
-    doc.setdefault("version", 1)
-    doc.setdefault("source", [])
-    return doc
-
-
-def write_lock_index(run_dir: str, doc: Dict[str, Any]) -> str:
-    os.makedirs(lock_dir(run_dir), exist_ok=True)
-    doc["version"] = 1
-    if not isinstance(doc.get("tiles"), dict):
-        doc["tiles"] = {}
-    path = lock_index_path(run_dir)
-    json_io.write_json_atomic(path, doc)
-    return path
-
-
-def tile_locks(run_dir: str) -> Dict[int, List[str]]:
-    """``{tile index: [locked layer names]}`` for the panel and the nodes."""
-    doc = read_lock_index(run_dir)
-    out: Dict[int, List[str]] = {}
-    for raw, tile in (doc.get("tiles") or {}).items():
-        try:
-            index = int(raw)
-        except (TypeError, ValueError):
-            continue
-        names = []
-        for key, record in ((tile or {}).get("parts") or {}).items():
-            names.append(str((record or {}).get("name") or key))
-        if names:
-            out[index] = names
-    return out
-
-
-def lock_summary(run_dir: str) -> Dict[str, List[str]]:
-    """JSON-friendly ``{"3": ["face", "hair"]}`` for the preview panel."""
-    return {str(index): names for index, names in tile_locks(run_dir).items()}
-
-
-def _lock_geometry_matches(doc: Dict[str, Any], tile: Dict[str, Any],
-                           coords: Optional[Sequence[Sequence[int]]],
-                           tile_index: int,
-                           source: Optional[Sequence[int]],
-                           frame_size: Optional[Sequence[int]]) -> bool:
-    """True when the snapshot still sits on the same crop of the same picture."""
-    stored_source = doc.get("source") or []
-    if stored_source and source:
-        try:
-            if ([int(stored_source[0]), int(stored_source[1])]
-                    != [int(source[0]), int(source[1])]):
-                return False
-        except (TypeError, ValueError, IndexError):
-            pass
-    stored_box = tile.get("tile")
-    if stored_box and coords:
-        try:
-            current = coords[int(tile_index)]
-            if [int(v) for v in stored_box[:4]] != [int(v) for v in current[:4]]:
-                return False
-        except (TypeError, ValueError, IndexError):
-            pass
-    canvas = tile.get("canvas")
-    if canvas and frame_size:
-        try:
-            if [int(canvas[0]), int(canvas[1])] != [int(frame_size[1]), int(frame_size[0])]:
-                return False
-        except (TypeError, ValueError, IndexError):
-            pass
-    return True
-
-
-def _lock_pixels(run_dir: str, record: Dict[str, Any]
-                 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """``(rgba, depth)`` from the store; either side may be None."""
-    rel = str(record.get("file") or "")
-    path = os.path.join(lock_dir(run_dir), rel)
-    if not rel or not os.path.isfile(path):
-        return None, None
-    try:
-        from PIL import Image
-        with Image.open(path) as image:
-            pixels = np.array(image.convert("RGBA"), dtype=np.uint8)
-    except Exception as exc:  # noqa: BLE001
-        print("[STLU] locks: cannot read %s: %s" % (path, exc), flush=True)
-        return None, None
-    depth = None
-    depth_rel = str(record.get("depth") or "")
-    if depth_rel:
-        depth_path = os.path.join(lock_dir(run_dir), depth_rel)
-        if os.path.isfile(depth_path):
-            try:
-                from PIL import Image
-                with Image.open(depth_path) as image:
-                    candidate = np.array(image.convert("L"), dtype=np.uint8)
-                if candidate.shape[:2] == pixels.shape[:2]:
-                    depth = candidate
-            except Exception:  # noqa: BLE001 - depth is a bonus
-                depth = None
-    return np.ascontiguousarray(pixels), depth
-
-
-def _write_lock_record(run_dir: str, tile_index: int, name: str,
-                       pixels: np.ndarray, left: int, top: int,
-                       depth: Optional[np.ndarray],
-                       depth_median: float) -> Dict[str, Any]:
-    """Write one RGBA (and optional depth) file and return its record."""
-    px = np.asarray(pixels)
-    if px.ndim != 3 or px.shape[-1] != 4 or px.size == 0:
-        raise ValueError("locked layer %r has no RGBA pixels" % name)
-    index = int(tile_index)
-    dest = os.path.join(lock_dir(run_dir), "tile_%02d" % index)
-    os.makedirs(dest, exist_ok=True)
-    stem = _safe_stem(str(name)) or "part"
-    filename = stem + ".png"
-    if not _save_png(os.path.join(dest, filename), px, "RGBA"):
-        raise OSError("cannot write locked layer %r" % name)
-    record: Dict[str, Any] = {
-        "name": str(name),
-        "file": "tile_%02d/%s" % (index, filename),
-        "left": int(left),
-        "top": int(top),
-        "size": [int(px.shape[1]), int(px.shape[0])],
-        "depth_median": float(depth_median),
-    }
-    depth_arr = None if depth is None else np.asarray(depth)
-    if (depth_arr is not None and depth_arr.ndim == 2
-            and depth_arr.shape[:2] == px.shape[:2]):
-        depth_name = stem + "_depth.png"
-        if _save_png(os.path.join(dest, depth_name), depth_arr, "L"):
-            record["depth"] = "tile_%02d/%s" % (index, depth_name)
-    return record
-
-
-def store_locked_layer(run_dir: str, tile_index: int, name: str,
-                       pixels: np.ndarray, left: int, top: int,
-                       tile_box: Optional[Sequence[int]] = None,
-                       canvas: Optional[Sequence[int]] = None,
-                       source: Optional[Sequence[int]] = None,
-                       depth: Optional[np.ndarray] = None,
-                       depth_median: float = 1.0) -> Dict[str, Any]:
-    """Snapshot one part from the preview panel (lock button)."""
-    index = int(tile_index)
-    record = _write_lock_record(
-        run_dir, index, name, pixels, left, top, depth, depth_median)
-    doc = read_lock_index(run_dir)
-    tile = doc["tiles"].setdefault(str(index), {})
-    try:
-        if tile_box is not None:
-            tile["tile"] = [int(v) for v in tile_box[:4]]
-        if canvas is not None:
-            tile["canvas"] = [int(canvas[0]), int(canvas[1])]
-        if source is not None:
-            doc["source"] = [int(source[0]), int(source[1])]
-    except (TypeError, ValueError, IndexError):
-        pass
-    tile.setdefault("parts", {})[str(name).strip().lower()] = record
-    write_lock_index(run_dir, doc)
-    return record
-
-
-def store_locked_parts(run_dir: str, tile_index: int, parts: Dict[str, Any],
-                       names: Sequence[str], tile_box: Optional[Sequence[int]] = None,
-                       canvas: Optional[Sequence[int]] = None,
-                       source: Optional[Sequence[int]] = None) -> List[str]:
-    """Snapshot the locked layers of a freshly written tile.
-
-    Keeping the store current means the next generation change cannot lose a
-    part the user locked before the folder is cleared.
-    """
-    wanted = {str(n).strip().lower() for n in (names or []) if str(n).strip()}
-    if not wanted or not isinstance(parts, dict):
-        return []
-    index = int(tile_index)
-    doc = read_lock_index(run_dir)
-    tile = doc["tiles"].setdefault(str(index), {})
-    try:
-        if tile_box is not None:
-            tile["tile"] = [int(v) for v in tile_box[:4]]
-        if canvas is not None:
-            tile["canvas"] = [int(canvas[0]), int(canvas[1])]
-        if source is not None:
-            doc["source"] = [int(source[0]), int(source[1])]
-    except (TypeError, ValueError, IndexError):
-        pass
-    parts_doc = tile.setdefault("parts", {})
-    stored: List[str] = []
-    for tag, pinfo in (parts.get("tag2pinfo") or {}).items():
-        key = str(tag).strip().lower()
-        if key not in wanted or not isinstance(pinfo, dict):
-            continue
-        img = pinfo.get("img")
-        if img is None:
-            continue
-        xyxy = pinfo.get("xyxy") or [0, 0, 0, 0]
-        try:
-            left, top = int(xyxy[0]), int(xyxy[1])
-            depth_median = float(pinfo.get("depth_median", 1.0))
-        except (TypeError, ValueError, IndexError):
-            continue
-        try:
-            record = _write_lock_record(
-                run_dir, index, str(tag), np.asarray(img), left, top,
-                pinfo.get("depth"), depth_median)
-        except (ValueError, OSError) as exc:
-            print("[STLU] locks: cannot snapshot %s (tile %d): %s"
-                  % (tag, index, exc), flush=True)
-            continue
-        parts_doc[key] = record
-        stored.append(str(tag))
-    if stored:
-        write_lock_index(run_dir, doc)
-    return stored
-
-
-def remove_locked_layer(run_dir: str, tile_index: int, name: str) -> bool:
-    """Drop one lock (and its files).  False when it was not locked."""
-    doc = read_lock_index(run_dir)
-    try:
-        index = int(tile_index)
-    except (TypeError, ValueError):
-        return False
-    tile = (doc.get("tiles") or {}).get(str(index))
-    if not isinstance(tile, dict):
-        return False
-    parts = tile.get("parts") or {}
-    record = parts.pop(str(name).strip().lower(), None)
-    if record is None:
-        return False
-    for rel in (record.get("file"), record.get("depth")):
-        if rel:
-            try:
-                os.remove(os.path.join(lock_dir(run_dir), str(rel)))
-            except OSError:
-                pass
-    if not parts:
-        doc["tiles"].pop(str(index), None)
-    write_lock_index(run_dir, doc)
-    return True
-
-
-def snapshot_parts(run_dir: str, tile_index: int,
-                   names: Optional[Sequence[str]] = None,
-                   coords: Optional[Sequence[Sequence[int]]] = None,
-                   source: Optional[Sequence[int]] = None
-                   ) -> Optional[Dict[str, Any]]:
-    """A parts document rebuilt from the lock store, or None.
-
-    ``names=None`` restores every locked layer of the tile: that is how a tile
-    the new run did not select at all is rebuilt from its locks.
-    """
-    doc = read_lock_index(run_dir)
-    try:
-        index = int(tile_index)
-    except (TypeError, ValueError):
-        return None
-    tile = (doc.get("tiles") or {}).get(str(index))
-    if not isinstance(tile, dict):
-        return None
-    canvas = tile.get("canvas") or []
-    try:
-        frame_w, frame_h = int(canvas[0]), int(canvas[1])
-    except (TypeError, ValueError, IndexError):
-        return None
-    if frame_w <= 0 or frame_h <= 0:
-        return None
-    if not _lock_geometry_matches(
-            doc, tile, coords, index, source, (frame_h, frame_w)):
-        return None
-    wanted = (None if names is None
-              else {str(n).strip().lower() for n in names if str(n).strip()})
-    tag2pinfo: Dict[str, Any] = {}
-    for key, record in (tile.get("parts") or {}).items():
-        if not isinstance(record, dict):
-            continue
-        if wanted is not None and str(key).lower() not in wanted:
-            continue
-        px, depth = _lock_pixels(run_dir, record)
-        if px is None:
-            continue
-        try:
-            left = int(record.get("left") or 0)
-            top = int(record.get("top") or 0)
-            depth_median = float(record.get("depth_median", 1.0))
-        except (TypeError, ValueError):
-            left = top = 0
-            depth_median = 1.0
-        pinfo = {
-            "img": px,
-            "xyxy": [left, top, left + int(px.shape[1]), top + int(px.shape[0])],
-            "depth_median": depth_median,
-        }
-        if depth is not None:
-            pinfo["depth"] = depth
-        tag2pinfo[str(record.get("name") or key)] = pinfo
-    if not tag2pinfo:
-        return None
-    return {"tag2pinfo": tag2pinfo, "frame_size": (frame_h, frame_w),
-            "status": "ok", "_locked_tile": index}
-
-
-def restore_locked_parts(parts: Dict[str, Any], run_dir: str, tile_index: int,
-                         names: Sequence[str],
-                         coords: Optional[Sequence[Sequence[int]]] = None,
-                         source: Optional[Sequence[int]] = None
-                         ) -> Tuple[List[str], set]:
-    """Replace fresh parts with the snapshots kept in ``<run>/_locks``.
-
-    Returns ``(kept names, loaded keys)``.  ``kept`` also lists wanted locks
-    the store has no copy of -- their fresh copy is dropped, so "keep the old
-    state" still means absent.  ``loaded keys`` lets the caller fall back to
-    the old PSD for exactly the names the store could not provide.
-    """
-    wanted = {str(n).strip().lower() for n in (names or []) if str(n).strip()}
-    if not wanted or not isinstance(parts, dict):
-        return [], set()
-    try:
-        index = int(tile_index)
-    except (TypeError, ValueError):
-        return [], set()
-    doc = read_lock_index(run_dir)
-    tile = (doc.get("tiles") or {}).get(str(index))
-    if not isinstance(tile, dict):
-        return [], set()
-    if not _lock_geometry_matches(
-            doc, tile, coords, index, source, parts.get("frame_size")):
-        return [], set()
-    tag2pinfo = parts.setdefault("tag2pinfo", {})
-    parts_doc = tile.get("parts") or {}
-    kept: List[str] = []
-    loaded = set()
-    for key in sorted(wanted):
-        record = None
-        for raw, candidate in parts_doc.items():
-            if str(raw).lower() == key:
-                record = candidate
-                break
-        for tag in [t for t in tag2pinfo if str(t).lower() == key]:
-            tag2pinfo.pop(tag, None)
-        px = depth = None
-        if isinstance(record, dict):
-            px, depth = _lock_pixels(run_dir, record)
-        if px is None:
-            kept.append(key)
-            continue
-        try:
-            left = int(record.get("left") or 0)
-            top = int(record.get("top") or 0)
-            depth_median = float(record.get("depth_median", 1.0))
-        except (TypeError, ValueError):
-            left = top = 0
-            depth_median = 1.0
-        pinfo = {
-            "img": px,
-            "xyxy": [left, top, left + int(px.shape[1]), top + int(px.shape[0])],
-            "depth_median": depth_median,
-        }
-        if depth is not None:
-            pinfo["depth"] = depth
-        name = str(record.get("name") or key)
-        tag2pinfo[name] = pinfo
-        loaded.add(key)
-        kept.append(name)
-    return kept, loaded
 
 
 def _crop_piece(rgba: np.ndarray, threshold: int) -> Optional[Tuple[np.ndarray, int, int]]:

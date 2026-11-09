@@ -80,8 +80,8 @@ def _strip_created(doc):
     """The run timestamp is the only field two runs may legitimately differ in."""
     doc = dict(doc or {})
     doc.pop("created", None)
-    # ``reset`` names what the old manifest forced this run to clear; two runs
-    # starting from different folder states legitimately differ here.
+    # ``reset`` reports what changed against the folder's old fingerprint; two
+    # runs starting from different folder states legitimately differ here.
     doc.pop("reset", None)
     for key in ("partition_plan", "out"):
         if isinstance(doc.get(key), dict):
@@ -169,7 +169,7 @@ def main():
     for name in ("STLU_PipelineSettings", "STLU_PlanGrid", "STLU_PickTiles",
                  "STLU_PlanContext", "STLU_PrepareRun", "STLU_CropTiles",
                  "STLU_GuideTile", "STLU_SeqTileLoop", "STLU_CropBack",
-                 "STLU_RestoreLocks", "STLU_WriteTilePSD",
+                 "STLU_WriteTilePSD",
                  "STLU_WriteTileImages", "STLU_SaveOriginal",
                  "STLU_WriteManifest", "STLU_MergeTiles"):
         check(name in stlu.NODE_CLASS_MAPPINGS, "%s is registered" % name)

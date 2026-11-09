@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import time
 import traceback
 
 import numpy as np
@@ -65,21 +66,47 @@ SETTINGS_KEYS = (
     "guide_context", "guide_feather", "guide_strength", "guide_tolerance",
     "seam_feather", "grid_offset_x", "grid_offset_y", "partition_mode",
     "strip_max_side", "strip_max_resolution", "strip_margin", "select_plan",
-    "context_pad", "custom_regions",
+    "context_pad", "custom_regions", "head_scope", "tile_tags",
+    "depth_random_seed",
 )
+
+# SeeThrough v3 runs a fixed second pass over the head tags for every tile,
+# whether or not a head is actually in it -- a leg/shirt tile gets an
+# invented face, eyes and mouth.  These are the tags that pass produces; they
+# are dropped from tiles the user did not mark as head tiles.  v2 has no such
+# pass and must keep every tag.
+HEAD_SCOPE_TOP_ROW = "自动（最上一行）"
+HEAD_SCOPE_ALL = "全部块保留"
+HEAD_SCOPE_NONE = "全部块去掉"
+HEAD_SCOPE_CHOICES = (HEAD_SCOPE_TOP_ROW, HEAD_SCOPE_ALL, HEAD_SCOPE_NONE)
+V3_HEAD_TAGS = ("headwear", "face", "irides", "eyebrow", "eyewhite",
+                "eyelash", "eyewear", "ears", "earwear", "nose", "mouth")
+V3_BODY_TAGS = ("front hair", "back hair", "head", "neck", "neckwear",
+                "topwear", "handwear", "bottomwear", "legwear", "footwear",
+                "tail", "wings", "objects")
+# v2 runs a single pass over one fixed list (third-party nodes.py
+# VALID_BODY_PARTS_V2); the user can whitelist a subset of it per tile.
+V2_BODY_TAGS = ("hair", "headwear", "face", "eyes", "eyewear", "ears",
+                "earwear", "nose", "mouth", "neck", "neckwear", "topwear",
+                "handwear", "bottomwear", "legwear", "footwear", "tail",
+                "wings", "objects")
 
 DEFAULT_SETTINGS = {
     "tile_width": 1024, "tile_height": 1024, "overlap": 128, "select": "all",
-    "resolution": 512, "num_inference_steps": 30, "depth_resolution": -1,
+    "resolution": 1024, "num_inference_steps": 30, "depth_resolution": -1,
     "random_seed": 0, "tblr_split": True, "use_lama": True,
     "alpha_threshold": 8, "out_dir": "SeeThrough/我的自设/", "group": "",
     "filename_prefix": "tile", "merge_name": "merged", "group_layers": True,
-    "include_depth": False, "include_original": False, "guide_context": True,
+    "include_depth": False, "include_original": False, "guide_context": False,
     "guide_feather": 32, "guide_strength": 40, "guide_tolerance": 16,
     "seam_feather": 32, "grid_offset_x": 0, "grid_offset_y": 0,
     "partition_mode": "均匀网格", "strip_max_side": 2048,
     "strip_max_resolution": 768, "strip_margin": 32, "select_plan": "",
     "context_pad": 0, "custom_regions": "[]",
+    "head_scope": HEAD_SCOPE_TOP_ROW, "tile_tags": "{}",
+    # -1 keeps older folders compatible: carried-forward values mean "follow
+    # the layer seed" instead of a separate depth seed.
+    "depth_random_seed": -1,
 }
 
 
@@ -99,16 +126,162 @@ def normalize_settings(**kwargs) -> dict:
             "alpha_threshold", "guide_feather", "guide_strength",
             "guide_tolerance", "seam_feather", "grid_offset_x",
             "grid_offset_y", "strip_max_side", "strip_max_resolution",
-            "strip_margin", "context_pad")
+            "strip_margin", "context_pad", "depth_random_seed")
     for key in ints:
         out[key] = int(out[key])
     for key in ("tblr_split", "use_lama", "group_layers", "include_depth",
                 "include_original", "guide_context"):
         out[key] = bool(out[key])
     for key in ("select", "out_dir", "group", "filename_prefix", "merge_name",
-                "partition_mode", "select_plan", "custom_regions"):
+                "partition_mode", "select_plan", "custom_regions",
+                "head_scope", "tile_tags"):
         out[key] = str(out[key] if out[key] is not None else "")
+    if out["head_scope"] not in HEAD_SCOPE_CHOICES:
+        out["head_scope"] = HEAD_SCOPE_TOP_ROW
     return out
+
+
+def _head_tile_set(coords, scope):
+    """Grid indices that may keep their v3 head layers.
+
+    ``None`` means "every tile"; an empty set means "none".  The default
+    scope keeps only the top row of the grid -- the library is upright
+    full-body art, so the head is always there.
+    """
+    total = len(coords or [])
+    if scope == HEAD_SCOPE_ALL:
+        return None
+    if scope == HEAD_SCOPE_NONE:
+        return set()
+    ys = []
+    for box in coords or []:
+        try:
+            ys.append(int(box[1]))
+        except (TypeError, IndexError, ValueError):
+            ys.append(0)
+    if not ys:
+        return set()
+    top = min(ys)
+    return {i for i, y in enumerate(ys) if y == top} if total else set()
+
+
+def _tile_tag_config(raw):
+    """Per-tile tag whitelist, normalised to ``{index: {"body": ..., "head": ...}}``.
+
+    ``raw`` is the ``tile_tags`` widget string: ``{"tiles": {"<index>": {...}}}``.
+    A bare ``{index: {...}}`` map is accepted too.  A group key that is
+    *absent* means "automatic" (keep everything the model produced); an
+    explicit list -- even an empty one -- is the whitelist of tags to keep.
+    Unknown tags are dropped so a stale workflow cannot invent new ones.
+    """
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except (TypeError, ValueError):
+            data = {}
+    if not isinstance(data, dict):
+        return {}
+    tiles = data.get("tiles", data)
+    if not isinstance(tiles, dict):
+        return {}
+    cfg = {}
+    for key, value in tiles.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        entry = {}
+        for group, universe in (("body", V3_BODY_TAGS + V2_BODY_TAGS),
+                                ("head", V3_HEAD_TAGS)):
+            if group not in value:
+                continue
+            keep = value[group]
+            if not isinstance(keep, (list, tuple)):
+                continue
+            entry[group] = frozenset(str(t) for t in keep if str(t) in universe)
+        if entry:
+            cfg[index] = entry
+    return cfg
+
+
+def _tile_drop_tags(index, cfg, head_tiles, is_v3):
+    """Tags to pop from this tile's layer_dict, or ``None`` for "keep all".
+
+    An explicit per-tile whitelist always wins.  Otherwise the v3 head pass is
+    dropped from tiles the head scope did not mark (unless it marked every
+    tile / ``head_tiles is None``).
+    """
+    tile_cfg = (cfg or {}).get(index) or {}
+    body_universe = V3_BODY_TAGS if is_v3 else V2_BODY_TAGS
+    head_universe = V3_HEAD_TAGS if is_v3 else ()
+    drop = set()
+    body_keep = tile_cfg.get("body")
+    if body_keep is not None:
+        drop.update(t for t in body_universe if t not in body_keep)
+    head_keep = tile_cfg.get("head")
+    if head_keep is not None:
+        drop.update(t for t in head_universe if t not in head_keep)
+    elif is_v3 and head_tiles is not None and index not in head_tiles:
+        drop.update(head_universe)
+    return tuple(sorted(drop)) or None
+
+
+# ---------------------------------------------------------------------------
+# head-pass skip hook
+# ---------------------------------------------------------------------------
+# The v3 branch of the third-party generator always runs a second, full
+# diffusion pass over the head crop -- on every tile, head or not.  On tiles
+# where every head tag ends up dropped that pass is pure wasted compute (a
+# whole 30-step run per tile).  Instead of forking the third-party source, we
+# wrap the pipeline's ``__call__`` once per process: while our flag is set, a
+# call with ``group_index=1`` hands back transparent images, and the
+# generator's head block then writes layers we discard anyway.
+_HEAD_PASS_SKIP = {"active": False}
+_HOOKED_PIPELINES = set()
+
+
+def _empty_head_output(fullpage):
+    """Stand-in for the head-group pipeline output (transparent canvases)."""
+    arr = np.asarray(fullpage)
+    blank = np.zeros(arr.shape[:2] + (4,), dtype=np.uint8)
+    images = [blank.copy() for _ in range(len(V3_HEAD_TAGS))]
+    try:
+        from modules.layerdiffuse.diffusers_kdiffusion_sdxl import (
+            LayerdiffPipelineOutput)
+    except Exception:  # noqa: BLE001 - upstream import layout may change
+        LayerdiffPipelineOutput = None
+    if LayerdiffPipelineOutput is not None:
+        return LayerdiffPipelineOutput(images=images, vis_list=[])
+    import types
+    return types.SimpleNamespace(images=images, vis_list=[])
+
+
+def _install_head_skip_hook(pipeline):
+    """Route the head-group call through the skip check (idempotent)."""
+    cls = type(pipeline)
+    if cls in _HOOKED_PIPELINES:
+        return
+    original = cls.__call__
+    if not callable(original):  # pragma: no cover - defensive
+        return
+
+    def __call__(self, *args, **kwargs):
+        if _HEAD_PASS_SKIP["active"] and kwargs.get("group_index") == 1:
+            return _empty_head_output(kwargs.get("fullpage"))
+        return original(self, *args, **kwargs)
+
+    cls.__call__ = __call__
+    _HOOKED_PIPELINES.add(cls)
+
+
+def _skips_head_pass(drop_tags, is_v3):
+    """True when this tile keeps no head tag, so the second pass is wasted."""
+    if not is_v3 or not drop_tags:
+        return False
+    return all(tag in drop_tags for tag in V3_HEAD_TAGS)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +303,11 @@ def make_plan(image, settings, layerdiff_model=None, depth_model=None) -> dict:
          random_seed) = stlu_limits.check_all(
             settings["resolution"], settings["num_inference_steps"],
             settings["depth_resolution"], settings["random_seed"])
+        # -1 means "follow the layer seed" (the pre-split behaviour); the plan
+        # carries the number actually used so previews can show it back.
+        depth_seed = stlu_limits.resolve_depth_seed(
+            stlu_limits.check_depth_seed(settings["depth_random_seed"]),
+            random_seed)
     except ValueError as exc:
         # 旧节点名保留在信息里，测试与用户报错都按这个名字找。
         raise ValueError("STLU_PipelineInput: %s" % exc) from exc
@@ -199,6 +377,21 @@ def make_plan(image, settings, layerdiff_model=None, depth_model=None) -> dict:
             offset_y=settings["grid_offset_y"])
         coords = doc["coords"]
 
+    # 块内推理分辨率低于块本身时，模型先下采样再上采样，细节与语义都会退化。
+    # 上游 SeeThrough 默认 1280，这里只在明显不匹配时提示，不改用户选择。
+    try:
+        biggest = max(max(int(c[2]) - int(c[0]), int(c[3]) - int(c[1]))
+                      for c in coords) if coords else 0
+    except Exception:  # noqa: BLE001
+        biggest = 0
+    if biggest and effective_resolution < biggest:
+        plan_warnings.append(
+            "推理分辨率 %d 小于最大块边长 %d：每块会先缩小再放大，"
+            "拆层容易整块丢失。建议 resolution 调到 %d。"
+            " / resolution %d < max tile side %d; raise it to %d."
+            % (effective_resolution, biggest, biggest,
+               effective_resolution, biggest, biggest))
+
     return {
         "settings": settings,
         "doc": doc,
@@ -212,6 +405,7 @@ def make_plan(image, settings, layerdiff_model=None, depth_model=None) -> dict:
         "depth_resolution": int(effective_depth_resolution),
         "num_inference_steps": int(num_inference_steps),
         "seed": int(random_seed),
+        "depth_seed": int(depth_seed),
         "partition": plan_meta,
         "warnings": plan_warnings,
         "fallback": fallback,
@@ -302,10 +496,26 @@ def _generation_block(plan) -> dict:
     # Everything that can change the pixels of a tile.  Merge-only options
     # (group_layers / depth / original / seam_feather) are deliberately
     # absent: changing them only needs ④ to run again, not a re-diffusion.
+    # This is a record for tracing a folder back to its settings; it is never
+    # compared automatically -- only structure decides whether a folder is
+    # cleared (see tile_psd.cache_mismatch_reason).
+    # Only the tiles being generated matter: editing the whitelist of an
+    # un-ticked tile must not invalidate the thumbnails of the ticked ones.
+    cfg = _tile_tag_config(settings["tile_tags"])
+    picked = plan.get("picked")
+    tile_tags = {}
+    for index in (picked if picked is not None else sorted(cfg)):
+        entry = cfg.get(int(index))
+        if not entry:
+            continue
+        tile_tags[str(index)] = {
+            group: sorted(entry[group])
+            for group in ("body", "head") if group in entry
+        }
     generation = {
         "version": 1,
-        # Bumped whenever tile pixels can change; joins generation_id so a
-        # code update cannot silently reuse tiles made by older logic.
+        # Bumped whenever tile pixels can change; kept in the record so a
+        # folder's tiles can be traced back to the code that made them.
         "algo_version": int(tile_psd.ALGO_VERSION),
         "source": plan.get("fingerprint") or "",
         "source_size": [int(plan["width"]), int(plan["height"])],
@@ -315,19 +525,21 @@ def _generation_block(plan) -> dict:
         "num_inference_steps": int(plan["num_inference_steps"]),
         "depth_resolution": int(plan["depth_resolution"]),
         "random_seed": int(plan["seed"]),
+        "depth_random_seed": int(plan.get("depth_seed", plan["seed"])),
         "tblr_split": bool(settings["tblr_split"]),
         "use_lama": bool(settings["use_lama"]),
         "alpha_threshold": int(settings["alpha_threshold"]),
         "context_pad": int(settings["context_pad"] or 0),
+        "head_scope": str(settings["head_scope"]),
+        "tile_tags": tile_tags,
         "guide": guide_block,
         "layerdiff_model": plan.get("layerdiff_model_id") or "",
         "depth_model": plan.get("depth_model_id") or "",
     }
     meta = plan["partition"] or {}
     if plan["is_strips"]:
-        # Only geometry goes into the fingerprint: warnings/notes can change
-        # without changing a single pixel, and a warning-only difference must
-        # not clear a finished folder.
+        # Only geometry goes into the record: warnings/notes can change
+        # without changing a single pixel.
         generation["partition"] = {
             key: meta.get(key)
             for key in ("mode", "side", "resolution", "density", "overlap",
@@ -343,8 +555,8 @@ def _generation_block(plan) -> dict:
                                     int(settings["grid_offset_y"])]
     elif plan["is_custom"]:
         # The region list is in run order, so moving a window up/down or
-        # changing a per-window resolution changes the fingerprint too:
-        # both change what the guide sees, and old tiles cannot be reused.
+        # changing a per-window resolution is recorded too: both change what
+        # the guide sees.
         generation["partition"] = {
             "mode": region_plan.CUSTOM_MODE,
             "plan_id": str(meta.get("plan_id") or ""),
@@ -361,10 +573,12 @@ def _generation_block(plan) -> dict:
 
 
 def prepare_run(plan, image=None) -> dict:
-    """Fingerprint the run, clear a stale folder, write ``generation.json``.
+    """Record the generation settings and settle reuse of the folder.
 
-    This is the one stage ① step with side effects, which is why it is its own
-    node: the graph now shows when a folder is about to be reset.
+    The folder is the cache: every finished tile in it joins this run whatever
+    the diffusion settings were.  Only a structural mismatch -- another
+    partition type, another source image, a grid whose boxes moved -- clears
+    it, because those tiles could never sit in this run's boxes.
     """
     plan = dict(plan)
     settings = plan["settings"]
@@ -380,88 +594,47 @@ def prepare_run(plan, image=None) -> dict:
 
     wave_dir = plan["wave_dir"]
     rel = os.path.relpath(wave_dir, _output_root()).replace(os.sep, "/")
+    # Drop a locked-parts store left behind by an older version of this pack.
+    tile_psd.discard_legacy_locks(wave_dir)
     wave = os.path.basename(wave_dir.rstrip("/\\")) or "run"
     doc.setdefault("source", {})["fingerprint"] = fingerprint
     generation, guide_block = _generation_block(plan)
     doc["guide"] = guide_block
-    gid = tile_psd.generation_id(generation)
     doc["generation"] = generation
-    doc["generation_id"] = gid
 
-    # A changed pixel-affecting parameter means the old tiles cannot be
-    # trusted: the folder is cleared before anything runs, so stale tiles from
-    # another generation can never be mixed into the merge.  The selection
-    # still decides how much work happens -- an explicit subset is the user's
-    # instruction and is never widened to the whole grid, it only regenerates
-    # the checked tiles into the now-empty folder.
+    # Nothing in the folder is touched for a settings change: only the ticked
+    # tiles run, and every other tile already there is reused as it is.  A
+    # structural mismatch (another partition type / another source image /
+    # moved boxes) is different -- those tiles would land in the wrong place,
+    # so the whole folder is cleared and the user is told why.
     reset_info = None
     picked = list(plan["picked"])
-    total = len(plan["coords"])
-    explicit_subset = 0 < len(picked) < total
     previous = tile_psd.read_manifest(wave_dir)
-    reset_keys = []
-    reset_reason = ""
-    old_generation = None
-    if previous is not None:
-        old_generation = previous.get("generation")
-    else:
-        # An interrupted run leaves tiles and generation.json behind but no
-        # manifest; that fingerprint still describes those tiles.
-        old_generation = (tile_psd.read_generation(wave_dir) or {}).get("generation")
-    if previous is not None and (not isinstance(old_generation, dict)
-                                 or not old_generation):
-        reset_reason = "旧结果没有参数指纹"
-    elif isinstance(old_generation, dict) and old_generation:
-        # Seed / context padding are deliberately excluded: changing them
-        # regenerates only the checked tiles and leaves the rest of the
-        # folder usable.
-        reset_keys = [key for key in generation
-                      if key not in tile_psd.LOCAL_RERUN_KEYS
-                      and old_generation.get(key) != generation[key]]
-        # A key that only the old run has still counts: that is what moving
-        # the grid back to offset 0 looks like.
-        reset_keys += [key for key in old_generation
-                       if key not in tile_psd.LOCAL_RERUN_KEYS
-                       and key not in generation]
-        if reset_keys:
-            reset_reason = "生成参数已变"
-    if reset_reason and explicit_subset:
-        cleared = tile_psd.clear_run_outputs(wave_dir, previous)
+    mismatch = tile_psd.cache_mismatch_reason(previous, doc)
+    if mismatch:
+        tile_psd.clear_run_outputs(wave_dir, previous)
         tile_psd.verify_run_cleared(wave_dir)
+        # The cleared tiles are gone, so a subset would leave the merge
+        # incomplete: this one automatic case runs the whole grid.  (The
+        # selection itself is never widened without clearing.)
+        everything = list(range(len(doc.get("coords") or [])))
+        if picked != everything:
+            picked = everything
+            plan["picked"] = list(everything)
+            plan["indices"] = [str(i) for i in everything]
+            plan["selection"] = "all"
+            doc["selection"] = "all"
         reset_info = {
-            "required": True, "partial": True, "reason": reset_reason,
-            "keys": reset_keys, "tiles": len(picked),
-            "removed": int(cleared.get("removed") or 0),
+            "required": False, "changed": True, "reason": mismatch,
+            "keys": [], "tiles": len(picked),
         }
         _notify("stlu.cache_reset", {
-            "dir": wave_dir, "rel": rel, "reason": reset_reason,
-            "keys": reset_keys, "tiles": len(picked),
-            "partial": True, "removed": reset_info["removed"],
+            "dir": wave_dir, "rel": rel, "reason": mismatch,
+            "tiles": len(picked),
         })
-        print("[STLU] generation changed (%s) -> cleared %s, re-running only the "
-              "%d selected tiles" % (
-                  ", ".join(reset_keys) or reset_reason, rel, len(picked)),
-              flush=True)
-    elif reset_reason:
-        picked = list(range(len(plan["coords"])))
-        encoded = "all"
-        doc["selection"] = encoded
-        plan["picked"] = picked
-        plan["indices"] = [str(int(i)) for i in picked]
-        plan["selection"] = encoded
-        cleared = tile_psd.clear_run_outputs(wave_dir, previous)
-        tile_psd.verify_run_cleared(wave_dir)
-        reset_info = {
-            "required": True, "reason": reset_reason, "keys": reset_keys,
-            "tiles": len(picked), "removed": int(cleared.get("removed") or 0),
-        }
-        _notify("stlu.cache_reset", {
-            "dir": wave_dir, "rel": rel, "reason": reset_reason,
-            "keys": reset_keys, "tiles": len(picked),
-            "removed": reset_info["removed"],
-        })
-        print("[STLU] generation changed -> cleared %s, regenerating all %d tiles (%s)" % (
-            rel, len(picked), ", ".join(reset_keys) or reset_reason), flush=True)
+        print("[STLU] %s in %s -> cleared the folder before running; "
+              "all %d tile(s) will be generated again"
+              % (mismatch, rel, len(picked)), flush=True)
 
     out_info = {
         "dir": wave_dir,
@@ -483,12 +656,12 @@ def prepare_run(plan, image=None) -> dict:
         out_info["reset"] = reset_info
     doc["out"] = out_info
     try:
-        tile_psd.write_generation(wave_dir, generation, gid)
+        tile_psd.write_generation(wave_dir, generation)
     except OSError as exc:
         raise RuntimeError(
-            "STLU ①: 无法写入生成指纹 %s：%s。"
+            "STLU ①: 无法写入生成参数 %s：%s。"
             "请检查输出目录权限后重试。"
-            " / cannot write the generation fingerprint %s: %s;"
+            " / cannot write the generation settings %s: %s;"
             " check the output folder's permissions and retry."
             % (wave_dir, exc, wave_dir, exc)) from exc
 
@@ -496,7 +669,7 @@ def prepare_run(plan, image=None) -> dict:
     plan["run"] = {
         "dir": wave_dir, "rel": rel, "wave": wave,
         "fingerprint": fingerprint, "out": out_info,
-        "generation": generation, "generation_id": gid,
+        "generation": generation,
     }
     plan["reset"] = reset_info
     _notify("stlu.grid", grid_info(plan))
@@ -604,12 +777,17 @@ def guide_state(plan) -> dict:
             context_boxes[int(key)] = [int(v) for v in box[:4]]
         except (TypeError, ValueError, IndexError):
             continue
+    coords = list(doc.get("coords") or [])
+    generation = doc.get("generation") or {}
+    scope = str(generation.get("head_scope") or HEAD_SCOPE_TOP_ROW)
     return {
         "guide": guide,
-        "coords": list(doc.get("coords") or []),
+        "coords": coords,
         "context_boxes": context_boxes,
         "regions_by_index": regions_by_index,
         "alpha_threshold": int(((doc.get("out") or {}).get("alpha_threshold")) or 8),
+        "head_tiles": _head_tile_set(coords, scope),
+        "tile_tags": _tile_tag_config(generation.get("tile_tags")),
     }
 
 
@@ -633,13 +811,20 @@ def crop_back(parts, composite, index, state):
 
 def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
                      depth_model, seed, resolution, steps, depth_resolution,
-                     tblr_split, use_lama) -> tuple:
-    """The sequential per-tile loop: guide -> chain -> retry -> crop back.
+                     tblr_split, use_lama, progress=None, depth_seed=None) -> tuple:
+    """The sequential per-tile loop: guide -> chain -> crop back.
 
     This is the one place a loop is genuinely required: tile N has to see the
     pixels tile N-1 produced, which no acyclic node graph can express.  Every
     step it calls is a separate function (``guide_tile`` / ``_run_seethrough_tile``
     / ``crop_back``), so the graph still shows what happens.
+
+    ``progress`` is an optional callable receiving one dict per milestone
+    (``phase`` / ``pos`` / ``total`` / ``index`` / ``done`` / ``seconds`` /
+    ``tile_seconds`` / ``cached`` / ``empty``).  The node passes
+    the websocket notifier here; plain callers omit it.  Every aspect of a
+    tile's work inside this loop (model reload included) takes minutes, so
+    without these events the UI sits on one unchanged line.
     """
     import comfy.model_management
     import comfy.utils
@@ -657,12 +842,17 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
     model = _first(layerdiff_model)
     depth_model = _first(depth_model)
     seed = int(_first(seed, 42))
-    resolution = int(_first(resolution, 512))
+    resolution = int(_first(resolution, 1024))
     steps = int(_first(steps, 30))
     depth_res = int(_first(depth_resolution, -1))
     try:
         (resolution, steps, depth_res,
          seed) = stlu_limits.check_all(resolution, steps, depth_res, seed)
+        raw_depth_seed = (stlu_limits.DEPTH_SEED_FOLLOW if depth_seed is None
+                          else int(_first(depth_seed,
+                                          stlu_limits.DEPTH_SEED_FOLLOW)))
+        depth_seed = stlu_limits.resolve_depth_seed(
+            stlu_limits.check_depth_seed(raw_depth_seed), seed)
     except ValueError as exc:
         raise ValueError("STLU ②: %s" % exc) from exc
     tblr = bool(_first(tblr_split, True))
@@ -673,6 +863,25 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
     regions_by_index = state["regions_by_index"]
     context_boxes = state["context_boxes"]
     alpha_threshold = state["alpha_threshold"]
+    head_tiles = state.get("head_tiles")
+    tile_tags = state.get("tile_tags") or {}
+    # v3 alone has the forced second pass; v2's single pass legitimately sees
+    # head tags, so its tiles must be left untouched unless the user set an
+    # explicit per-tile whitelist.
+    try:
+        tag_version = str(model.unet.get_tag_version()) if model is not None else ""
+    except Exception:  # noqa: BLE001 - unknown model object: keep old behaviour
+        tag_version = ""
+    is_v3 = tag_version == "v3"
+    if is_v3 and head_tiles is not None:
+        print("[STLU] guided: v3 head layers kept only on tiles %s" % (
+            sorted(head_tiles) if head_tiles else "[]"), flush=True)
+    if tile_tags:
+        print("[STLU] guided: per-tile tag whitelist on tiles %s" % (
+            sorted(tile_tags), ), flush=True)
+
+    def _drop_for(tile_index):
+        return _tile_drop_tags(int(tile_index), tile_tags, head_tiles, is_v3)
     if not coords:
         raise ValueError(
             "STLU ②: 计划里没有块坐标，无法做引导。"
@@ -685,6 +894,19 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
     total = len(tiles)
     if not total:
         return ([], [], [], [])
+
+    started = time.monotonic()
+
+    def _progress(phase, **info):
+        if progress is None:
+            return
+        info["phase"] = phase
+        info["total"] = total
+        info["seconds"] = round(time.monotonic() - started, 1)
+        try:
+            progress(info)
+        except Exception:  # noqa: BLE001 - a bad UI hook must not fail the run
+            pass
 
     index_order = []
     for pos in range(total):
@@ -718,6 +940,9 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
         total, guide.get("enabled", True), guide.get("feather"),
         guide.get("strength")), flush=True)
 
+    _progress("start", done=len(cached), cached=len(cached),
+              order=list(index_order))
+
     pbar = comfy.utils.ProgressBar(total)
     generated: dict = dict(cached)
     fixed = set(cached)
@@ -735,6 +960,9 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
     for pos, tile in enumerate(tiles):
         index = index_order[pos]
         comfy.model_management.throw_exception_if_processing_interrupted()
+        tile_started = time.monotonic()
+        _progress("guide", pos=pos + 1, index=index, done=pos,
+                  tile_seconds=0.0)
 
         # Per-window resolution when the document names one; otherwise the
         # single value (uniform grid / subject strips).
@@ -744,11 +972,16 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
         input_tile = guide_tile(tile, index, state, generated, fixed=fixed)
         guided_out.append(input_tile.detach().cpu().clamp(0, 1))
 
+        def _phase(phase, _pos=pos + 1, _index=index, _done=pos):
+            _progress(phase, pos=_pos, index=_index, done=_done,
+                      tile_seconds=round(time.monotonic() - tile_started, 1))
+
         try:
             parts, composite = _run_seethrough_tile(
                 layer_node, depth_node, post_node, input_tile, model,
                 depth_model, seed, tile_res, steps, tile_depth, tblr,
-                lama, alpha_threshold)
+                lama, alpha_threshold, on_phase=_phase,
+                drop_tags=_drop_for(index), depth_seed=depth_seed)
         except comfy.model_management.InterruptProcessingException:
             raise
         except Exception as exc:  # noqa: BLE001 - add the tile number
@@ -770,47 +1003,14 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
                    index, composite.get("error") or "unknown",
                    composite.get("traceback") or ""))
 
-        # An all-transparent result is a model collapse, not a real empty
-        # tile: retry this one tile on a new seed before giving up.  The
-        # input tile stays the same -- nothing about the guide changes.
-        attempt = 0
-        while composite["status"] == GUIDE_EMPTY and attempt < GUIDED_EMPTY_RETRIES:
-            attempt += 1
-            retry_seed = (seed + attempt * 0x9E3779B1) % (2 ** 32)
-            print("[STLU] guided: tile %d came back empty with seed %d, "
-                  "retrying on seed %d (%d/%d)" % (
-                      index, seed, retry_seed, attempt,
-                      GUIDED_EMPTY_RETRIES), flush=True)
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            try:
-                parts, composite = _run_seethrough_tile(
-                    layer_node, depth_node, post_node, input_tile, model,
-                    depth_model, retry_seed, tile_res, steps, tile_depth,
-                    tblr, lama, alpha_threshold)
-            except comfy.model_management.InterruptProcessingException:
-                raise
-            except Exception as exc:  # noqa: BLE001 - add the tile number
-                raise RuntimeError(
-                    "STLU ②: 第 %d 块在重试时生成失败（%s: %s）。\n%s"
-                    " / STLU ②: tile %d failed to generate on retry (%s: %s).\n%s"
-                    % (index, type(exc).__name__, exc,
-                       traceback.format_exc(), index, type(exc).__name__, exc,
-                       traceback.format_exc())) from exc
-            if composite["status"] == GUIDE_ERROR:
-                raise RuntimeError(
-                    "STLU ②: 第 %d 块在重试时合成失败（%s）。\n%s"
-                    " / STLU ②: tile %d failed to composite on retry (%s).\n%s"
-                    % (index, composite.get("error") or "unknown",
-                       composite.get("traceback") or "",
-                       index, composite.get("error") or "unknown",
-                       composite.get("traceback") or ""))
         if composite["status"] == GUIDE_EMPTY:
-            print("[STLU] guided: tile %d is still empty after %d "
-                  "retries" % (index, GUIDED_EMPTY_RETRIES), flush=True)
+            print("[STLU] guided: tile %d came back empty (seed %d / depth %d)"
+                  % (index, seed, depth_seed), flush=True)
         else:
             if input_box:
                 # The model saw the padded window; everything downstream
                 # (merge geometry, PSD size, guides) wants the strip box.
+                _phase("crop")
                 parts, composite = _crop_tile_parts(
                     parts, composite, coords[index], input_box)
             generated[index] = composite["rgba"]
@@ -818,9 +1018,14 @@ def run_guided_tiles(tiles, indices, state, run_dir, layerdiff_model,
         indices_out.append(str(index))
         composite_out.append(_composite_tensor(composite.get("rgba")))
         pbar.update(1)
+        _progress("tile_done", pos=pos + 1, index=index, done=pos + 1,
+                  tile_seconds=round(time.monotonic() - tile_started, 1),
+                  empty=composite["status"] == GUIDE_EMPTY,
+                  cached=len(cached))
         print("[STLU] guided: tile %d done (%d/%d)" % (index, pos + 1, total),
               flush=True)
 
+    _progress("end", done=total, cached=len(cached))
     return (parts_out, indices_out, guided_out, composite_out)
 
 
@@ -862,10 +1067,10 @@ GUIDE_ERROR = "error"
 def _guide_composite_result(parts: dict, alpha_threshold: int = 8) -> dict:
     """Flatten one tile's parts, distinguishing a real empty result from a bug.
 
-    A fully transparent tile is a known model failure and is retried on a new
-    seed.  An exception or a malformed ``frame_size`` is not: retrying it only
-    burns two more diffusion runs and hides the real error, so it is reported
-    as ``error`` with a traceback.
+    A fully transparent tile is a known model failure and is reported as
+    ``empty`` so the loop can log it and move on.  An exception or a malformed
+    ``frame_size`` is not an empty tile: it is reported as ``error`` with a
+    traceback.
     """
     try:
         layers = tile_psd.build_tile_layers(
@@ -901,18 +1106,53 @@ def _guide_composite(parts: dict, alpha_threshold: int = 8):
     """Backwards-compatible: the RGBA canvas, or ``None`` when unusable."""
     return _guide_composite_result(parts, alpha_threshold).get("rgba")
 
-GUIDED_EMPTY_RETRIES = 2
-
 
 def _run_seethrough_tile(layer_node, depth_node, post_node, input_tile, model,
                          depth_model, seed, resolution, steps, depth_res,
-                         tblr, lama, alpha_threshold):
-    """Generate -> depth -> post for one tile; return (parts, composite result)."""
-    layers_data, _preview = layer_node.generate(
-        input_tile, model, seed, resolution, steps)
+                         tblr, lama, alpha_threshold, on_phase=None,
+                         drop_tags=None, skip_head=False, depth_seed=None):
+    """Generate -> depth -> post for one tile; return (parts, composite result).
+
+    ``on_phase(name)`` is called before each of the three model steps.  They
+    are where the minutes go (GenerateLayers alone can reload the text
+    encoder), so the UI reports them by name instead of a frozen bar.
+
+    ``seed`` drives the layer diffusion, ``depth_seed`` the depth estimate;
+    ``None`` makes depth follow the layer seed (the old single-seed setup).
+
+    ``drop_tags`` removes tags from the generated layer set *before* depth is
+    estimated, so a tile the model was forced to hallucinate a face on simply
+    ends up without those layers (and without depth/post/merge passes for
+    them).  See :data:`V3_HEAD_TAGS`.
+
+    ``skip_head`` also skips the head-group diffusion itself (a second full
+    pass) -- only valid when every head tag is in ``drop_tags``.
+    """
+    if on_phase:
+        on_phase("layers")
+    _HEAD_PASS_SKIP["active"] = bool(skip_head)
+    try:
+        layers_data, _preview = layer_node.generate(
+            input_tile, model, seed, resolution, steps)
+    finally:
+        _HEAD_PASS_SKIP["active"] = False
+    if drop_tags:
+        layer_dict = getattr(layers_data, "layer_dict", None)
+        if isinstance(layer_dict, dict):
+            removed = [tag for tag in drop_tags if tag in layer_dict]
+            for tag in removed:
+                layer_dict.pop(tag, None)
+            if removed:
+                print("[STLU] tile: dropped %d tag(s) (%s)" % (
+                    len(removed), ", ".join(removed)), flush=True)
     # GenerateDepth returns (layers_depth, preview), not a bare object.
+    if on_phase:
+        on_phase("depth")
     depth_data, _preview_depth = depth_node.generate(
-        layers_data, depth_model, seed, depth_res)
+        layers_data, depth_model,
+        seed if depth_seed is None else depth_seed, depth_res)
+    if on_phase:
+        on_phase("post")
     parts, _preview2 = post_node.process(depth_data, tblr, lama)
     return parts, _guide_composite_result(parts, alpha_threshold)
 
@@ -1100,93 +1340,6 @@ def _crop_tile_parts(parts, composite, content_box, input_box):
     return out, composite
 
 
-def _restore_locked_orphans(wave_dir, doc, prefix, entries, image_entries,
-                            alpha_threshold):
-    """Rebuild tiles this run did not select from their locked-part snapshots.
-
-    A reset clears the folder down to the tiles this queue click generated, so
-    a locked part living in any other tile would disappear with it.  The
-    ``_locks/`` store survives the reset, so those tiles are written back with
-    just their locked layers and join the manifest (and therefore the merge).
-    """
-    locks = tile_psd.tile_locks(wave_dir)
-    if not locks:
-        return [], []
-    have = set()
-    for entry in entries:
-        try:
-            have.add(int(entry.get("index", -1)))
-        except (TypeError, ValueError):
-            continue
-    pending = [index for index in sorted(locks) if index not in have]
-    if not pending:
-        return [], []
-    coords = (doc or {}).get("coords") or []
-    src = (doc or {}).get("source") or {}
-    source = None
-    try:
-        source = [int(src["width"]), int(src["height"])]
-    except (KeyError, TypeError, ValueError):
-        source = None
-    tile_size = []
-    try:
-        tile_size = [int(v) for v in ((doc or {}).get("tile_size") or [])
-                     if v is not None][:2]
-    except (TypeError, ValueError):
-        tile_size = []
-    made_entries = []
-    made_images = []
-    for index in pending:
-        parts = tile_psd.snapshot_parts(
-            wave_dir, index, coords=coords, source=source)
-        if not parts:
-            print("[STLU] locked tile %d not restored: its crop layout changed"
-                  % index, flush=True)
-            continue
-        frame_h, frame_w = (int(v) for v in parts["frame_size"][:2])
-        size_pair = tile_size if len(tile_size) == 2 else [frame_w, frame_h]
-        try:
-            manifest = tile_psd.write_tiles(
-                [parts], _output_root(),
-                filename_prefix=prefix,
-                merge_parts=True,
-                alpha_threshold=int(alpha_threshold),
-                source_size=tuple(source) if source else None,
-                tile_size=tuple(size_pair),
-                overlap=int((doc or {}).get("overlap") or 0),
-                tile_index_map=[index],
-                write_depth=True,
-                original_rgba=None,
-                merge_group_layers=True,
-                include_original=False,
-                run_dir_abs=wave_dir,
-                write_manifest=False,
-                tile_coords=coords or None,
-                grid_offset=(doc or {}).get("offset") or (0, 0),
-            )
-            image_manifest = tile_psd.write_tile_images(
-                [parts], _output_root(),
-                filename_prefix=prefix,
-                grid_doc=doc,
-                tile_index_map=[index],
-                source_size=source,
-                original_rel="../original.png",
-                run_dir_abs=os.path.join(wave_dir, "images"),
-                write_index=False,
-                alpha_threshold=int(alpha_threshold),
-            )
-        except (ValueError, OSError) as exc:
-            print("[STLU] could not restore locked tile %d: %s" % (index, exc),
-                  flush=True)
-            continue
-        made_entries.append(manifest["tiles"][0])
-        made_images.append(image_manifest["tiles"][0])
-        print("[STLU] restored tile %d from locked parts: %s" % (
-            index, ", ".join(sorted((parts.get("tag2pinfo") or {}).keys()))),
-            flush=True)
-    return made_entries, made_images
-
-
 # ---------------------------------------------------------------------------
 # ③ saving one tile / the wave manifest
 # ---------------------------------------------------------------------------
@@ -1218,74 +1371,6 @@ def tile_context(plan, index) -> dict:
     }
 
 
-def restore_locks(parts, plan, index) -> dict:
-    """Bring back the parts the ⑤ panel locked for this tile.
-
-    The ``_locks/`` snapshot survives a folder reset, so it is tried first;
-    the previous tile PSD is only a fallback for locks saved before the store
-    existed.  Either source can revive a tile the new run left empty.
-    """
-    ctx = tile_context(plan, index)
-    tile_index = ctx["index"]
-    doc = ctx["doc"]
-    wave_dir = ctx["wave_dir"]
-    prefix = ctx["prefix"]
-    if not isinstance(parts, dict):
-        raise ValueError(
-            "STLU ③: tile %d 没有收到部件（上游返回 %r）。请检查 ② 是否正常完成。"
-            " / STLU ③: tile %d received no parts (upstream returned %r);"
-            " check whether ② finished normally."
-            % (tile_index, parts, tile_index, parts))
-    if str(parts.get("status") or "") == "error":
-        raise RuntimeError("STLU ③ tile %d upstream error: %s"
-                           % (tile_index, parts.get("error") or "unknown"))
-    coords = doc.get("coords") or []
-    src = doc.get("source") or {}
-    source = None
-    try:
-        if int(src.get("width") or 0) > 0 and int(src.get("height") or 0) > 0:
-            source = [int(src["width"]), int(src["height"])]
-    except (TypeError, ValueError):
-        source = None
-    locks = []
-    seen_locks = set()
-    for name in tile_psd.tile_locks(wave_dir).get(tile_index, []):
-        name = str(name).strip()
-        if name and name.lower() not in seen_locks:
-            seen_locks.add(name.lower())
-            locks.append(name)
-    if not locks:
-        return parts
-    parts = dict(parts)
-    restored, loaded = tile_psd.restore_locked_parts(
-        parts, wave_dir, tile_index, locks, coords=coords, source=source)
-    missing = [name for name in locks if name.strip().lower() not in loaded]
-    if missing:
-        old_path = tile_psd.find_tile_psd(wave_dir, prefix, tile_index)
-        if old_path:
-            previous = tile_psd.read_manifest(wave_dir) or {}
-            old_entry = None
-            for entry in previous.get("tiles") or []:
-                try:
-                    if int(entry.get("index", -1)) == tile_index:
-                        old_entry = entry
-                        break
-                except (TypeError, ValueError):
-                    continue
-            try:
-                row, col = (tile_psd.tile_rc(coords, tile_index)
-                            if coords else (0, 0))
-                tile_folder = ("tile_%02d_r%d_c%d" % (tile_index, row, col)
-                               if coords else "tile_%02d" % tile_index)
-            except Exception:  # noqa: BLE001 - fall back to no depth reuse
-                tile_folder = "tile_%02d" % tile_index
-            images_dir = os.path.join(wave_dir, "images", tile_folder)
-            restored.extend(tile_psd.replace_locked_parts(
-                parts, old_path, missing, old_entry, images_dir=images_dir))
-    if restored:
-        print("[STLU] tile %d: kept locked parts: %s" % (
-            tile_index, ", ".join(sorted(set(restored)))), flush=True)
-    return parts
 
 
 def tile_is_empty(parts) -> bool:
@@ -1310,8 +1395,7 @@ def write_tile_psd(parts, plan, index) -> dict:
         raise RuntimeError("STLU ③ tile %d upstream error: %s"
                            % (tile_index, parts.get("error") or "unknown"))
     if not (parts.get("tag2pinfo") or {}):
-        # Still nothing to write: skip the tile (an edge tile with no content
-        # and no locks to restore).
+        # Still nothing to write: skip the tile (an edge tile with no content).
         return {"index": tile_index, "status": "empty"}
 
     frame = (parts.get("frame_size") or (0, 0))
@@ -1345,31 +1429,14 @@ def write_tile_psd(parts, plan, index) -> dict:
             # The grid's own boxes, so a phased grid lands where it was cut.
             tile_coords=doc.get("coords") or None,
             grid_offset=doc.get("offset") or (0, 0),
+            # Per-tile seed record for the ⑤ preview ("种子 42 / 深度 7").
+            generation=doc.get("generation") or None,
         )
     except ValueError as exc:
         # Say which tile came up empty: "every tile ended up empty" alone
         # gives no way to tell this apart from a layout bug.
         raise ValueError("STLU ③: tile %d: %s" % (tile_index, exc)) from exc
     entry = psd_manifest["tiles"][0]
-
-    # Refresh the lock snapshots from what was actually written.  This
-    # migrates locks that came from the old PSD and keeps every locked layer
-    # safe for the next time a parameter change clears the folder.
-    source = None
-    try:
-        if int(src.get("width") or 0) > 0 and int(src.get("height") or 0) > 0:
-            source = [int(src["width"]), int(src["height"])]
-    except (TypeError, ValueError):
-        source = None
-    locks = [str(name).strip()
-             for name in tile_psd.tile_locks(wave_dir).get(tile_index, [])]
-    present = {str(tag).lower() for tag in (parts.get("tag2pinfo") or {})}
-    lock_names = [name for name in locks if name.strip().lower() in present]
-    if lock_names:
-        tile_psd.store_locked_parts(
-            wave_dir, tile_index, parts, lock_names,
-            tile_box=entry.get("tile"), canvas=entry.get("canvas"),
-            source=source)
 
     print("[STLU] tile %d -> %s" % (tile_index, entry.get("file")), flush=True)
     return {"index": int(tile_index), "status": "ok", "entry": entry,
@@ -1465,14 +1532,11 @@ def write_manifest(records, image_records, original_name, plan) -> dict:
     previous = tile_psd.read_manifest(wave_dir)
 
     generation = dict(doc.get("generation") or {})
-    generation_id = str(doc.get("generation_id") or "")
     if not generation:
         stored = tile_psd.read_generation(wave_dir) or {}
         generation = dict(stored.get("generation") or {})
-        generation_id = str(stored.get("generation_id") or "")
     cache_doc = dict(doc)
     cache_doc["generation"] = generation
-    cache_doc["generation_id"] = generation_id
     fingerprint = str(out.get("fingerprint") or "")
 
     entries = []
@@ -1516,17 +1580,16 @@ def write_manifest(records, image_records, original_name, plan) -> dict:
             if image_entry and index not in have_images:
                 image_entries.append(dict(image_entry))
 
-    # Tiles the current selection did not touch (after a reset the folder
-    # holds only the selected ones).  Locked parts keep their own snapshot, so
-    # those tiles are rebuilt instead of silently vanishing.
-    restored_entries, restored_images = _restore_locked_orphans(
-        wave_dir, doc, prefix, entries, image_entries, alpha_threshold)
-    restored_indices = []
-    if restored_entries:
-        entries.extend(restored_entries)
-        image_entries.extend(restored_images)
-        restored_indices = [int(e.get("index", -1)) for e in restored_entries]
-
+    # Cached tiles may come from a folder written before the
+    # seeds were recorded per entry; the manifest's generation is the same
+    # for every tile, so it can fill the gap.
+    if generation:
+        for entry in entries:
+            if not entry.get("seeds"):
+                entry["seeds"] = {
+                    "layer": generation.get(tile_psd.SEED_KEY),
+                    "depth": generation.get(tile_psd.DEPTH_SEED_KEY),
+                }
     entries.sort(key=lambda e: int(e.get("index", -1)))
     for slot, entry in enumerate(entries):
         entry["slot"] = int(slot)
@@ -1577,9 +1640,7 @@ def write_manifest(records, image_records, original_name, plan) -> dict:
         "count": len(entries),
         "run_tiles": sorted(run_indices),
         "reused_tiles": sorted(reused_indices),
-        "restored_tiles": sorted(restored_indices),
         "generation": generation,
-        "generation_id": generation_id,
         "images_dir": images_dir,
         "group": group_name,
         "wave": wave_id_value,
@@ -1639,9 +1700,7 @@ def write_manifest(records, image_records, original_name, plan) -> dict:
         "wave": wave_id_value,
         "run_tiles": sorted(run_indices),
         "reused_tiles": sorted(reused_indices),
-        "restored_tiles": sorted(restored_indices),
         "empty_tiles": empty_tiles,
-        "generation_id": generation_id,
         "algo_version": (generation or {}).get("algo_version"),
         "error": None,
     }

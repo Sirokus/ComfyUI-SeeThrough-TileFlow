@@ -7,6 +7,7 @@ The implementation is split by responsibility:
 * ``nodes_legacy``   -- older nodes, still registered under ``/Legacy``
 * ``nodes_upscale``  -- plan / edit-parts / 4K-mask workflows
 * ``nodes_transparent`` -- fine-grained steps of the guided pipeline
+* ``nodes_edit`` -- PSD per-layer edit (prepare / key cut / layer edit / assemble)
 
 Importing ``nodes`` (as tests and tools do) still exposes every class.
 """
@@ -31,6 +32,12 @@ if __package__:  # ComfyUI
     from .nodes_legacy import *  # noqa: F401,F403
     from .nodes_upscale import *  # noqa: F401,F403
     from .nodes_transparent import *  # noqa: F401,F403
+    from .mask_layers import *  # noqa: F401,F403
+    from .nodes_edit import *  # noqa: F401,F403
+    from .mask_layers import (
+        NODE_CLASS_MAPPINGS as _MASK_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _MASK_NAMES,
+    )
     from .nodes_pipeline import (
         NODE_CLASS_MAPPINGS as _PIPELINE_CLASSES,
         NODE_DISPLAY_NAME_MAPPINGS as _PIPELINE_NAMES,
@@ -47,6 +54,14 @@ if __package__:  # ComfyUI
         NODE_CLASS_MAPPINGS as _TRANSPARENT_CLASSES,
         NODE_DISPLAY_NAME_MAPPINGS as _TRANSPARENT_NAMES,
     )
+    from .nodes_psd import (
+        NODE_CLASS_MAPPINGS as _PSD_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _PSD_NAMES,
+    )
+    from .nodes_edit import (
+        NODE_CLASS_MAPPINGS as _EDIT_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _EDIT_NAMES,
+    )
 else:  # standalone import used by the tests and tools
     import folder_paths  # noqa: F401
     from nodes_shared import *  # noqa: F401,F403
@@ -54,6 +69,12 @@ else:  # standalone import used by the tests and tools
     from nodes_legacy import *  # noqa: F401,F403
     from nodes_upscale import *  # noqa: F401,F403
     from nodes_transparent import *  # noqa: F401,F403
+    from mask_layers import *  # noqa: F401,F403
+    from nodes_edit import *  # noqa: F401,F403
+    from mask_layers import (
+        NODE_CLASS_MAPPINGS as _MASK_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _MASK_NAMES,
+    )
     from nodes_pipeline import (
         NODE_CLASS_MAPPINGS as _PIPELINE_CLASSES,
         NODE_DISPLAY_NAME_MAPPINGS as _PIPELINE_NAMES,
@@ -70,6 +91,14 @@ else:  # standalone import used by the tests and tools
         NODE_CLASS_MAPPINGS as _TRANSPARENT_CLASSES,
         NODE_DISPLAY_NAME_MAPPINGS as _TRANSPARENT_NAMES,
     )
+    from nodes_psd import (
+        NODE_CLASS_MAPPINGS as _PSD_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _PSD_NAMES,
+    )
+    from nodes_edit import (
+        NODE_CLASS_MAPPINGS as _EDIT_CLASSES,
+        NODE_DISPLAY_NAME_MAPPINGS as _EDIT_NAMES,
+    )
 
 CATEGORY = "SeeThrough/LayerUpscale"
 
@@ -78,9 +107,15 @@ NODE_CLASS_MAPPINGS.update(_UPSCALE_CLASSES)
 NODE_CLASS_MAPPINGS.update(_LEGACY_CLASSES)
 NODE_CLASS_MAPPINGS.update(_PIPELINE_CLASSES)
 NODE_CLASS_MAPPINGS.update(_TRANSPARENT_CLASSES)
+NODE_CLASS_MAPPINGS.update(_MASK_CLASSES)
+NODE_CLASS_MAPPINGS.update(_PSD_CLASSES)
+NODE_CLASS_MAPPINGS.update(_EDIT_CLASSES)
 
 NODE_DISPLAY_NAME_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS.update(_UPSCALE_NAMES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_LEGACY_NAMES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_PIPELINE_NAMES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_TRANSPARENT_NAMES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_MASK_NAMES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_PSD_NAMES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_EDIT_NAMES)

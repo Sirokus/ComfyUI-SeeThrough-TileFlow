@@ -1,4 +1,4 @@
-"""CPU-only checks that only authoritative cached tiles are reused."""
+"""CPU-only checks that every finished tile in a folder is reused."""
 
 from __future__ import annotations
 
@@ -40,11 +40,9 @@ def fake_psd(width=512, height=512):
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         generation = {"version": 1, "algo_version": 1, "random_seed": 1}
-        gid = tile_psd.generation_id(generation)
         grid = tile_psd.grid_document((1024, 1024), (512, 512), 64)
         grid["source"]["fingerprint"] = "fp"
         grid["generation"] = generation
-        grid["generation_id"] = gid
 
         manifest = {
             "source": [1024, 1024],
@@ -53,7 +51,6 @@ def main():
             "offset": [0, 0],
             "source_fingerprint": "fp",
             "generation": generation,
-            "generation_id": gid,
             "tiles": [{"index": 0, "file": "tile_00.psd",
                        "preview": "", "depth": ""}],
         }
@@ -63,36 +60,29 @@ def main():
         manifest_path = os.path.join(tmp, "manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle)
-        tile_psd.write_generation(tmp, generation, gid)
+        tile_psd.write_generation(tmp, generation)
 
-        print("[manifest is authoritative]")
-        with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):
-            entries = tile_psd.cached_tile_entries(tmp, grid)
-        indices = [int(e["index"]) for e in entries]
-        check(indices == [0], "an unlisted leftover PSD is ignored (%s)" % indices)
-
-        print("[a genuinely interrupted folder may adopt unlisted PSDs]")
-        os.remove(manifest_path)
-        with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):
-            entries = tile_psd.cached_tile_entries(tmp, grid)
-        indices = [int(e["index"]) for e in entries]
-        check(indices == [0, 5], "matching generation adopts both PSDs (%s)" % indices)
-
-        print("[a different generation is never reused]")
-        tile_psd.write_generation(
-            tmp, {"version": 1, "algo_version": 2, "random_seed": 1}, "other")
-        with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):
-            entries = tile_psd.cached_tile_entries(tmp, grid)
-        check(entries == [], "a mismatched generation returns nothing")
-
-        print("[a seed-only change keeps the folder reusable]")
-        tile_psd.write_generation(
-            tmp, {"version": 1, "algo_version": 1, "random_seed": 2}, "seed")
+        print("[the folder is the cache]")
         with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):
             entries = tile_psd.cached_tile_entries(tmp, grid)
         indices = [int(e["index"]) for e in entries]
         check(indices == [0, 5],
-              "a different seed still reuses finished tiles (%s)" % indices)
+              "an unlisted leftover PSD is adopted too (%s)" % indices)
+
+        print("[a different generation is still reused]")
+        tile_psd.write_generation(
+            tmp, {"version": 1, "algo_version": 2, "random_seed": 1})
+        with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):
+            entries = tile_psd.cached_tile_entries(tmp, grid)
+        indices = [int(e["index"]) for e in entries]
+        check(indices == [0, 5],
+              "settings never invalidate finished tiles (%s)" % indices)
+
+        print("[skip wins over the folder]")
+        with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):
+            entries = tile_psd.cached_tile_entries(tmp, grid, skip=(5,))
+        indices = [int(e["index"]) for e in entries]
+        check(indices == [0], "the ticked tile is regenerated (%s)" % indices)
 
         print("[scan with an explicit manifest gate]")
         with mock.patch("tile_psd.psd_reader.read_psd", side_effect=lambda _p: fake_psd()):

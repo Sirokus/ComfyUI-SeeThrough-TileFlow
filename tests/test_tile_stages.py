@@ -81,7 +81,10 @@ def test_signatures():
     for name, cls in stlu.NODE_CLASS_MAPPINGS.items():
         types = cls.INPUT_TYPES()
         wanted = list(types.get("required", {})) + list(types.get("optional", {}))
-        signature = inspect.signature(cls.execute).parameters
+        entry = getattr(cls, getattr(cls, "FUNCTION", "execute"), None)
+        if entry is None:
+            entry = cls.execute
+        signature = inspect.signature(entry).parameters
         if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.values()):
             continue  # **options takes the whole widget set (STLU_PipelineInput)
         params = set(signature)
@@ -340,7 +343,7 @@ def test_pipeline_input(tmp):
     check(bool(merged2) and os.path.isfile(merged2),
           "④ merges the re-run plus the cached tile")
 
-    # Merge-only options are not part of the generation fingerprint: they
+    # Merge-only options do not change a tile: they
     # must not wipe the tile cache or force every tile.
     out_merge_only = node.execute(
         image=frame, tile_width=1024, tile_height=1024, overlap=128, select="0",
@@ -365,13 +368,15 @@ def test_pipeline_input(tmp):
         include_original=True,
     )
     _t3, _i3, grid_doc3, original3, *_ = out3["result"]
-    check(len(_t3) == 1,
-          "a changed source clears the folder but keeps the selection")
+    check(len(_t3) == 2,
+          "a changed source clears the folder and hands on every tile")
     doc3 = tile_psd.load_grid_ref(grid_doc3)
     reset3 = (doc3.get("out") or {}).get("reset") or {}
-    check(bool(doc3.get("generation_id")) and reset3.get("required") is True
-          and reset3.get("partial") is True,
-          "the partial reset is recorded in grid_doc")
+    check(reset3.get("required") is False and reset3.get("changed") is True
+          and bool(reset3.get("reason")),
+          "the changed source is reported and cleared (%s)" % (reset3,))
+    check(doc3.get("selection") == "all",
+          "the cleared folder runs the whole grid")
     record3 = tile_node.execute(parts=make_parts(), index="0",
                                 grid_doc=grid_doc3)["result"][0]
     _rd3, report_json3, _md3 = index_node.execute(
@@ -379,8 +384,9 @@ def test_pipeline_input(tmp):
     report3 = json.loads(report_json3)
     check([int(t["index"]) for t in report3.get("tiles") or []] == [0],
           "a new source image does not inherit stale tiles")
-    check(report3.get("generation_id") == doc3.get("generation_id"),
-          "the manifest records the generation fingerprint")
+    check(report3.get("source_fingerprint") ==
+          (doc3.get("out") or {}).get("fingerprint"),
+          "the manifest records the source it was generated from")
 
     merged3 = stlu.STLU_TileMerge().execute(
         merge_doc=json.dumps(dict(json.loads(_md3), dir=out_info["dir"]),
@@ -412,23 +418,23 @@ def test_pipeline_input(tmp):
         include_original=True,
     )
     _t4, _i4, grid_doc4, *_ = out4["result"]
-    check(len(_t4) == 1,
-          "a resolution change clears the folder and keeps the selection")
+    check(len(_t4) == 1 and _i4 == ["1"],
+          "a resolution change keeps the selection and never widens it")
     doc4 = tile_psd.load_grid_ref(grid_doc4)
-    check("resolution" in ((doc4.get("out") or {}).get("reset") or {}).get("keys", []),
-          "the changed resolution is named in the reset report")
+    check((doc4.get("out") or {}).get("reset") is None,
+          "a settings change never clears the folder")
     gen4 = doc4.get("generation") or {}
     pixel_keys = {"source", "source_size", "tile_size", "overlap", "resolution",
                   "num_inference_steps", "depth_resolution", "random_seed",
                   "tblr_split", "use_lama", "alpha_threshold", "guide",
                   "layerdiff_model", "depth_model"}
     check(pixel_keys <= set(gen4),
-          "the fingerprint covers every pixel-affecting parameter (%s)"
+          "the generation record covers every pixel-affecting parameter (%s)"
           % sorted(pixel_keys - set(gen4)))
     merge_keys = {"group_layers", "include_depth", "include_original",
                   "merge_name", "seam_feather"}
     check(not (merge_keys & set(gen4)),
-          "merge-only options stay out of the generation fingerprint")
+          "merge-only options stay out of the generation record")
 
 
 def test_rebuild(images_dir, tmp):
@@ -777,7 +783,7 @@ def test_mixed_merge(grid_path, tmp):
 
 
 def test_pipeline_offset(tmp):
-    print("[① grid phase: offset moves the split line and resets the cache]")
+    print("[① grid phase: offset moves the split line and reports a cache change]")
     frame = torch.rand(1, 1024, 2048, 3)
     node = stlu.STLU_PipelineInput()
     kwargs = dict(
@@ -797,14 +803,13 @@ def test_pipeline_offset(tmp):
     check([512, 0, 1536, 1024] in boxes, "the phase created the centred tile")
     check(len(out["result"][0]) == 1, "the explicit selection is still honoured")
 
-    # generation.json from the run above is on disk; returning to offset 0
-    # drops the key, which must still be detected as a changed fingerprint.
+    # Only ③ writes manifest.json, so the folder makes no claim about the
+    # old phase: returning to offset 0 clears nothing.
     out0 = node.execute(grid_offset_x=0, grid_offset_y=0, **kwargs)
     doc0 = tile_psd.load_grid_ref(out0["result"][2])
-    reset = (doc0.get("out") or {}).get("reset") or {}
-    check(reset.get("required") is True, "offset 0 after a phased run resets")
-    check("offset" in (reset.get("keys") or []), "the dropped offset key is reported")
-    check(reset.get("partial") is True, "the explicit selection is preserved")
+    check((doc0.get("out") or {}).get("reset") is None,
+          "a phase change with no manifest reports nothing")
+    check(len(out0["result"][0]) == 1, "the explicit selection is preserved")
     check((doc0.get("generation") or {}).get("offset") is None,
           "offset 0 keeps the fingerprint free of the key")
 

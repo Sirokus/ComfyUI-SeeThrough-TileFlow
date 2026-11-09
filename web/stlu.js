@@ -1,10 +1,12 @@
 /**
- * Front-end for the SeeThrough layer-upscale nodes.
+ * Front-end for the SeeThrough tile-flow nodes.
  *
- * STLU_Plan       big panel: folder, reference image, per-part selection,
- *                 resolution, composite preview, run button, live progress.
- * STLU_UpscaleBatch  card showing which subgraph workflow is used.
- * STLU_AssemblePSD   result card with the finished PSD + preview.
+ * STLU_PipelineInput / STLU_PipelineSettings  the ① input panel: grid, tile
+ *                 picking, crop, merge options.
+ * STLU_GuidedLayers / STLU_SeqTileLoop      ② progress.
+ * STLU_TilePSD / STLU_WaveIndex / STLU_TileMerge / STLU_PSDPreview
+ *                 ③ saving, ④ merging, ⑤ preview.
+ * STLU_EditPartsBatch / STLU_Mask4K          standalone edit / mask nodes.
  *
  * The raw text widgets stay the source of truth for prompt serialization;
  * this file only writes them through setWidget().
@@ -16,9 +18,6 @@
   const { app } = window.comfyAPI.app;
   const { api } = window.comfyAPI.api;
 
-  const PLAN = "STLU_Plan";
-  const BATCH = "STLU_UpscaleBatch";
-  const ASSEMBLE = "STLU_AssemblePSD";
   const TILES = "STLU_TilesPSD";
   const TILE_SELECT = "STLU_TileSelect";
   const TILE_MERGE = "STLU_TileMerge";
@@ -27,10 +26,6 @@
   // The transparent variant splits stage ① into visible nodes; the same grid
   // panel lives on its settings node so the user still has one place to edit.
   const PIPELINE_SETTINGS = "STLU_PipelineSettings";
-  // The lightweight ① node: same planner, fewer knobs.  Optional controls are
-  // hidden by widget presence, so this only needs to be recognized as a
-  // pipeline node.
-  const SIMPLE = "STLU_SimpleInput";
   // Subject strips: one inference sees the whole subject width.  Kept as a
   // literal so the panel, the route and the Python widget use one spelling.
   const STRIPS_MODE = "方形全宽分区";
@@ -41,6 +36,35 @@
   const CUSTOM_MIN = 64;
   const CUSTOM_RES_MIN = 512;
   const CUSTOM_RES_MAX = 2048;
+  // Mirrors pipeline_stages.V3_HEAD_TAGS / V3_BODY_TAGS: the tag universes the
+  // per-tile whitelist editor offers (SeeThrough v3 runs both groups).
+  const TILE_TAG_HEAD = ["headwear", "face", "irides", "eyebrow", "eyewhite",
+    "eyelash", "eyewear", "ears", "earwear", "nose", "mouth"];
+  const TILE_TAG_BODY = ["front hair", "back hair", "head", "neck", "neckwear",
+    "topwear", "handwear", "bottomwear", "legwear", "footwear", "tail", "wings",
+    "objects"];
+  // How the same universes are shown as cards in the editor.  Storage keeps the
+  // two backend groups ("head" / "body"); the cards only group the chips and
+  // decide which vertical band of the body they belong to.  Bands are read off
+  // the subject box (or the whole image when no subject was detected).
+  const TILE_TAG_CARDS = [
+    { key: "head", label: "头部（脸/眼/嘴/耳/头饰）", store: "head",
+      universe: TILE_TAG_HEAD, bands: ["head"] },
+    { key: "hair", label: "头发（前发/后发/头）", store: "body",
+      universe: ["front hair", "back hair", "head"], bands: ["head", "upper"] },
+    { key: "upper", label: "上半身（脖子/颈饰/上衣/手套）", store: "body",
+      universe: ["neck", "neckwear", "topwear", "handwear"], bands: ["upper"] },
+    { key: "lower", label: "下半身（下装/腿饰/鞋）", store: "body",
+      universe: ["bottomwear", "legwear", "footwear"], bands: ["lower"] },
+    { key: "other", label: "其他（尾巴/翅膀/道具）", store: "body",
+      universe: ["tail", "wings", "objects"], bands: ["head", "upper", "lower"] },
+  ];
+  // A tile counts as inside a band when at least this share of its height
+  // overlaps it; a sliver at the edge should not pull in another body part.
+  const BAND_MIN_OVERLAP = 0.12;
+  // Bump whenever the tile panel changes: it is printed on the quality card so
+  // "I still see the old panel" (stale JS in the browser) is unambiguous.
+  const STLU_BUILD = "build 2026-11-08k";
   const SELECT_TILES = "STLU_SelectTiles";
   const REBUILD_PSD = "STLU_RebuildPSD";
   const SAVE_TILES = "STLU_SaveTiles";
@@ -49,10 +73,25 @@
   const TILE_PSD = "STLU_TilePSD";
   const WAVE_INDEX = "STLU_WaveIndex";
   const PSD_PREVIEW = "STLU_PSDPreview";
+  const SEQ_LOOP = "STLU_SeqTileLoop";
+  // PSD-upscale workflow: finished PSD -> per-part crops -> Qwen edit -> PSD.
+  const PSD_PREPARE = "STLU_PsdPrepare";
+  const PSD_LOAD_CROP = "STLU_LoadCrop";
+  const PSD_CUT = "STLU_CutToLayer";
+  const PSD_ASSEMBLE = "STLU_PsdAssemble";
+  const PSD_UPSCALE = "STLU_PsdUpscale";
+  // PSD-edit workflow: finished PSD -> per-task crops -> Qwen image edit -> PSD.
+  const EDIT_PREPARE = "STLU_EditPrepare";
+  const EDIT_LAYER = "STLU_LayerEdit";
+  const EDIT_ASSEMBLE = "STLU_EditAssemble";
   const editStates = new Set();
+  // The PSD-edit panels keep their own set: stlu.psd.* and stlu.edit.* are
+  // different notifications, and a shared broadcast set would cross-fire.
+  const editCdStates = new Set();
   const mergeStates = new Set();
   const tilesStates = new Set();
   const stage3States = new Set();
+  const loopStates = new Set();
 
   // Last split produced in this session.  Stage one no longer writes a file:
   // ``lastGridDoc`` is the inline document, ``lastGridPath`` stays for nodes
@@ -73,32 +112,6 @@
   const panelRegistry = new Map();
   let gridBroadcast = false;
   const SESSION_V = Date.now();
-
-  const HIDDEN_PLAN = [
-    "layers_json", "select", "exclude", "size_rules", "out_dir",
-    "canvas_size", "skip_empty", "empty_coverage",
-    "focus_crop", "focus_margin", "focus_context", "focus_prompt",
-  ];
-
-  // Mirrors core_plan.DEFAULT_FOCUS_PROMPT.
-  const DEFAULT_FOCUS_PROMPT =
-    "Upscale <image1>, a cropped region of a character illustration. Keep the exact " +
-    "composition, framing, colors and shapes. Do NOT add, remove or extend anything. " +
-    "Enhance only sharpness and fine detail.";
-  const HIDDEN_BATCH = ["plan", "plan_path", "seed", "workflow_json"];
-  const HIDDEN_ASSEMBLE = [
-    "plan", "out_dir", "psd_filename", "fallback", "write_layers_json", "alpha_threshold",
-  ];
-
-  // Part categories, first match wins. "body" is the catch-all.
-  const CATEGORIES = [
-    { id: "hair", label: "头发", test: (n) => /hair/i.test(n) },
-    { id: "face", label: "面部", test: (n) => /face|eyebrow|eyelash|eyewhite|irides|ears|nose|mouth|eyewear|earwear/i.test(n) },
-    { id: "wear", label: "服装", test: (n) => /wear|cloth|skirt|shoe|dress|pants/i.test(n) },
-    { id: "body", label: "身体 / 其它", test: () => true },
-  ];
-
-  const SIZE_PRESETS = [512, 1024, 1536, 2048, 3072, 4096];
 
   const CSS = `
   .stlu-panel{display:flex;flex-direction:column;gap:7px;height:100%;padding:9px;box-sizing:border-box;
@@ -142,7 +155,10 @@
     font-size:11px;cursor:pointer;white-space:nowrap;}
   .stlu-chip:hover{background:#303033;}
   .stlu-chip.on{background:rgba(45,108,223,.18);border-color:#2d6cdf;color:#9cc4ff;}
+  .stlu-chip.part{background:rgba(45,108,223,.07);border-color:#3f5f9a;color:#8fa8cc;
+    border-style:dashed;}
   .stlu-chip .n{opacity:.6;margin-left:3px;}
+  .stlu-tcell.taganchor{outline:1px solid rgba(154,108,224,.55);}
   .stlu-search{flex:1 1 160px;}
   .stlu-bulk{flex:0 1 190px;color:#bbb;}
   .stlu-list{flex:1 1 auto;min-height:110px;overflow-y:auto;border:1px solid #2d2d2f;border-radius:6px;background:#111112;}
@@ -178,6 +194,10 @@
   .stlu-refthumb{width:34px;height:34px;object-fit:contain;border-radius:3px;border:1px solid #2a2a2c;
     background:repeating-conic-gradient(#242426 0% 25%,#1a1a1c 0% 50%) 50%/10px 10px;}
   .stlu-cardtitle{font-weight:600;color:#eaeaea;}
+  .stlu-bar{height:6px;border-radius:3px;background:#2a2a2c;overflow:hidden;flex:none;}
+  .stlu-bar-fill{height:100%;width:0;background:#4a7fd4;transition:width .25s linear;}
+  .stlu-bar-fill.ok{background:#4cc06a;}
+  .stlu-bar-fill.error{background:#d05a5a;}
   .stlu-dot{width:8px;height:8px;border-radius:50%;background:#777;display:inline-block;flex:none;}
   .stlu-dot.ok{background:#4cc06a;}
   .stlu-dot.bad{background:#d05a5a;}
@@ -241,6 +261,9 @@
   .stlu-tcell.on:after{content:"";position:absolute;inset:0;background:rgba(45,108,223,.22);}
   .stlu-tcell span{position:relative;z-index:1;background:rgba(0,0,0,.65);color:#ddd;
     padding:0 3px;border-radius:3px;margin-bottom:2px;}
+  .stlu-tcell.tagsel{border-color:#9a6ce0;box-shadow:inset 0 0 0 2px rgba(154,108,224,.85);}
+  .stlu-tcell .tagdot{position:absolute;top:2px;right:2px;width:7px;height:7px;
+    border-radius:50%;background:#b48cff;box-shadow:0 0 0 1px rgba(0,0,0,.7);}
   .stlu-gridwrap{display:flex;justify-content:center;align-items:center;background:#111112;
     border:1px solid #2d2d2f;border-radius:6px;padding:4px;min-height:60px;overflow:hidden;}
   .stlu-gridwrap canvas{max-width:100%;max-height:300px;display:block;cursor:pointer;border-radius:3px;}
@@ -377,10 +400,6 @@
     return Math.max(1, Math.round(n / 1024)) + " KB";
   }
 
-  function round32(v) {
-    return Math.max(32, Math.round(v / 32) * 32);
-  }
-
   function widgetOf(node, name) {
     return (node.widgets || []).find((w) => w.name === name);
   }
@@ -419,26 +438,6 @@
   // "value" when linked, otherwise the node's own widget.
   function valueWidget(node, name) {
     return primitiveWidget(linkedOrigin(node, name)) || widgetOf(node, name);
-  }
-
-  // 旧工作流把默认输出目录写死成 SeeThrough/UpScale。现在空值 = 自动，
-  // 即「当前拆层文件夹/UpScale」；读到旧默认值就迁移成自动，免得换了个角色
-  // 仍把结果混进同一个目录。后端 core_plan.LEGACY_OUT_DIR 有同样的兜底。
-  const LEGACY_OUT_DIR = "SeeThrough/UpScale";
-
-  function readOutDir(node) {
-    const value = String(widgetValue(node, "out_dir", "") || "").trim().replace(/\\/g, "/");
-    if (!value || value === LEGACY_OUT_DIR) return "";
-    return value;
-  }
-
-  function outDirLabel(ctx) {
-    if (ctx.outDir) return ctx.outDir;
-    return ctx.autoOutDir ? "自动 · " + ctx.autoOutDir : "自动";
-  }
-
-  function outDirPath(ctx) {
-    return ctx.outDir || ctx.autoOutDir || "";
   }
 
   // Stage ③ writes straight into this folder: no per-run subfolder.  Tiles
@@ -555,24 +554,6 @@
     const links = g.links;
     if (typeof links.get === "function") return links.get(id) || null;
     return links[id] || null;
-  }
-
-  function findBatchNode() {
-    return allNodes().find((n) => n.type === BATCH) || null;
-  }
-
-  function findReferenceNode() {
-    const batch = findBatchNode();
-    if (batch) {
-      const input = (batch.inputs || []).find((i) => i.name === "reference");
-      const link = input && input.link != null ? linkById(input.link) : null;
-      if (link) {
-        const originId = link.origin_id != null ? link.origin_id : link[1];
-        const origin = allNodes().find((n) => n.id === originId);
-        if (origin) return origin;
-      }
-    }
-    return allNodes().find((n) => n.type === "LoadImage") || null;
   }
 
   async function openPath(path, file) {
@@ -1097,7 +1078,8 @@
         }
         item.appendChild(el("span", "name", file.name));
         const tag = el("span", "tag",
-          file.is_layers ? "layers.json" : file.is_workflow ? "工作流" : file.is_image ? "图片" : fmtBytes(file.size));
+          file.is_layers ? "layers.json" : file.is_workflow ? "工作流"
+            : file.is_json ? "输入存档" : file.is_image ? "图片" : fmtBytes(file.size));
         item.appendChild(tag);
         if (opts.mode === "folder") {
           if (file.is_layers) {
@@ -1108,6 +1090,8 @@
             });
           }
         } else if (opts.mode === "image" && file.is_image) {
+          item.addEventListener("click", () => pickFile(file));
+        } else if (opts.mode === "json" && file.is_json) {
           item.addEventListener("click", () => pickFile(file));
         } else if (opts.mode === "workflow" && file.is_workflow) {
           item.addEventListener("click", () => pickFile(file));
@@ -1125,1302 +1109,129 @@
     nav(current);
   }
 
-  // -------------------------------------------------------------------------
-  // Plan panel
-  // -------------------------------------------------------------------------
+  // Browser for files outside output/input/workflows: the finished PSD lives
+  // in the user's own artwork folder, which /stlu/ls cannot reach.  Talks to
+  // /stlu/fs_ls, an absolute-path listing that only reads names and sizes.
+  // opts = { title, mode: "psd" | "image", start, onPick(abs, file) }
+  function openFsPicker(opts) {
+    const { dialog, close } = openOverlay();
+    const head = el("div", "stlu-dialog-head");
+    head.appendChild(el("strong", "grow", opts.title || "选择文件"));
+    head.appendChild(closeButton(close));
+    dialog.appendChild(head);
 
-  const planStates = new Set();
+    const crumbsEl = el("div", "stlu-crumbs");
+    const listEl = el("div", "stlu-filelist");
+    const foot = el("div", "stlu-dialog-foot");
+    const pathEl = el("span", "path");
+    foot.appendChild(pathEl);
+    dialog.appendChild(crumbsEl);
+    dialog.appendChild(listEl);
+    dialog.appendChild(foot);
 
-  function parseSelectNames(text) {
-    const t = (text || "").trim();
-    if (!t || t.toLowerCase() === "all" || t === "*") return null;
-    const names = new Set();
-    for (const item of t.split(",")) {
-      const name = item.trim();
-      if (!name || name.startsWith("!") || name.startsWith("-")) continue;
-      if (/[*?[]/.test(name)) continue;
-      names.add(name);
+    const wantImage = opts.mode === "image";
+
+    function pick(file) {
+      close();
+      opts.onPick(file.abs, file);
     }
-    return names;
-  }
 
-  function parseSizes(text) {
-    try {
-      const obj = JSON.parse(text || "{}");
-      const out = {};
-      for (const [key, value] of Object.entries(obj)) {
-        if (key === "*" || !value) continue;
-        if (typeof value === "number") out[key] = value;
-        else if (typeof value === "object" && value.long_side != null) out[key] = Number(value.long_side);
-      }
-      return out;
-    } catch (e) {
-      return {};
-    }
-  }
-
-  // Rules that are globs stay "template defaults"; literal layer names are
-  // turned into pinned rows by parseSizes so "自动" can really reset them.
-  function templateRules(base) {
-    const out = {};
-    try {
-      for (const [key, value] of Object.entries(base || {})) {
-        if (key === "*" || /[*?[]/.test(key)) out[key] = value;
-      }
-    } catch (e) { /* ignore */ }
-    if (!out["*"]) out["*"] = {};
-    return out;
-  }
-
-  function categoryOf(name) {
-    for (const cat of CATEGORIES) if (cat.test(name)) return cat;
-    return CATEGORIES[CATEGORIES.length - 1];
-  }
-
-  function entryFor(ctx, layer) {
-    let entry = ctx.entries.get(layer.name);
-    if (!entry) {
-      let checked = !layer.empty;
-      let longSide = layer.suggested.long_side;
-      let auto = true;
-      // Restore the selection / pinned sizes saved in the workflow the first
-      // time the layer list is loaded after opening or reloading the graph.
-      if (ctx.restore) {
-        if (ctx.savedSelectNames) checked = ctx.savedSelectNames.has(layer.name);
-        if (ctx.savedSizes && ctx.savedSizes[layer.name] != null) {
-          longSide = Number(ctx.savedSizes[layer.name]);
-          auto = false;
-        }
-      }
-      entry = { checked, longSide, auto };
-      ctx.entries.set(layer.name, entry);
-    } else if (entry.auto) {
-      entry.longSide = layer.suggested.long_side;
-    }
-    return entry;
-  }
-
-  function buildPlanPanel(node, ctx) {
-    const root = el("div", "stlu-panel");
-
-    const sourceCard = el("div", "stlu-card");
-    const srcLine = el("div", "stlu-line");
-    srcLine.appendChild(el("span", "stlu-label", "拆层文件夹"));
-    ctx.pathInput = el("input", "stlu-input stlu-path");
-    ctx.pathInput.type = "text";
-    ctx.pathInput.spellcheck = false;
-    ctx.pathInput.placeholder = "output 下的文件夹，例如 SeeThrough";
-    srcLine.appendChild(ctx.pathInput);
-    const browseBtn = el("button", "stlu-btn", "浏览…");
-    browseBtn.addEventListener("click", () => {
-      openPicker({
-        title: "选择拆层文件夹",
-        mode: "folder",
-        scopes: [{ scope: "output", label: "输出目录" }],
-        start: ctx.pathInput.value.trim(),
-        onPick: (rel) => {
-          ctx.pathInput.value = rel;
-          setWidget(ctx.node, "layers_json", rel);
-          refresh(ctx);
-        },
-      });
-    });
-    srcLine.appendChild(browseBtn);
-    const refreshBtn = el("button", "stlu-btn", "刷新");
-    refreshBtn.addEventListener("click", () => refresh(ctx));
-    srcLine.appendChild(refreshBtn);
-    sourceCard.appendChild(srcLine);
-
-    const configLine = el("div", "stlu-line");
-    configLine.appendChild(el("span", "stlu-label", "PSD 画布"));
-    ctx.canvasInput = el("input", "stlu-input stlu-canvas");
-    ctx.canvasInput.type = "number";
-    ctx.canvasInput.min = "256";
-    ctx.canvasInput.max = "8192";
-    ctx.canvasInput.step = "256";
-    ctx.canvasInput.style.flex = "0 0 92px";
-    ctx.canvasInput.title = "最终 PSD 的边长（像素）。部件默认按 画布/源图 的倍率放大。";
-    configLine.appendChild(ctx.canvasInput);
-    ctx.scaleEl = el("span", "stlu-hint stlu-scale");
-    configLine.appendChild(ctx.scaleEl);
-    configLine.appendChild(el("span", "grow"));
-    configLine.appendChild(el("span", "stlu-label", "输出"));
-    ctx.outBtn = el("button", "stlu-btn stlu-outdir");
-    ctx.outBtn.title = "输出文件夹（相对 output）。留空 = 当前拆层文件夹下的 UpScale，"
-      + "不存在会自动新建；点这里可以改成别的目录。";
-    ctx.outBtn.addEventListener("click", () => {
-      openPicker({
-        title: "选择输出文件夹",
-        mode: "folder",
-        scopes: [{ scope: "output", label: "输出目录" }],
-        start: outDirPath(ctx),
-        onPick: (rel) => {
-          // 选中的就是自动目录时保持「自动」，拆层文件夹改名后仍能跟随。
-          ctx.outDir = !rel || rel === ctx.autoOutDir ? "" : rel;
-          setWidget(ctx.node, "out_dir", ctx.outDir);
-          refresh(ctx);
-        },
-      });
-    });
-    configLine.appendChild(ctx.outBtn);
-    sourceCard.appendChild(configLine);
-
-    ctx.metaEl = el("div", "stlu-hint stlu-meta");
-    sourceCard.appendChild(ctx.metaEl);
-    root.appendChild(sourceCard);
-
-    // reference image -------------------------------------------------------
-    const refCard = el("div", "stlu-card stlu-refcard");
-    const refLine = el("div", "stlu-line");
-    ctx.refThumb = el("img", "stlu-refthumb");
-    ctx.refThumb.alt = "";
-    ctx.refThumb.title = "当前全身参考图（点击在 LoadImage 中更换）";
-    refLine.appendChild(ctx.refThumb);
-    const refWho = el("div", "stlu-who");
-    refWho.style.flex = "1";
-    refWho.appendChild(el("div", "stlu-name", "参考图"));
-    ctx.refName = el("div", "stlu-sub", "未选择");
-    refWho.appendChild(ctx.refName);
-    refLine.appendChild(refWho);
-    const pickRef = el("button", "stlu-btn", "选择…");
-    pickRef.title = "从 input 目录中选择参考图";
-    pickRef.addEventListener("click", () => {
-      openPicker({
-        title: "选择全身参考图",
-        mode: "image",
-        scopes: [{ scope: "input", label: "输入目录" }],
-        start: "",
-        onPick: (rel) => {
-          const node = findReferenceNode();
-          if (!node) { setStatus(ctx, "没有找到 LoadImage 节点", "error"); return; }
-          setWidget(node, "image", rel);
-          refreshRef(ctx);
-          setStatus(ctx, "参考图已设为 " + rel);
-        },
-      });
-    });
-    refLine.appendChild(pickRef);
-    const uploadRef = el("button", "stlu-btn", "上传…");
-    uploadRef.title = "从电脑上传一张新参考图到 input 目录";
-    ctx.refFile = el("input");
-    ctx.refFile.type = "file";
-    ctx.refFile.accept = "image/*";
-    ctx.refFile.style.display = "none";
-    uploadRef.addEventListener("click", () => ctx.refFile.click());
-    ctx.refFile.addEventListener("change", async () => {
-      const file = ctx.refFile.files && ctx.refFile.files[0];
-      ctx.refFile.value = "";
-      if (!file) return;
-      setStatus(ctx, "正在上传 " + file.name + " …");
+    async function nav(path) {
+      listEl.innerHTML = "";
+      listEl.appendChild(el("div", "stlu-item", "加载中…"));
+      let data;
       try {
-        const form = new FormData();
-        form.append("image", file, file.name);
-        form.append("type", "input");
-        form.append("overwrite", "true");
-        const res = await fetch(apiUrl("/upload/image"), { method: "POST", body: form });
-        if (!res.ok) throw new Error(res.status + " " + res.statusText);
-        const data = await res.json();
-        const name = data.name || (data.subfolder ? data.subfolder + "/" + data.name : "");
-        const node = findReferenceNode();
-        if (!node) throw new Error("没有找到 LoadImage 节点");
-        setWidget(node, "image", name);
-        refreshRef(ctx);
-        setStatus(ctx, "参考图已上传");
+        data = await getJson("/stlu/fs_ls?path=" + encodeURIComponent(path || "") +
+          (wantImage ? "&ext=image" : ""));
       } catch (e) {
-        setStatus(ctx, "上传失败：" + e.message, "error");
+        listEl.innerHTML = "";
+        const err = el("div", "stlu-item");
+        err.appendChild(el("span", "icon", "⚠"));
+        err.appendChild(el("span", "name", "无法读取：" + e.message));
+        listEl.appendChild(err);
+        return;
       }
-    });
-    refLine.appendChild(uploadRef);
-    refLine.appendChild(ctx.refFile);
-    refCard.appendChild(refLine);
-    root.appendChild(refCard);
+      const here = data.path || "";
+      pathEl.textContent = here || "此电脑";
+      pathEl.title = here;
 
-    // toolbar ---------------------------------------------------------------
-    const toolbar = el("div", "stlu-toolbar");
-    toolbar.style.display = "flex";
-    toolbar.style.flexDirection = "column";
-    toolbar.style.gap = "6px";
-    const searchLine = el("div", "stlu-line");
-    ctx.search = el("input", "stlu-input stlu-search");
-    ctx.search.type = "text";
-    ctx.search.placeholder = "搜索部件…";
-    let searchTimer = null;
-    ctx.search.addEventListener("input", () => {
-      if (searchTimer) clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => {
-        ctx.query = ctx.search.value || "";
-        renderList(ctx);
-      }, 120);
-    });
-    searchLine.appendChild(ctx.search);
-    ctx.bulk = el("select", "stlu-input stlu-bulk");
-    const bulkPlaceholder = el("option", null, "已勾选：批量长边…");
-    bulkPlaceholder.value = "";
-    ctx.bulk.appendChild(bulkPlaceholder);
-    const bulkAuto = el("option", null, "自动（跟随画布）");
-    bulkAuto.value = "auto";
-    ctx.bulk.appendChild(bulkAuto);
-    for (const size of SIZE_PRESETS) {
-      const opt = el("option", null, size + " px");
-      opt.value = String(size);
-      ctx.bulk.appendChild(opt);
+      crumbsEl.innerHTML = "";
+      const crumb = (label, target) => {
+        const b = el("button", "stlu-crumb", label);
+        b.addEventListener("click", () => nav(target));
+        crumbsEl.appendChild(b);
+      };
+      crumb("💻 此电脑", "");
+      const parts = here ? here.replace(/\\/g, "/").replace(/\/+$/, "").split("/") : [];
+      let acc = "";
+      for (const part of parts) {
+        acc = acc ? acc + "/" + part : (/^[A-Za-z]:$/.test(part) ? part + "/" : part);
+        crumbsEl.appendChild(el("span", null, "/"));
+        crumb(part, acc);
+      }
+
+      listEl.innerHTML = "";
+      if (here) {
+        const up = el("div", "stlu-item");
+        up.appendChild(el("span", "icon", "⬆"));
+        up.appendChild(el("span", "name", "上一级"));
+        up.addEventListener("click", () => nav(data.parent || ""));
+        listEl.appendChild(up);
+      }
+      for (const dir of data.dirs || []) {
+        const item = el("div", "stlu-item");
+        item.appendChild(el("span", "icon", "📁"));
+        item.appendChild(el("span", "name", dir.name));
+        item.addEventListener("click", () => nav(dir.rel));
+        listEl.appendChild(item);
+      }
+      for (const file of data.files || []) {
+        const item = el("div", "stlu-item");
+        item.appendChild(el("span", "icon", file.is_image ? "🖼" : "📄"));
+        item.appendChild(el("span", "name", file.name));
+        item.appendChild(el("span", "tag", file.is_psd ? "PSD" : fmtBytes(file.size)));
+        item.addEventListener("click", () => pick(file));
+        listEl.appendChild(item);
+      }
+      if (!(data.dirs || []).length && !(data.files || []).length) {
+        const empty = el("div", "stlu-item");
+        empty.appendChild(el("span", "icon", "·"));
+        empty.appendChild(el("span", "name", "空文件夹"));
+        listEl.appendChild(empty);
+      }
     }
-    ctx.bulk.title = "把当前勾选的部件统一设为某个长边（“自动”等于跟随 PSD 画布）";
-    ctx.bulk.addEventListener("change", () => bulkApply(ctx, ctx.bulk.value));
-    searchLine.appendChild(ctx.bulk);
-    toolbar.appendChild(searchLine);
 
-    const chipLine = el("div", "stlu-line");
-    ctx.chipsEl = el("div", "stlu-chips");
-    chipLine.appendChild(ctx.chipsEl);
-    chipLine.appendChild(el("span", "grow"));
-    const allBtn = el("button", "stlu-btn", "全选");
-    allBtn.title = "勾选所有部件";
-    allBtn.addEventListener("click", () => setAll(ctx, () => true));
-    const nonEmptyBtn = el("button", "stlu-btn", "仅非空");
-    nonEmptyBtn.title = "只勾选有实际像素的部件（跳过翅膀/尾巴等空层）";
-    nonEmptyBtn.addEventListener("click", () => setAll(ctx, (layer) => !layer.empty));
-    const noneBtn = el("button", "stlu-btn", "清空");
-    noneBtn.title = "全部不勾选（PSD 仍会用原图合成）";
-    noneBtn.addEventListener("click", () => setAll(ctx, () => false));
-    chipLine.appendChild(allBtn);
-    chipLine.appendChild(nonEmptyBtn);
-    chipLine.appendChild(noneBtn);
-    toolbar.appendChild(chipLine);
+    nav(opts.start ? absDirOf(opts.start) : "");
+  }
 
-    const legend = el("div", "stlu-hint",
-      "勾选 = 本次用 AI 重绘；未勾选的部件仍会以原图放进 PSD（不耗时）。");
-    toolbar.appendChild(legend);
-    root.appendChild(toolbar);
+  // Absolute-path helpers for the PSD panels.
+  function absDirOf(path) {
+    const text = String(path || "").trim();
+    if (!text) return "";
+    return text.replace(/\\/g, "/").replace(/\/[^/]*$/, "");
+  }
 
-    // local crop refinement -------------------------------------------------
-    const focusCard = el("div", "stlu-card stlu-focus");
-    const fLine1 = el("div", "stlu-line");
-    const fLabel = el("label", "stlu-check");
-    ctx.focusCb = el("input");
-    ctx.focusCb.type = "checkbox";
-    fLabel.appendChild(ctx.focusCb);
-    fLabel.appendChild(el("span", "stlu-focusname", "局部裁切重绘"));
-    fLabel.title = "只在部件周围一小块真实上下文里生成，再按原坐标贴回并恢复原 alpha。" +
-      "开：小部件不会被补全成整个人；关：整帧编辑（旧行为）。";
-    fLine1.appendChild(fLabel);
-    fLine1.appendChild(el("span", "grow"));
-    ctx.focusCtxSel = el("select", "stlu-input stlu-focusctx");
-    const fOptBackdrop = el("option", null, "上下文：合成源层");
-    fOptBackdrop.value = "backdrop";
-    ctx.focusCtxSel.appendChild(fOptBackdrop);
-    const fOptRef = el("option", null, "上下文：参考图");
-    fOptRef.value = "reference";
-    ctx.focusCtxSel.appendChild(fOptRef);
-    ctx.focusCtxSel.title = "合成源层：把全部源层拼成一张图再裁，坐标天然对齐（推荐）。" +
-      "参考图：直接用 LoadImage 那张图裁，要求它与拆层画面严格对齐。";
-    fLine1.appendChild(ctx.focusCtxSel);
-    focusCard.appendChild(fLine1);
+  function baseNameOf(path) {
+    const text = String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const cut = text.lastIndexOf("/");
+    return cut >= 0 ? text.slice(cut + 1) : text;
+  }
 
-    const fLine2 = el("div", "stlu-line");
-    fLine2.appendChild(el("span", "stlu-hint", "边距"));
-    ctx.focusMargin = el("input", "stlu-size");
-    ctx.focusMargin.type = "number";
-    ctx.focusMargin.min = "0";
-    ctx.focusMargin.max = "256";
-    ctx.focusMargin.step = "8";
-    ctx.focusMargin.title = "裁片在部件四周多留多少像素（源图尺度）。" +
-      "瞳孔这类小部件用 16–64：留得越少，模型越没有空间「联想」出更大的结构。";
-    fLine2.appendChild(ctx.focusMargin);
-    fLine2.appendChild(el("span", "stlu-hint", "px（源图尺度）"));
-    focusCard.appendChild(fLine2);
-
-    ctx.focusHint = el("div", "stlu-hint");
-    focusCard.appendChild(ctx.focusHint);
-
-    const focusDetails = el("details", "stlu-focusprompt");
-    focusDetails.appendChild(el("summary", "stlu-hint", "裁片提示词（点开编辑）"));
-    ctx.focusPrompt = el("textarea", "stlu-input stlu-promptarea");
-    ctx.focusPrompt.rows = 4;
-    focusDetails.appendChild(ctx.focusPrompt);
-    focusCard.appendChild(focusDetails);
-    root.appendChild(focusCard);
-
-    ctx.listEl = el("div", "stlu-list");
-    root.appendChild(ctx.listEl);
-
-    // footer ----------------------------------------------------------------
-    const foot = el("div", "stlu-foot");
-    const previewBtn = el("button", "stlu-btn", "预览合成");
-    previewBtn.title = "用当前勾选和分辨率离线合成一张预览（不跑 GPU）";
-    previewBtn.addEventListener("click", () => openCompositePreview(ctx));
-    foot.appendChild(previewBtn);
-    const openSrc = el("button", "stlu-btn", "源文件夹");
-    openSrc.title = "在文件管理器中打开拆层文件夹";
-    openSrc.addEventListener("click", () => {
-      const dir = (ctx.source && (ctx.source.source_dir || ctx.source.layers_json)) || ctx.pathInput.value;
-      openPath(dir, false);
-    });
-    foot.appendChild(openSrc);
-    const openOut = el("button", "stlu-btn", "输出目录");
-    openOut.title = "在文件管理器中打开输出文件夹";
-    openOut.addEventListener("click", () => openPath(outDirPath(ctx), false));
-    foot.appendChild(openOut);
-    ctx.statusEl = el("span", "stlu-status");
-    foot.appendChild(ctx.statusEl);
-    ctx.runBtn = el("button", "stlu-btn primary", "▶ 开始放大");
-    ctx.runBtn.title = "运行整个工作流（模型加载一次，逐层放大）";
-    ctx.runBtn.addEventListener("click", () => runWorkflow(ctx));
-    foot.appendChild(ctx.runBtn);
-    root.appendChild(foot);
-
-    ctx.rows = new Map();
-    ctx.entries = new Map();
-    ctx.query = "";
-    ctx.chip = "all";
-    ctx.running = false;
-    ctx.done = new Set();
-    ctx.total = 0;
-    ctx.rowEls = new Map();
-    ctx.restore = true;
-    ctx.outDir = readOutDir(node);
-    ctx.autoOutDir = "";
-    ctx.canvas = Number(widgetValue(node, "canvas_size", 2048)) || 2048;
-
-    ctx.pathInput.value = String(widgetValue(node, "layers_json", "") || "");
-    ctx.canvasInput.value = String(ctx.canvas);
-    ctx.outBtn.textContent = outDirLabel(ctx);
-    readFocusWidgets(ctx);
-
-    ctx.focusCb.addEventListener("change", () => writeFocusWidgets(ctx));
-    ctx.focusCtxSel.addEventListener("change", () => writeFocusWidgets(ctx));
-    ctx.focusMargin.addEventListener("change", () => writeFocusWidgets(ctx));
-    ctx.focusPrompt.addEventListener("change", () => writeFocusWidgets(ctx));
-
-    ctx.pathInput.addEventListener("change", () => {
-      setWidget(node, "layers_json", ctx.pathInput.value.trim());
-      refresh(ctx);
-    });
-    ctx.canvasInput.addEventListener("change", () => {
-      let value = Number(ctx.canvasInput.value) || 2048;
-      value = Math.max(256, Math.min(8192, Math.round(value / 8) * 8));
-      ctx.canvas = value;
-      ctx.canvasInput.value = String(value);
-      setWidget(node, "canvas_size", value);
-      refresh(ctx);
-    });
-    ctx.canvasInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") ctx.canvasInput.blur();
-    });
-
-    addDOM(node, "stlu_panel", root, 470, undefined);
+  // Open / reveal an absolute path (PSD source, output folder) in the OS.
+  async function openLocal(path, file) {
+    if (!path) return;
+    try {
+      await getJson("/stlu/" + (file ? "open_local" : "reveal_local") +
+        "?path=" + encodeURIComponent(path));
+    } catch (e) {
+      console.warn("[STLU] open local failed", e);
+    }
   }
 
   function setStatus(ctx, text, cls) {
     if (!ctx.statusEl) return;
     ctx.statusEl.textContent = text || "";
     ctx.statusEl.className = "stlu-status" + (cls ? " " + cls : "");
-  }
-
-  function selectedCount(ctx) {
-    let n = 0;
-    for (const layer of ctx.layers) {
-      const entry = ctx.entries.get(layer.name);
-      if (entry && entry.checked) n++;
-    }
-    return n;
-  }
-
-  function updateRunState(ctx) {
-    if (!ctx.runBtn) return;
-    const n = selectedCount(ctx);
-    if (ctx.running) {
-      ctx.runBtn.disabled = true;
-      ctx.runBtn.textContent = "运行中…";
-      return;
-    }
-    ctx.runBtn.disabled = false;
-    ctx.runBtn.textContent = n ? "▶ 开始放大（" + n + " 层）" : "▶ 只合成 PSD（不放大）";
-    ctx.runBtn.title = n
-      ? "运行整个工作流（模型只加载一次，逐层放大）"
-      : "没有勾选部件：不调用模型，直接用原图合成 PSD";
-  }
-
-  function updateScale(ctx) {
-    if (!ctx.scaleEl) return;
-    const src = ctx.meta && ctx.meta.source ? Number(ctx.meta.source.canvas_w) || 1024 : 1024;
-    const scale = ctx.canvas / src;
-    ctx.scaleEl.textContent = "源 " + src + " · " + scale.toFixed(2) + "×";
-  }
-
-  function updateSummary(ctx) {
-    if (!ctx.metaEl) return;
-    const total = ctx.layers.length;
-    let checked = 0;
-    let inPsd = 0;
-    let upscaled = 0;
-    for (const layer of ctx.layers) {
-      const entry = ctx.entries.get(layer.name);
-      if (entry && entry.checked) checked++;
-      if (!(layer.empty && !(entry && entry.checked))) inPsd++;
-      if (layer.upscaled) upscaled++;
-    }
-    const bits = [total + " 个部件", "PSD " + inPsd + " 层", "已选 " + checked + " 个重绘"];
-    if (upscaled) bits.push("已生成 " + upscaled);
-    ctx.metaEl.classList.remove("warn");
-    ctx.metaEl.textContent = bits.join(" · ");
-    if (ctx.meta) {
-      const src = ctx.meta.source || {};
-      const name = String(src.layers_json || "").split("/").pop();
-      if (name) bits.push(name);
-      if (src.synthetic) bits.push("从 PNG 合成（无 layers.json）");
-      ctx.metaEl.textContent = bits.join(" · ");
-      if ((ctx.meta.warnings || []).length) {
-        ctx.metaEl.classList.add("warn");
-        ctx.metaEl.title = ctx.meta.warnings.join("\n");
-      } else {
-        ctx.metaEl.title = "";
-      }
-    }
-    updateScale(ctx);
-    updateRunState(ctx);
-    updateFocusHint(ctx);
-  }
-
-  function updateChipCounts(ctx) {
-    if (!ctx.chipsEl) return;
-    const chips = [{ id: "all", label: "全部" }]
-      .concat(CATEGORIES.map((c) => ({ id: c.id, label: c.label })))
-      .concat([{ id: "empty", label: "空层" }]);
-    if (!ctx.chipButtons) ctx.chipButtons = new Map();
-    ctx.chipsEl.innerHTML = "";
-    for (const chip of chips) {
-      let count = 0;
-      for (const layer of ctx.layers) {
-        if (chip.id === "all") count++;
-        else if (chip.id === "empty") count += layer.empty ? 1 : 0;
-        else if (categoryOf(layer.name).id === chip.id) count++;
-      }
-      const b = el("button", "stlu-chip" + (ctx.chip === chip.id ? " on" : ""), chip.label);
-      b.appendChild(el("span", "n", String(count)));
-      b.addEventListener("click", () => {
-        ctx.chip = chip.id;
-        renderList(ctx);
-      });
-      ctx.chipsEl.appendChild(b);
-    }
-  }
-
-  function rowSubText(layer, entry) {
-    const src = layer.w + "×" + layer.h;
-    if (!entry.checked) return src + " · 不重绘，PSD 使用原图";
-    const aspect = layer.w / Math.max(1, layer.h);
-    let w;
-    let h;
-    if (aspect >= 1) {
-      w = entry.longSide;
-      h = round32(entry.longSide / aspect);
-    } else {
-      h = entry.longSide;
-      w = round32(entry.longSide * aspect);
-    }
-    return src + " → " + w + "×" + h + " · " + (entry.auto ? "自动" : "固定");
-  }
-
-  function updateRowEl(ref, layer, entry) {
-    if (!ref) return;
-    ref.row.classList.toggle("off", !entry.checked);
-    // 批量按钮（全选/仅非空/清空、分区全选）只改 entry，不会触发 change 事件，
-    // 所以这里必须把原生复选框同步回去，否则会出现“置灰但仍是勾选态”。
-    if (ref.cb && ref.cb.checked !== !!entry.checked) ref.cb.checked = !!entry.checked;
-    if (ref.sub) ref.sub.textContent = rowSubText(layer, entry);
-    if (ref.size) ref.size.value = String(entry.longSide);
-    if (ref.autoBtn) {
-      ref.autoBtn.classList.toggle("on", entry.auto);
-      ref.autoBtn.textContent = entry.auto ? "自动" : "固定";
-      ref.autoBtn.title = entry.auto
-        ? "跟随 PSD 画布倍率（在右侧数字框里输入即固定）"
-        : "已固定；点击恢复自动";
-    }
-    if (ref.doneTag) {
-      ref.doneTag.style.display = ref.ctx && ref.ctx.done.has(layer.name) ? "" : "none";
-    }
-  }
-
-  function makeRow(ctx, layer) {
-    const entry = entryFor(ctx, layer);
-    const row = el("div", "stlu-row");
-    const ref = { row, layer, entry, ctx };
-    ctx.rowEls.set(layer.name, ref);
-
-    const cb = el("input");
-    cb.type = "checkbox";
-    cb.checked = entry.checked;
-    cb.addEventListener("change", () => {
-      entry.checked = cb.checked;
-      updateRowEl(ref, layer, entry);
-      updateSummary(ctx);
-      updateChipCounts(ctx);
-      sync(ctx);
-    });
-    ref.cb = cb;
-
-    const thumb = el("img", "stlu-thumb");
-    thumb.loading = "lazy";
-    thumb.alt = "";
-    if (layer.thumb) {
-      thumb.src = apiUrl(layer.thumb);
-      thumb.addEventListener("click", () => openLayerPreview(ctx, layer));
-      thumb.addEventListener("error", () => { thumb.style.visibility = "hidden"; });
-    }
-    ref.thumb = thumb;
-
-    const who = el("div", "stlu-who");
-    const nameEl = el("div", "stlu-name");
-    nameEl.appendChild(el("span", null, layer.name));
-    if (layer.empty) nameEl.appendChild(el("span", "stlu-tag", "空层"));
-    ref.doneTag = el("span", "stlu-tag ok", "✓");
-    ref.doneTag.style.display = "none";
-    nameEl.appendChild(ref.doneTag);
-    if (layer.upscaled) nameEl.appendChild(el("span", "stlu-tag ok", "已生成"));
-    who.appendChild(nameEl);
-    ref.sub = el("div", "stlu-sub");
-    who.appendChild(ref.sub);
-
-    const sizebox = el("div", "stlu-sizebox");
-    const size = el("input", "stlu-size");
-    size.type = "number";
-    size.min = "32";
-    size.max = "8192";
-    size.step = "32";
-    size.title = "放大后的长边像素（按部件宽高比换算 W×H）";
-    size.addEventListener("change", () => {
-      let value = Number(size.value) || layer.suggested.long_side;
-      value = Math.max(32, Math.min(8192, round32(value)));
-      entry.longSide = value;
-      entry.auto = false;
-      updateRowEl(ref, layer, entry);
-      sync(ctx);
-    });
-    ref.size = size;
-    const autoBtn = el("button", "stlu-auto");
-    autoBtn.addEventListener("click", () => {
-      if (entry.auto) return;
-      entry.auto = true;
-      entry.longSide = layer.suggested.long_side;
-      updateRowEl(ref, layer, entry);
-      sync(ctx);
-    });
-    ref.autoBtn = autoBtn;
-    sizebox.appendChild(size);
-    sizebox.appendChild(autoBtn);
-
-    row.appendChild(cb);
-    row.appendChild(thumb);
-    row.appendChild(who);
-    row.appendChild(sizebox);
-    updateRowEl(ref, layer, entry);
-    return row;
-  }
-
-  function sectionHeader(ctx, category, layers) {
-    const head = el("div", "stlu-sec");
-    head.appendChild(el("span", null, category.label + " · " + layers.length));
-    head.appendChild(el("span", "grow"));
-    const btn = el("button", "stlu-mini", "全选");
-    btn.addEventListener("click", () => {
-      const allOn = layers.every((layer) => entryFor(ctx, layer).checked);
-      for (const layer of layers) {
-        const entry = entryFor(ctx, layer);
-        entry.checked = !allOn;
-        updateRowEl(ctx.rowEls.get(layer.name), layer, entry);
-      }
-      updateSummary(ctx);
-      updateChipCounts(ctx);
-      sync(ctx);
-    });
-    head.appendChild(btn);
-    return head;
-  }
-
-  function renderList(ctx) {
-    ctx.listEl.innerHTML = "";
-    ctx.rowEls = new Map();
-    const query = (ctx.query || "").trim().toLowerCase();
-    const visible = ctx.layers
-      .filter((layer) => {
-        if (query && layer.name.toLowerCase().indexOf(query) === -1) return false;
-        if (ctx.chip === "all") return true;
-        if (ctx.chip === "empty") return !!layer.empty;
-        return categoryOf(layer.name).id === ctx.chip;
-      })
-      // 空层统一排在非空之后；sort 是稳定的，同类部件保持原有相对顺序。
-      .sort((a, b) => (a.empty ? 1 : 0) - (b.empty ? 1 : 0));
-
-    if (ctx.chip === "all") {
-      for (const category of CATEGORIES) {
-        const rows = visible.filter((layer) => categoryOf(layer.name).id === category.id);
-        if (!rows.length) continue;
-        ctx.listEl.appendChild(sectionHeader(ctx, category, rows));
-        for (const layer of rows) ctx.listEl.appendChild(makeRow(ctx, layer));
-      }
-    } else {
-      for (const layer of visible) ctx.listEl.appendChild(makeRow(ctx, layer));
-    }
-    if (!visible.length) {
-      ctx.listEl.appendChild(el("div", "stlu-item", "没有匹配的部件"));
-    }
-    updateChipCounts(ctx);
-    updateSummary(ctx);
-  }
-
-  function setAll(ctx, predicate) {
-    for (const layer of ctx.layers) {
-      const entry = entryFor(ctx, layer);
-      entry.checked = !!predicate(layer);
-      updateRowEl(ctx.rowEls.get(layer.name), layer, entry);
-    }
-    updateSummary(ctx);
-    updateChipCounts(ctx);
-    sync(ctx);
-  }
-
-  function bulkApply(ctx, value) {
-    if (!value) return;
-    let count = 0;
-    for (const layer of ctx.layers) {
-      const entry = ctx.entries.get(layer.name);
-      if (!entry || !entry.checked) continue;
-      if (value === "auto") {
-        entry.auto = true;
-        entry.longSide = layer.suggested.long_side;
-      } else {
-        entry.auto = false;
-        entry.longSide = Number(value);
-      }
-      updateRowEl(ctx.rowEls.get(layer.name), layer, entry);
-      count++;
-    }
-    ctx.bulk.value = "";
-    sync(ctx);
-    if (count) {
-      setStatus(ctx, "已把 " + count + " 个勾选部件的长边设为 " + (value === "auto" ? "自动" : value + " px"));
-    } else {
-      setStatus(ctx, "先勾选要修改的部件", "error");
-    }
-  }
-
-  function readFocusWidgets(ctx) {
-    if (!ctx.focusCb) return;
-    ctx.focusCb.checked = widgetValue(ctx.node, "focus_crop", true) !== false;
-    const mode = String(widgetValue(ctx.node, "focus_context", "backdrop") || "backdrop");
-    ctx.focusCtxSel.value = mode === "reference" ? "reference" : "backdrop";
-    let margin = Number(widgetValue(ctx.node, "focus_margin", 32));
-    if (!Number.isFinite(margin)) margin = 32;
-    margin = Math.max(0, Math.min(256, Math.round(margin / 8) * 8));
-    ctx.focusMargin.value = String(margin);
-    ctx.focusPrompt.value = String(widgetValue(ctx.node, "focus_prompt", DEFAULT_FOCUS_PROMPT) || "");
-    updateFocusHint(ctx);
-  }
-
-  function writeFocusWidgets(ctx) {
-    if (!ctx.focusCb || !ctx.node) return;
-    let margin = Number(ctx.focusMargin.value);
-    if (!Number.isFinite(margin)) margin = 32;
-    margin = Math.max(0, Math.min(256, Math.round(margin / 8) * 8));
-    ctx.focusMargin.value = String(margin);
-    setWidget(ctx.node, "focus_crop", !!ctx.focusCb.checked);
-    setWidget(ctx.node, "focus_context", ctx.focusCtxSel.value);
-    setWidget(ctx.node, "focus_margin", margin);
-    setWidget(ctx.node, "focus_prompt", ctx.focusPrompt.value);
-    if (ctx.focusCtxSel.value === "reference") probeRefSize(ctx);
-    else updateFocusHint(ctx);
-    updateSummary(ctx);
-  }
-
-  const refSizeCache = new Map();
-
-  async function probeRefSize(ctx) {
-    const node = findReferenceNode();
-    const widget = node ? widgetOf(node, "image") : null;
-    const name = widget ? String(widget.value || "") : "";
-    if (!name) {
-      ctx.refSize = null;
-      updateFocusHint(ctx);
-      return;
-    }
-    if (refSizeCache.has(name)) {
-      ctx.refSize = refSizeCache.get(name);
-      updateFocusHint(ctx);
-      return;
-    }
-    try {
-      const data = await getJson("/stlu/imgsize?scope=input&path=" + encodeURIComponent(name));
-      const size = [Number(data.width) || 0, Number(data.height) || 0];
-      refSizeCache.set(name, size);
-      ctx.refSize = size;
-    } catch (e) {
-      ctx.refSize = null;
-    }
-    updateFocusHint(ctx);
-  }
-
-  function updateFocusHint(ctx) {
-    if (!ctx.focusHint) return;
-    const enabled = ctx.focusCb ? !!ctx.focusCb.checked : true;
-    const src = (ctx.meta && ctx.meta.source) || {};
-    const cw = Number(src.canvas_w) || 1024;
-    const ch = Number(src.canvas_h) || cw;
-    const canvasArea = Math.max(1, cw * ch);
-    let focus = 0;
-    let full = 0;
-    let overscale = 0;
-    for (const layer of ctx.layers || []) {
-      const entry = ctx.entries.get(layer.name);
-      if (!entry || !entry.checked) continue;
-      const box = layer.box || [0, 0, cw, ch];
-      const bw = Math.max(0, box[2] - box[0]);
-      const bh = Math.max(0, box[3] - box[1]);
-      if (bw * bh >= 0.95 * canvasArea) full++;
-      else focus++;
-      const srcSide = Math.max(1, bw, bh);
-      if ((Number(entry.longSide) || 0) / srcSide > 8) overscale++;
-    }
-    const bits = [];
-    if (enabled) {
-      bits.push("局部裁切 " + focus + " 层");
-      if (full) bits.push("整帧 " + full + " 层");
-    } else {
-      bits.push("整帧编辑（关）");
-    }
-    let warn = overscale > 0;
-    if (overscale) bits.push("⚠ " + overscale + " 层超过源尺寸 8×");
-    if (enabled && ctx.focusCtxSel && ctx.focusCtxSel.value === "reference") {
-      const size = ctx.refSize;
-      if (size && size[0] > 0) {
-        const kx = size[0] / cw;
-        const ky = size[1] / ch;
-        const k = (kx + ky) / 2;
-        if (Math.abs(kx - ky) > 0.02 * Math.max(kx, ky)) {
-          bits.push("⚠ 参考图 " + size[0] + "×" + size[1] + " 比例不符，会缩放回画布");
-          warn = true;
-        } else if (k > 1.02) {
-          bits.push("参考图 " + size[0] + "×" + size[1] + " · 原生分辨率裁取 ×" + k.toFixed(2));
-        } else {
-          bits.push("参考图 " + size[0] + "×" + size[1] + "（与画布同尺寸）");
-        }
-      } else {
-        bits.push("参考图");
-      }
-    }
-    ctx.focusHint.textContent = bits.join(" · ");
-    ctx.focusHint.classList.toggle("warn", warn);
-    if (ctx.focusCtxSel) ctx.focusCtxSel.disabled = !enabled;
-    if (ctx.focusMargin) ctx.focusMargin.disabled = !enabled;
-    if (ctx.focusPrompt) ctx.focusPrompt.disabled = !enabled;
-  }
-
-  function sync(ctx) {
-    const names = [];
-    const sizes = templateRules(ctx.baseRulesObj);
-    for (const layer of ctx.layers) {
-      const entry = ctx.entries.get(layer.name);
-      if (!entry || !entry.checked) continue;
-      names.push(layer.name);
-      if (!entry.auto) sizes[layer.name] = { long_side: entry.longSide };
-    }
-    setWidget(ctx.node, "select", names.length ? names.join(", ") : "!*");
-    setWidget(ctx.node, "size_rules", JSON.stringify(sizes));
-    setWidget(ctx.node, "layers_json", ctx.pathInput.value.trim());
-    setWidget(ctx.node, "exclude", "");
-    setWidget(ctx.node, "canvas_size", ctx.canvas);
-    setWidget(ctx.node, "out_dir", ctx.outDir);
-  }
-
-  async function refresh(ctx) {
-    if (!ctx.node || !ctx.listEl) return;
-    const source = ctx.pathInput.value.trim();
-    const rules = String(widgetValue(ctx.node, "size_rules", "") || "");
-    const m0 = i18n();
-    const keepStatus = ctx.statusEl ? (m0 ? m0.raw(ctx.statusEl) : ctx.statusEl.textContent) : "";
-    if (!ctx.running) setStatus(ctx, "正在读取部件…");
-    try {
-      const data = await getJson(
-        "/stlu/layers?dir=" + encodeURIComponent(source) +
-        "&canvas=" + encodeURIComponent(ctx.canvas) +
-        "&rules=" + encodeURIComponent(rules) +
-        "&out_dir=" + encodeURIComponent(ctx.outDir)
-      );
-      ctx.layers = data.layers || [];
-      ctx.meta = data;
-      ctx.source = data.source || {};
-      // 空 out_dir 时由后端按拆层文件夹算出实际目录（相对 output）。
-      ctx.autoOutDir = String(data.auto_out_dir || "");
-      ctx.outResolved = String(data.out_dir || outDirPath(ctx));
-      const valid = new Set(ctx.layers.map((layer) => layer.name));
-      for (const key of Array.from(ctx.entries.keys())) {
-        if (!valid.has(key)) ctx.entries.delete(key);
-      }
-      if (ctx.restore) {
-        // Rebuild every entry once so the saved select / pinned sizes apply to
-        // layers that are not currently visible under the active filter.
-        ctx.savedSelectNames = parseSelectNames(widgetValue(ctx.node, "select", ""));
-        ctx.savedSizes = parseSizes(widgetValue(ctx.node, "size_rules", ""));
-        for (const layer of ctx.layers) entryFor(ctx, layer);
-        ctx.restore = false;
-      }
-      ctx.canvasInput.value = String(ctx.canvas);
-      ctx.outBtn.textContent = outDirLabel(ctx);
-      ctx.outBtn.title = "输出文件夹：" + ctx.outResolved + "（相对 output）\n"
-        + "点击更改；当前为自动 = 拆层文件夹下的 UpScale。";
-      renderList(ctx);
-      sync(ctx);
-      refreshRef(ctx);
-      if (!ctx.running && keepStatus !== "正在读取部件…") {
-        setStatus(ctx, keepStatus || "就绪");
-      }
-    } catch (e) {
-      ctx.layers = ctx.layers || [];
-      ctx.rowEls = new Map();
-      setStatus(ctx, "读取失败：" + e.message, "error");
-      if (ctx.metaEl) {
-        ctx.metaEl.classList.add("warn");
-        ctx.metaEl.textContent = "读取失败：" + e.message;
-      }
-    }
-  }
-
-  function refreshRef(ctx) {
-    const node = findReferenceNode();
-    ctx.refNode = node;
-    const w = node ? widgetOf(node, "image") : null;
-    if (w && !w.__stluHooked) {
-      // Changing the image directly on the LoadImage node should update the
-      // reference row too.
-      const original = w.callback;
-      w.callback = function () {
-        let result;
-        try {
-          result = original ? original.apply(this, arguments) : undefined;
-        } finally {
-          setTimeout(() => forEachPlanState((other) => refreshRef(other)), 0);
-        }
-        return result;
-      };
-      w.__stluHooked = true;
-    }
-    const name = w ? String(w.value || "") : "";
-    if (!node) {
-      ctx.refName.textContent = "未找到 LoadImage 节点";
-      ctx.refThumb.style.visibility = "hidden";
-      ctx.refSize = null;
-      updateFocusHint(ctx);
-      return;
-    }
-    if (!name) {
-      ctx.refName.textContent = "未选择（点击“选择…”）";
-      ctx.refThumb.style.visibility = "hidden";
-      ctx.refSize = null;
-      updateFocusHint(ctx);
-      return;
-    }
-    ctx.refName.textContent = name;
-    ctx.refThumb.style.visibility = "";
-    probeRefSize(ctx);
-    ctx.refThumb.src = apiUrl(
-      "/stlu/thumb?scope=input&path=" + encodeURIComponent(name) + "&size=64&v=" + encodeURIComponent(name)
-    );
-    ctx.refThumb.onclick = () => {
-      openPicker({
-        title: "选择全身参考图",
-        mode: "image",
-        scopes: [{ scope: "input", label: "输入目录" }],
-        start: "",
-        onPick: (rel) => {
-          setWidget(node, "image", rel);
-          refreshRef(ctx);
-        },
-      });
-    };
-  }
-
-  async function runWorkflow(ctx) {
-    if (ctx.running) return;
-    const count = selectedCount(ctx);
-    if (count > 0) {
-      const ref = findReferenceNode();
-      const refWidget = ref ? widgetOf(ref, "image") : null;
-      if (refWidget && !String(refWidget.value || "")) {
-        setStatus(ctx, "先选择参考图", "error");
-        return;
-      }
-    }
-    sync(ctx);
-    ctx.running = true;
-    resetDoneMarks(ctx);
-    ctx.total = count;
-    updateRunState(ctx);
-    setStatus(ctx, count ? "已提交，等待执行…" : "已提交：直接用原图合成 PSD…");
-    try {
-      if (!app.queuePrompt) throw new Error("当前前端版本不支持程序化排队，请点右上角“运行”");
-      await app.queuePrompt(0, 1);
-    } catch (e) {
-      ctx.running = false;
-      updateRunState(ctx);
-      setStatus(ctx, "提交失败：" + (e && e.message ? e.message : e), "error");
-    }
-  }
-
-  function resetDoneMarks(ctx) {
-    ctx.done.clear();
-    for (const ref of ctx.rowEls.values()) {
-      if (ref.doneTag) ref.doneTag.style.display = "none";
-    }
-  }
-
-  function markRowDone(ctx, name) {
-    // The upscaled file now exists; remember it so a later refresh shows it.
-    const layer = ctx.layers.find((l) => l.name === name);
-    if (layer) layer.upscaled = true;
-    // 统一走 updateRowEl：让 “off” 只反映勾选状态，别把未勾选的行误清灰。
-    const ref = ctx.rowEls.get(name);
-    if (ref) updateRowEl(ref, ref.layer, ref.entry);
-  }
-
-  async function openCompositePreview(ctx) {
-    const { dialog, close } = openOverlay("wide");
-    const head = el("div", "stlu-dialog-head");
-    head.appendChild(el("strong", "grow", "合成预览（未勾选部件使用原图）"));
-    head.appendChild(closeButton(close));
-    dialog.appendChild(head);
-    const box = el("div", "stlu-prevbox");
-    box.appendChild(el("div", "stlu-hint", "正在合成…"));
-    dialog.appendChild(box);
-    const meta = el("div", "stlu-prevmeta");
-    dialog.appendChild(meta);
-
-    sync(ctx);
-    const query = "/stlu/preview" +
-      "?dir=" + encodeURIComponent(ctx.pathInput.value.trim()) +
-      "&canvas=" + encodeURIComponent(ctx.canvas) +
-      "&rules=" + encodeURIComponent(String(widgetValue(ctx.node, "size_rules", "") || "")) +
-      "&select=" + encodeURIComponent(String(widgetValue(ctx.node, "select", "all") || "all")) +
-      "&exclude=" + encodeURIComponent(String(widgetValue(ctx.node, "exclude", "") || "")) +
-      "&out_dir=" + encodeURIComponent(ctx.outDir) +
-      "&skip_empty=" + (widgetValue(ctx.node, "skip_empty", true) ? "1" : "0") +
-      "&coverage=" + encodeURIComponent(String(widgetValue(ctx.node, "empty_coverage", 0.0005))) +
-      "&size=1024";
-    try {
-      const data = await getJson(query);
-      box.innerHTML = "";
-      const img = el("img");
-      img.src = apiUrl(data.url);
-      box.appendChild(img);
-      meta.innerHTML = "";
-      meta.appendChild(el("span", null, data.layers + " 个图层"));
-      meta.appendChild(el("span", null, data.canvas[0] + "×" + data.canvas[1]));
-      meta.appendChild(el("span", null, "已选重绘 " + data.selected + " 个"));
-      const openBtn = el("button", "stlu-btn", "输出目录");
-      openBtn.style.marginLeft = "auto";
-      openBtn.addEventListener("click", () => openPath(outDirPath(ctx), false));
-      meta.appendChild(openBtn);
-      if ((data.notes || []).length || (data.warnings || []).length) {
-        const list = el("ul", "stlu-notes");
-        for (const note of (data.notes || []).slice(0, 6)) list.appendChild(el("li", null, note));
-        for (const warning of (data.warnings || []).slice(0, 4)) list.appendChild(el("li", null, warning));
-        meta.appendChild(list);
-      }
-    } catch (e) {
-      box.innerHTML = "";
-      box.appendChild(el("div", "stlu-hint error", "合成失败：" + e.message));
-    }
-  }
-
-  function bigThumb(url) {
-    return String(url || "").replace(/size=\d+/, "size=768");
-  }
-
-  function openLayerPreview(ctx, layer) {
-    const { dialog, close } = openOverlay("wide");
-    const head = el("div", "stlu-dialog-head");
-    head.appendChild(el("strong", "grow", layer.name));
-    head.appendChild(closeButton(close));
-    dialog.appendChild(head);
-    const box = el("div", "stlu-layerbox");
-    const figure = (caption, src) => {
-      const fig = el("figure");
-      const img = el("img");
-      img.src = apiUrl(src);
-      img.addEventListener("error", () => { img.style.visibility = "hidden"; });
-      fig.appendChild(img);
-      fig.appendChild(el("figcaption", null, caption));
-      return fig;
-    };
-    if (layer.thumb) box.appendChild(figure("原图 · " + layer.w + "×" + layer.h, bigThumb(layer.thumb)));
-    if (layer.upscaled_thumb) {
-      box.appendChild(figure("上次放大结果", bigThumb(layer.upscaled_thumb)));
-    }
-    dialog.appendChild(box);
-    const foot = el("div", "stlu-dialog-foot");
-    foot.appendChild(el("span", "path", layer.filename || ""));
-    const openOut = el("button", "stlu-btn", "打开输出目录");
-    openOut.addEventListener("click", () => openPath((ctx && outDirPath(ctx)) || "", false));
-    foot.appendChild(openOut);
-    dialog.appendChild(foot);
-  }
-
-  // -------------------------------------------------------------------------
-  // Plan node wiring
-  // -------------------------------------------------------------------------
-
-  function setupPlan(node) {
-    injectCss();
-    const ctx = {
-      node,
-      layers: [],
-      entries: new Map(),
-      rowEls: new Map(),
-      running: false,
-      done: new Set(),
-      total: 0,
-    };
-    for (const name of HIDDEN_PLAN) hideWidget(widgetOf(node, name));
-    ctx.baseRulesObj = (() => {
-      try {
-        return JSON.parse(String(widgetValue(node, "size_rules", "") || "{}"));
-      } catch (e) {
-        return { "*": {} };
-      }
-    })();
-
-    buildPlanPanel(node, ctx);
-    planStates.add(ctx);
-
-    const keep = {
-      width: Math.max(node.size[0], 780),
-      height: Math.max(node.size[1], 900),
-    };
-    node.setSize([keep.width, keep.height]);
-
-    let timer = null;
-    const schedule = (delay) => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        timer = null;
-        refresh(ctx);
-      }, delay == null ? 120 : delay);
-    };
-
-    // Re-read every hidden widget after the node is configured (workflow load,
-    // paste, undo): the saved folder / selection / sizes must win over the
-    // defaults used when the node was created.
-    const reloadFromWidgets = () => {
-      ctx.pathInput.value = String(widgetValue(node, "layers_json", "") || "");
-      ctx.outDir = readOutDir(node);
-      ctx.canvas = Number(widgetValue(node, "canvas_size", 2048)) || 2048;
-      ctx.canvasInput.value = String(ctx.canvas);
-      ctx.outBtn.textContent = outDirLabel(ctx);
-      try {
-        ctx.baseRulesObj = JSON.parse(String(widgetValue(node, "size_rules", "") || "{}"));
-      } catch (e) {
-        ctx.baseRulesObj = { "*": {} };
-      }
-      ctx.entries = new Map();
-      ctx.restore = true;
-      readFocusWidgets(ctx);
-      schedule(200);
-    };
-
-    const oldConfigured = node.onAfterGraphConfigured;
-    node.onAfterGraphConfigured = function () {
-      const result = oldConfigured ? oldConfigured.apply(this, arguments) : undefined;
-      reloadFromWidgets();
-      return result;
-    };
-
-    const oldConfigure = node.onConfigure;
-    node.onConfigure = function () {
-      const result = oldConfigure ? oldConfigure.apply(this, arguments) : undefined;
-      try {
-        reloadFromWidgets();
-      } catch (e) {
-        console.warn("[STLU] reload after configure failed", e);
-      }
-      return result;
-    };
-
-    const oldRemoved = node.onRemoved;
-    node.onRemoved = function () {
-      if (oldRemoved) oldRemoved.apply(this, arguments);
-      planStates.delete(ctx);
-    };
-
-    setTimeout(() => schedule(250), 250);
-  }
-
-  // -------------------------------------------------------------------------
-  // Batch node card
-  // -------------------------------------------------------------------------
-
-  function setupBatch(node) {
-    injectCss();
-    for (const name of HIDDEN_BATCH) hideWidget(widgetOf(node, name));
-
-    const root = el("div", "stlu-panel");
-    root.style.padding = "8px";
-    const line = el("div", "stlu-line");
-    const dot = el("span", "stlu-dot");
-    line.appendChild(dot);
-    const title = el("span", "stlu-cardtitle", "子图模板");
-    line.appendChild(title);
-    const nameEl = el("span", "stlu-hint");
-    nameEl.style.flex = "1";
-    line.appendChild(nameEl);
-    root.appendChild(line);
-    root.appendChild(el("div", "stlu-hint",
-      "每一层都会克隆这个工作流里的 Qwen 编辑子图；改了 prompt / 采样器会自动生效。"));
-    const actions = el("div", "stlu-line");
-    const openBtn = el("button", "stlu-btn", "打开工作流");
-    const pickBtn = el("button", "stlu-btn", "更换…");
-    actions.appendChild(openBtn);
-    actions.appendChild(pickBtn);
-    root.appendChild(actions);
-
-    const state = { path: "", exists: false };
-    let checking = false;
-
-    async function check() {
-      if (checking) return;
-      checking = true;
-      try {
-        const path = String(widgetValue(node, "workflow_json", "") || "");
-        const data = await getJson("/stlu/wf?path=" + encodeURIComponent(path));
-        state.path = data.path || "";
-        state.exists = !!data.exists;
-        nameEl.textContent = data.name || "?";
-        nameEl.title = state.path;
-        dot.className = "stlu-dot " + (state.exists ? "ok" : "bad");
-        nameEl.className = "stlu-hint" + (state.exists ? "" : " warn");
-        openBtn.disabled = !state.exists;
-      } catch (e) {
-        dot.className = "stlu-dot bad";
-        nameEl.className = "stlu-hint warn";
-        nameEl.textContent = "无法检查（" + e.message + "）";
-      } finally {
-        checking = false;
-      }
-    }
-
-    openBtn.addEventListener("click", () => {
-      if (state.path) openPath(state.path, true);
-    });
-    pickBtn.addEventListener("click", () => {
-      openPicker({
-        title: "选择子图模板工作流",
-        mode: "workflow",
-        scopes: [{ scope: "workflows", label: "工作流目录" }],
-        start: "",
-        onPick: (rel, abs) => {
-          setWidget(node, "workflow_json", abs || rel);
-          check();
-        },
-      });
-    });
-
-    addDOM(node, "stlu_batch_card", root, 150, 190);
-    const oldConfigured = node.onAfterGraphConfigured;
-    node.onAfterGraphConfigured = function () {
-      const result = oldConfigured ? oldConfigured.apply(this, arguments) : undefined;
-      check();
-      return result;
-    };
-    const oldConfigure = node.onConfigure;
-    node.onConfigure = function () {
-      const result = oldConfigure ? oldConfigure.apply(this, arguments) : undefined;
-      check();
-      return result;
-    };
-    setTimeout(check, 300);
-  }
-
-  // -------------------------------------------------------------------------
-  // Assemble node card
-  // -------------------------------------------------------------------------
-
-  function setupAssemble(node) {
-    injectCss();
-    for (const name of HIDDEN_ASSEMBLE) hideWidget(widgetOf(node, name));
-
-    const root = el("div", "stlu-panel");
-    root.style.padding = "8px";
-    root.style.gap = "5px";
-
-    const line = el("div", "stlu-line");
-    const dot = el("span", "stlu-dot");
-    line.appendChild(dot);
-    const title = el("span", "stlu-cardtitle", "等待运行");
-    line.appendChild(title);
-    line.appendChild(el("span", "grow"));
-    const tag = el("span", "stlu-tag", "自动");
-    line.appendChild(tag);
-    root.appendChild(line);
-
-    const preview = el("img", "stlu-psd-prev");
-    preview.style.display = "none";
-    root.appendChild(preview);
-
-    const sub = el("div", "stlu-hint", "全部部件完成后自动合成 PSD，无需手动操作。");
-    root.appendChild(sub);
-
-    const actions = el("div", "stlu-line");
-    const openPsd = el("button", "stlu-btn", "打开 PSD");
-    const reveal = el("button", "stlu-btn", "打开文件夹");
-    openPsd.disabled = true;
-    reveal.disabled = true;
-    actions.appendChild(openPsd);
-    actions.appendChild(reveal);
-    root.appendChild(actions);
-
-    let info = null;
-    const targetPath = () => (info ? (info.subfolder ? info.subfolder + "/" : "") + info.filename : "");
-    openPsd.addEventListener("click", () => { if (info) openPath(targetPath(), true); });
-    reveal.addEventListener("click", () => { if (info) openPath(info.subfolder || ".", false); });
-
-    function applyInfo(data) {
-      if (!data) return;
-      info = data;
-      const isError = !!data.error;
-      dot.className = "stlu-dot " + (isError ? "bad" : "ok");
-      title.textContent = data.filename || "PSD";
-      title.title = targetPath();
-      tag.textContent = isError ? "PSD 写入失败" : "完成";
-      const bits = [];
-      if (data.layers) bits.push(data.layers + " 层");
-      if (data.canvas && data.canvas.length === 2) bits.push(data.canvas[0] + "×" + data.canvas[1]);
-      if (data.size) bits.push(fmtBytes(data.size));
-      if (isError) bits.push(String(data.error).slice(0, 120));
-      sub.textContent = bits.join(" · ");
-      sub.className = "stlu-hint" + (isError ? " error" : "");
-      if (data.preview && data.preview.filename) {
-        const rel = (data.preview.subfolder ? data.preview.subfolder + "/" : "") + data.preview.filename;
-        preview.src = apiUrl(
-          "/stlu/thumb?scope=output&path=" + encodeURIComponent(rel) +
-          "&size=384&v=" + encodeURIComponent(data.preview.v || "")
-        );
-        preview.style.display = "";
-      }
-      openPsd.disabled = isError;
-      reveal.disabled = false;
-    }
-
-    addDOM(node, "stlu_psd_card", root, 210, 300);
-
-    const oldExecuted = node.onExecuted;
-    node.onExecuted = function (message) {
-      const result = oldExecuted ? oldExecuted.apply(this, arguments) : undefined;
-      try {
-        const payload = message && message.stlu_psd;
-        if (payload && payload.length) applyInfo(payload[0]);
-      } catch (e) {
-        console.error("[STLU] cannot read PSD result", e);
-      }
-      return result;
-    };
   }
 
   // -------------------------------------------------------------------------
@@ -3382,8 +2193,7 @@
     root.style.gap = "4px";
 
     const isPipeline = node.type === PIPELINE
-      || node.type === PIPELINE_SETTINGS
-      || node.type === SIMPLE;
+      || node.type === PIPELINE_SETTINGS;
 
     const head = el("div", "stlu-line");
     head.appendChild(el("span", "stlu-cardtitle",
@@ -3494,6 +2304,25 @@
     // Assigned by buildPipelineControls (the list DOM lives in that card).
     let renderCustomList = function () {};
     let customCountTag = null;
+    // Per-tile tag whitelist, mirroring pipeline_stages._tile_tag_config:
+    // {_key: <geometry key>, tiles: {"<index>": {body: [...], head: [...]}}}.
+    // A missing group means "automatic"; a present (even empty) group is the
+    // exact set of tags this tile may emit.
+    let tileTags = {};
+    let tileTagKey = "";
+    // The block the tag editor centres on; Shift-range and Ctrl-toggle extend
+    // ``tagEditSel`` around it.  Editing always applies to the whole selection,
+    // so a row of blocks can share one tag set without clicking every tile.
+    let tagEditIndex = 0;
+    let tagEditSel = new Set([0]);
+    // Assigned by buildPipelineControls (the summary line lives in that card).
+    let syncTileTagUi = function () {};
+    // Red line under the tag editor when the widget write fails.
+    let tagWriteHint = null;
+    // -1 = follow the layer seed; anything else is its own seed.
+    // Declared up here with the rest of the state: buildPipelineControls
+    // reads it, and it runs at line ~3537, before the old declaration site.
+    const DEPTH_SEED_FOLLOW = -1;
 
     // Must come AFTER the state above: the factory builds the custom-window
     // card and initialises those bindings.  Declaring them later put them in
@@ -3578,6 +2407,523 @@
       refreshCacheHint();
     }
 
+    // --- per-tile tag whitelist --------------------------------------------
+    function readTileTagsFromWidget() {
+      const raw = String(widgetValue(node, "tile_tags", "{}") || "{}").trim() || "{}";
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (e) {
+        console.warn("[STLU] tile_tags is not valid JSON", e);
+        return { key: "", tiles: {} };
+      }
+      if (!data || typeof data !== "object") return { key: "", tiles: {} };
+      const src = data.tiles && typeof data.tiles === "object" ? data.tiles : data;
+      const tiles = {};
+      for (const index of Object.keys(src)) {
+        if (index === "_key") continue;
+        const entry = src[index];
+        if (!entry || typeof entry !== "object") continue;
+        const clean = {};
+        for (const group of ["body", "head"]) {
+          const list = entry[group];
+          if (!Array.isArray(list)) continue;
+          const universe = group === "head" ? TILE_TAG_HEAD : TILE_TAG_BODY;
+          // Keep tags the cards do not show (older v2 names, or a tag added by
+          // hand to the widget) in their original order after the known ones.
+          // Dropping them here made the next edit silently rewrite the
+          // whitelist and disable layers the user never touched.
+          const known = universe.filter((tag) => list.indexOf(tag) >= 0);
+          const extra = [];
+          for (const tag of list) {
+            if (typeof tag !== "string" || !tag) continue;
+            if (universe.indexOf(tag) >= 0 || extra.indexOf(tag) >= 0) continue;
+            extra.push(tag);
+          }
+          clean[group] = known.concat(extra);
+        }
+        if (Object.keys(clean).length) tiles[String(index)] = clean;
+      }
+      return { key: String(data._key || ""), tiles };
+    }
+
+    // --- proportional auto tags -------------------------------------------
+    // The subject box (square-strip mode) or the whole image (uniform/custom)
+    // gives the vertical reference.  A head is roughly the top fifth of a
+    // standing figure; hair hangs past it; the rest splits into upper body and
+    // legs with a small overlap so a tile straddling a boundary keeps both.
+    function autoBands() {
+      const plan = (planState && planState.plan && planState.plan.ok)
+        ? planState.plan : null;
+      const bbox = plan && ((plan.subject && plan.subject.bbox) ||
+        (plan.subject_detection && plan.subject_detection.bbox));
+      let top = 0;
+      let bottom = Number(srcH) || 0;
+      if (bbox && bbox.length === 4) {
+        top = Number(bbox[1]) || 0;
+        bottom = Number(bbox[3]) || 0;
+      }
+      if (!(bottom > top)) { top = 0; bottom = Number(srcH) || 1; }
+      const h = bottom - top;
+      return {
+        head: [top, top + h * 0.22],
+        upper: [top + h * 0.18, top + h * 0.62],
+        lower: [top + h * 0.58, bottom],
+      };
+    }
+
+    // The tags automatic mode would give one tile: every card whose band the
+    // tile overlaps, with a little tolerance so a tile on a seam keeps both
+    // neighbours' tags.
+    function autoSets(index) {
+      const c = coords[index] || [0, 0, srcW || 1, srcH || 1];
+      const y0 = Number(c[1]) || 0;
+      const y1 = Number(c[3]) || 0;
+      const height = Math.max(1, y1 - y0);
+      const bands = autoBands();
+      const hits = (name) => {
+        const band = bands[name];
+        const overlap = Math.min(y1, band[1]) - Math.max(y0, band[0]);
+        return overlap > 0 && overlap / height >= BAND_MIN_OVERLAP;
+      };
+      const body = new Set();
+      const head = new Set();
+      for (const card of TILE_TAG_CARDS) {
+        if (!card.bands.some(hits)) continue;
+        const target = card.store === "head" ? head : body;
+        card.universe.forEach((tag) => target.add(tag));
+      }
+      return { body, head };
+    }
+
+    // The sets the editor shows for one tile: explicit when configured,
+    // otherwise the proportional defaults.
+    function tileTagSets(index) {
+      const entry = tileTags[String(index)] || {};
+      const auto = autoSets(index);
+      return {
+        body: entry.body ? new Set(entry.body) : auto.body,
+        head: entry.head ? new Set(entry.head) : auto.head,
+      };
+    }
+
+    // Whether a tile was hand-adjusted away from the proportional estimate.
+    // A written entry that equals auto is just a snapshot, not an override.
+    function tileIsCustomized(index) {
+      const entry = tileTags[String(index)];
+      if (!entry) return false;
+      const auto = autoSets(index);
+      const same = (list, set) => Array.isArray(list) && list.length === set.size
+        && list.every((tag) => set.has(tag));
+      return (entry.body ? !same(entry.body, auto.body) : false)
+        || (entry.head ? !same(entry.head, auto.head) : false);
+    }
+
+    function sortTiles(tiles) {
+      const out = {};
+      Object.keys(tiles).map(Number).filter(Number.isFinite).sort((a, b) => a - b)
+        .forEach((index) => { out[String(index)] = tiles[String(index)]; });
+      return out;
+    }
+
+    function writeTileTags() {
+      const payload = { _key: planAppliedKey, tiles: sortTiles(tileTags) };
+      const saved = setWidget(node, "tile_tags", JSON.stringify(payload));
+      if (tagWriteHint) {
+        tagWriteHint.style.display = saved ? "none" : "";
+        tagWriteHint.textContent = saved ? "" : ("Tag 没有写进节点（缺少 tile_tags 控件），"
+          + "这次勾选只在画面上，切图或刷新后会丢。");
+      }
+      if (!saved) console.error("[STLU] tile_tags widget missing", payload);
+      tileTagKey = planAppliedKey;
+      if (syncTileTagUi) syncTileTagUi();
+      drawCanvas();
+    }
+
+    // --- inline per-tile tag editor ---------------------------------------
+    // No popup: the thumbnail strip, the chips and the current tile's info all
+    // live in the quality card, so tags can be edited while looking at blocks.
+    // Tags the widget carries that the cards do not show (older v2 names, or a
+    // hand edit to the JSON).  They are invisible in the panel, so no chip
+    // click or group button is meant to remove them: always write them back.
+    function hiddenTags(index, group, universe) {
+      const entry = tileTags[String(index)];
+      const list = entry && Array.isArray(entry[group]) ? entry[group] : [];
+      return list.filter((tag) => universe.indexOf(tag) < 0);
+    }
+
+    // One card's share of a stored group.  Four cards (hair / upper / lower /
+    // other) share the "body" group, so a card's add-all, clear and restore
+    // must walk its own tag list and leave the other cards' tags alone.
+    function cardTagChange(set, index, store, universe, mode) {
+      if (mode === "all") {
+        universe.forEach((tag) => set.add(tag));
+        return;
+      }
+      if (mode === "none") {
+        universe.forEach((tag) => set.delete(tag));
+        return;
+      }
+      const auto = autoSets(index)[store];
+      universe.forEach((tag) => {
+        if (auto.has(tag)) set.add(tag);
+        else set.delete(tag);
+      });
+    }
+
+    // Store one tile's choice, dropping the group (back to automatic) when it
+    // matches what automatic mode would give, so the widget stays small.
+    function storeTileTag(index, bodySet, headSet) {
+      const key = String(index);
+      const entry = {};
+      const auto = autoSets(index);
+      const body = TILE_TAG_BODY.filter((tag) => bodySet.has(tag))
+        .concat(hiddenTags(index, "body", TILE_TAG_BODY));
+      const bodyAuto = body.length === auto.body.size
+        && body.every((tag) => auto.body.has(tag));
+      if (!bodyAuto) entry.body = body;
+      const head = TILE_TAG_HEAD.filter((tag) => headSet.has(tag))
+        .concat(hiddenTags(index, "head", TILE_TAG_HEAD));
+      const headAuto = head.length === auto.head.size
+        && head.every((tag) => auto.head.has(tag));
+      if (!headAuto) entry.head = head;
+      if (entry.body || entry.head) tileTags[key] = entry;
+      else delete tileTags[key];
+    }
+
+    // Write out the proportional defaults for every tile.  Automatic mode is a
+    // preview otherwise: the backend's fallback only knows "top row keeps the
+    // head", so the panel would show tags the model never sees.
+    function autoFillAll() {
+      if (!total) return;
+      const next = {};
+      for (let i = 0; i < total; i++) {
+        const auto = autoSets(i);
+        const body = TILE_TAG_BODY.filter((tag) => auto.body.has(tag))
+          .concat(hiddenTags(i, "body", TILE_TAG_BODY));
+        const head = TILE_TAG_HEAD.filter((tag) => auto.head.has(tag))
+          .concat(hiddenTags(i, "head", TILE_TAG_HEAD));
+        next[String(i)] = { body, head };
+      }
+      tileTags = next;
+      writeTileTags();
+    }
+
+    function buildTileTagEditor(container) {
+      const sec = el("div");
+      sec.style.display = "flex";
+      sec.style.flexDirection = "column";
+      sec.style.gap = "6px";
+      sec.style.marginTop = "4px";
+      sec.style.paddingTop = "8px";
+      sec.style.borderTop = "1px solid #2d2d2f";
+
+      const titleRow = el("div", "stlu-line");
+      titleRow.appendChild(el("span", "stlu-sec2", "按块 Tag 白名单"));
+      titleRow.appendChild(el("span", "grow"));
+      const activeLabel = el("span", "stlu-hint", "");
+      titleRow.appendChild(activeLabel);
+      sec.appendChild(titleRow);
+
+      sec.appendChild(el("div", "stlu-hint",
+        "点缩略图选块：Shift 连选、Ctrl 加选；下面的 Tag 作用于所有选中的块，"
+        + "改完即时保存。紫边=选中，紫点=该块手动改过，虚线 Tag=部分块有。"
+        + "每块的默认值按它在人物身上的位置预估，点「一键自动」可一次填好全部块。"));
+
+      const pickRow = el("div", "stlu-line");
+      pickRow.style.flexWrap = "wrap";
+      // Every selection path funnels through here, so the anchor is always one
+      // of the selected tiles: a later Shift-range must start from a block the
+      // user can see, not from a stale one just outside the selection.
+      function applySelection(next, anchor) {
+        const clean = new Set();
+        for (const i of next || []) if (i >= 0 && i < total) clean.add(i);
+        if (!clean.size) clean.add(Math.max(0, Math.min(tagEditIndex, total - 1)));
+        if (anchor != null && clean.has(anchor)) tagEditIndex = anchor;
+        else if (!clean.has(tagEditIndex)) tagEditIndex = Math.min.apply(null, Array.from(clean));
+        tagEditSel = clean;
+        syncTileTagUi();
+        drawCanvas();
+      }
+      const pickAll = el("button", "stlu-mini", "全选块");
+      pickAll.title = "选中所有块";
+      pickAll.addEventListener("click", () => {
+        const all = [];
+        for (let i = 0; i < total; i++) all.push(i);
+        applySelection(all, tagEditIndex);
+      });
+      const pickTicked = el("button", "stlu-mini", "选勾选块");
+      pickTicked.title = "只选中上面勾了要跑的块";
+      pickTicked.addEventListener("click", () => {
+        if (!selected.size) return;
+        applySelection(Array.from(selected), tagEditIndex);
+      });
+      const pickOne = el("button", "stlu-mini", "只选当前块");
+      pickOne.title = "把选择缩回当前块";
+      pickOne.addEventListener("click", () => applySelection([tagEditIndex], tagEditIndex));
+      pickRow.appendChild(pickAll);
+      pickRow.appendChild(pickTicked);
+      pickRow.appendChild(pickOne);
+      sec.appendChild(pickRow);
+
+      const strip = el("div");
+      strip.style.display = "grid";
+      strip.style.gridTemplateColumns = "repeat(auto-fill, 54px)";
+      strip.style.gap = "4px";
+      sec.appendChild(strip);
+
+      const groups = el("div");
+      groups.style.display = "flex";
+      groups.style.flexDirection = "column";
+      groups.style.gap = "8px";
+      sec.appendChild(groups);
+
+      const batchRow = el("div", "stlu-line");
+      batchRow.style.flexWrap = "wrap";
+      const autoAll = el("button", "stlu-btn", "一键自动（按人体比例）");
+      autoAll.title = "按每块在人物身上的位置一次填好所有块，之后随便微调。"
+        + "再点一次会覆盖掉手动改动。";
+      autoAll.addEventListener("click", () => autoFillAll());
+      batchRow.appendChild(autoAll);
+      const allGroups = el("button", "stlu-btn", "所有组全选");
+      allGroups.title = "把每一组的所有 Tag 都勾上，只作用于当前选中的块；"
+        + "面板不显示的旧标签保持原样。";
+      allGroups.addEventListener("click", () => {
+        applyToTiles(selIndices(), (body, head) => {
+          TILE_TAG_BODY.forEach((tag) => body.add(tag));
+          TILE_TAG_HEAD.forEach((tag) => head.add(tag));
+        });
+      });
+      batchRow.appendChild(allGroups);
+      const noneGroups = el("button", "stlu-btn", "所有组全不选");
+      noneGroups.title = "把每一组都清空，只作用于当前选中的块；"
+        + "面板不显示的旧标签保持原样。";
+      noneGroups.addEventListener("click", () => {
+        applyToTiles(selIndices(), (body, head) => {
+          body.clear();
+          head.clear();
+        });
+      });
+      batchRow.appendChild(noneGroups);
+      sec.appendChild(batchRow);
+
+      const summary = el("div", "stlu-hint", "");
+      sec.appendChild(summary);
+      tagWriteHint = el("div", "stlu-hint error", "");
+      tagWriteHint.style.display = "none";
+      tagWriteHint.style.whiteSpace = "normal";
+      sec.appendChild(tagWriteHint);
+
+      // The tiles the editor writes to.  Sorted, so the widget JSON keeps a
+      // stable order and rebuilding the panel does not churn it.
+      function selIndices() {
+        const out = [];
+        for (const i of tagEditSel) if (i >= 0 && i < total) out.push(i);
+        out.sort((a, b) => a - b);
+        return out;
+      }
+
+      // Apply one change to a set of tiles.  Each tile re-reads its own sets
+      // first, so the group not being edited is never overwritten with the
+      // current tile's choice.
+      function applyToTiles(sel, mutate) {
+        if (!sel.length) return;
+        for (const i of sel) {
+          const sets = tileTagSets(i);
+          const body = new Set(sets.body);
+          const head = new Set(sets.head);
+          mutate(body, head, i);
+          storeTileTag(i, body, head);
+        }
+        writeTileTags();
+      }
+
+      function groupBlock(card) {
+        const store = card.store;
+        const universe = card.universe;
+        const sel = selIndices();
+        const box = el("div");
+        box.style.display = "flex";
+        box.style.flexDirection = "column";
+        box.style.gap = "4px";
+        const row = el("div", "stlu-line");
+        row.style.flexWrap = "wrap";
+        row.appendChild(el("span", "stlu-sec2", card.label));
+        row.appendChild(el("span", "grow"));
+        const chips = el("div", "stlu-chips");
+        // How many of the selected tiles carry a tag: 0 / some / all.  The
+        // chips show it as off / dashed / on so a mixed selection is visible.
+        const countOf = (tag) => sel.reduce((n, i) =>
+          n + (tileTagSets(i)[store].has(tag) ? 1 : 0), 0);
+        // Apply one change to every selected tile, touching only this group.
+        const apply = (mutate) => {
+          applyToTiles(sel, (body, head, i) => {
+            mutate(store === "body" ? body : head, i);
+          });
+        };
+        const redraw = () => {
+          for (const chip of chips.children) {
+            const n = countOf(chip.dataset.tag);
+            chip.classList.toggle("on", n === sel.length && n > 0);
+            chip.classList.toggle("part", n > 0 && n < sel.length);
+          }
+        };
+        for (const tag of universe) {
+          const chip = el("button", "stlu-chip", tag);
+          chip.dataset.tag = tag;
+          chip.addEventListener("click", () => {
+            // Partially present -> fill in; fully present -> clear.
+            const turnOn = countOf(tag) < sel.length;
+            apply((set) => { if (turnOn) set.add(tag); else set.delete(tag); });
+          });
+          chips.appendChild(chip);
+        }
+        const allBtn = el("button", "stlu-mini", "本组全选");
+        allBtn.title = "把这一类的 Tag 全部勾上，只作用于当前选中的块；"
+          + "同一行里的其他卡片、面板不显示的旧标签都保持原样。";
+        allBtn.addEventListener("click", () => {
+          apply((set, i) => cardTagChange(set, i, store, universe, "all"));
+        });
+        const noneBtn = el("button", "stlu-mini", "本组全不选");
+        noneBtn.title = "只清掉这一类的 Tag，只作用于当前选中的块；"
+          + "同一行里的其他卡片、面板不显示的旧标签都保持原样。";
+        noneBtn.addEventListener("click", () => {
+          apply((set, i) => cardTagChange(set, i, store, universe, "none"));
+        });
+        const autoBtn = el("button", "stlu-mini", "恢复自动");
+        autoBtn.title = "只把这一类的 Tag 恢复成按身体位置的自动值，"
+          + "同一行里的其他卡片保持原样（和「一键自动」同一套规则）。";
+        autoBtn.addEventListener("click", () => {
+          apply((set, i) => cardTagChange(set, i, store, universe, "auto"));
+        });
+        row.appendChild(allBtn);
+        row.appendChild(noneBtn);
+        row.appendChild(autoBtn);
+        box.appendChild(row);
+        box.appendChild(chips);
+        redraw();
+        return box;
+      }
+
+      function renderStrip() {
+        strip.innerHTML = "";
+        if (!total) {
+          strip.appendChild(el("div", "stlu-hint",
+            "还没有块：先在上面设置分块（或等左侧图片载入），缩略图会出现在这里。"));
+          return;
+        }
+        if (tagEditIndex >= total) tagEditIndex = total - 1;
+        coords.forEach((c, i) => {
+          const cell = el("div", "stlu-tcell"
+            + (tagEditSel.has(i) ? " tagsel" : "")
+            + (i === tagEditIndex ? " taganchor" : ""));
+          const cw = Math.max(1, c[2] - c[0]);
+          const ch = Math.max(1, c[3] - c[1]);
+          const size = 54;
+          const scaleX = size / cw;
+          const scaleY = size / ch;
+          const customTag = tileIsCustomized(i);
+          cell.title = "第 " + i + " 块 · x" + c[0] + " y" + c[1] + " " + cw + "×" + ch
+            + (customTag ? " · 已单独配置" : "")
+            + " · 点击选择，Shift 连选，Ctrl 加选";
+          if (imageUrl) {
+            cell.style.backgroundImage = 'url("' + imageUrl + '")';
+            cell.style.backgroundSize = (srcW * scaleX) + "px " + (srcH * scaleY) + "px";
+            cell.style.backgroundPosition = (-c[0] * scaleX) + "px " + (-c[1] * scaleY) + "px";
+          }
+          cell.appendChild(el("span", null, String(i)));
+          if (customTag) cell.appendChild(el("i", "tagdot"));
+          cell.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const anchor = Math.max(0, Math.min(tagEditIndex, total - 1));
+            if (event.shiftKey) {
+              const lo = Math.min(anchor, i);
+              const hi = Math.max(anchor, i);
+              const range = [];
+              for (let k = lo; k <= hi; k++) range.push(k);
+              applySelection(range, anchor);
+              return;
+            }
+            if (event.ctrlKey || event.metaKey) {
+              const next = new Set(tagEditSel);
+              if (next.has(i) && next.size > 1) next.delete(i);
+              else next.add(i);
+              applySelection(Array.from(next), i);
+              return;
+            }
+            applySelection([i], i);
+          });
+          strip.appendChild(cell);
+        });
+      }
+
+      function renderGroups() {
+        groups.innerHTML = "";
+        if (!total) {
+          groups.appendChild(el("div", "stlu-hint", "先在上面设置分块，再按块配置 Tag。"));
+          return;
+        }
+        for (const card of TILE_TAG_CARDS) groups.appendChild(groupBlock(card));
+      }
+
+      let stripSig = null;
+      let groupsSig = null;
+
+      function refresh() {
+        // The panel polls once a second; rebuilding the strip and the chips on
+        // every tick would flicker and steal clicks, so redraw only on change.
+        // Drop selections the current plan no longer has before signing them.
+        if (total) {
+          if (tagEditIndex >= total) tagEditIndex = total - 1;
+          for (const i of Array.from(tagEditSel)) if (i >= total) tagEditSel.delete(i);
+          if (!tagEditSel.size) tagEditSel.add(Math.max(0, tagEditIndex));
+          // The anchor must stay inside the selection; Shift ranges start
+          // from it, so a stale anchor would add blocks the user cannot see.
+          if (!tagEditSel.has(tagEditIndex)) {
+            tagEditIndex = Math.min.apply(null, Array.from(tagEditSel));
+          }
+        }
+        const selSig = selIndices().join(",");
+        const configSig = JSON.stringify(tileTags);
+        // Auto values follow the subject box; when the strip plan lands (or a
+        // new image changes it) the chips must redraw even if tileTags did not.
+        const bandSig = JSON.stringify(autoBands());
+        const nextStrip = [selSig, tagEditIndex, total, srcW, srcH, imageUrl,
+          JSON.stringify(coords), configSig, bandSig].join("|");
+        if (nextStrip !== stripSig) {
+          stripSig = nextStrip;
+          renderStrip();
+        }
+        // The card buttons capture the selected indexes when they are built, so
+        // a changed grid (total/coords) must rebuild them even when the
+        // selection string looks the same.
+        const nextGroups = [selSig, tagEditIndex, total, JSON.stringify(coords),
+            bandSig, JSON.stringify(tileTags)].join("|");
+        if (nextGroups !== groupsSig) {
+          groupsSig = nextGroups;
+          renderGroups();
+        }
+        const sel = selIndices();
+        const c = coords[tagEditIndex] || [0, 0, 0, 0];
+        activeLabel.textContent = !total ? "" : (sel.length > 1
+          ? "已选 " + sel.length + " 块 · 以第 " + tagEditIndex + " 块为锚点"
+          : "第 " + tagEditIndex + " 块 · x" + c[0] + " y" + c[1] + " "
+            + (c[2] - c[0]) + "×" + (c[3] - c[1]));
+        let count = 0;
+        for (let i = 0; i < total; i++) if (tileIsCustomized(i)) count += 1;
+        summary.className = "stlu-hint" + (count ? " ok" : "");
+        summary.textContent = count
+          ? "有 " + count + " 块手调过（其余块按人体比例自动）。改动会即时保存到节点。"
+          : "全部按人体比例自动；点「一键自动」把预估写进所有块，之后可微调。";
+      }
+
+      syncTileTagUi = refresh;
+      refresh();
+      container.appendChild(sec);
+      return sec;
+    }
+
     function addCustomWindow(cx, cy) {
       const limit = Math.max(CUSTOM_MIN, Math.min(srcW || CUSTOM_MIN, srcH || CUSTOM_MIN));
       let size = Math.round((lastCustomSize || 1024) / CUSTOM_STEP) * CUSTOM_STEP;
@@ -3656,7 +3002,7 @@
       return {
         overlap: Math.max(0, Number(widgetValue(node, "overlap", 128)) || 0),
         max_side: Math.max(512, Number(widgetValue(node, "strip_max_side", 2048)) || 2048),
-        resolution: Math.max(512, Number(widgetValue(node, "resolution", 512)) || 512),
+        resolution: Math.max(512, Number(widgetValue(node, "resolution", 1024)) || 1024),
         margin: Math.max(0, Number(widgetValue(node, "strip_margin", 32)) || 0),
       };
     }
@@ -3727,6 +3073,9 @@
       selectionHint.textContent = empty
         ? "未勾选任何" + unit + "：Queue 会在这里停下。点「全选」或点格子/画面勾选。"
         : "";
+      // Selection drives the "apply to picked N tiles" button and the tag
+      // editor's thumbnail strip, so keep it in step with every toggle.
+      if (syncTileTagUi) syncTileTagUi();
     }
 
     function showPlan(plan) {
@@ -3824,82 +3173,30 @@
         });
     }
 
-    // --- cache compatibility hint ----------------------------------------
-    // The backend owns the real check; this mirrors the non-model part so a
-    // changed setting is visible before Queue.  Model changes are caught by
-    // the stlu.cache_reset event during execution.
-    const GEN_LABELS = {
-      source: "原图",
-      source_size: "原图尺寸",
-      tile_size: "块尺寸",
-      overlap: "重叠",
-      offset: "网格偏移",
-      resolution: "分辨率",
-      num_inference_steps: "步数",
-      depth_resolution: "深度分辨率",
-      random_seed: "种子",
-      tblr_split: "左右拆分",
-      use_lama: "LaMa",
-      alpha_threshold: "透明阈值",
-      context_pad: "块外上下文",
-      guide: "引导参数",
-      layerdiff_model: "拆层模型",
-      depth_model: "深度模型",
-      partition: "分区方式",
-      plan_id: "分区位置",
+    // --- folder reuse hint -----------------------------------------------
+    // The folder is the cache: finished tiles are reused as they are, whatever
+    // the diffusion settings were, and only the ticked tiles run.  The one
+    // exception is structural -- another partition type, another source image
+    // or moved boxes -- where the tiles could not sit in this run's boxes; the
+    // backend then clears the whole folder before running and emits
+    // stlu.cache_reset.  These hints only mirror that rule, the backend owns
+    // the real check.
+    const MODE_LABELS = {
+      uniform: "均匀网格",
+      uniform_fallback: "均匀网格（分区退回）",
+      subject_strips: "方形全宽分区",
+      custom_regions: "自定义分区",
     };
 
-    function currentGeneration() {
-      const gen = {
-        version: 1,
-        source_size: [srcW, srcH],
-        tile_size: [
-          Math.max(64, Number(widgetValue(node, "tile_width", 1024)) || 1024),
-          Math.max(64, Number(widgetValue(node, "tile_height", 1024)) || 1024),
-        ],
-        overlap: Math.max(0, Number(widgetValue(node, "overlap", 128)) || 0),
-        resolution: Number(widgetValue(node, "resolution", 512)),
-        num_inference_steps: Number(widgetValue(node, "num_inference_steps", 30)),
-        depth_resolution: Number(widgetValue(node, "depth_resolution", -1)),
-        random_seed: Number(widgetValue(node, "random_seed", 0)),
-        tblr_split: !!widgetValue(node, "tblr_split", true),
-        use_lama: !!widgetValue(node, "use_lama", true),
-        alpha_threshold: Number(widgetValue(node, "alpha_threshold", 8)),
-        context_pad: Math.max(0, Number(widgetValue(node, "context_pad", 0)) || 0),
-        guide: {
-          // The simple node has no guide widgets; the backend fills in the
-          // shared defaults, so these fallbacks must be those defaults.
-          enabled: !!widgetValue(node, "guide_context", true),
-          feather: Math.max(0, Number(widgetValue(node, "guide_feather", 32)) || 0),
-          strength: Math.min(100, Math.max(0, Number(widgetValue(node, "guide_strength", 40)) || 0)),
-          tolerance: Math.min(255, Math.max(0, Number(widgetValue(node, "guide_tolerance", 16)) || 0)),
-        },
-      };
-      // Mirrors the backend: the key is absent at 0, so a folder written by
-      // the previous version is not reported as a mismatch.
-      const ox = Math.max(0, Number(widgetValue(node, "grid_offset_x", 0)) || 0);
-      const oy = Math.max(0, Number(widgetValue(node, "grid_offset_y", 0)) || 0);
-      if (ox || oy) gen.offset = [ox, oy];
-      return gen;
+    function modeFamily(mode) {
+      const name = String(mode || "uniform");
+      return name === "uniform_fallback" ? "uniform" : name;
     }
 
-    function genDeepEqual(a, b) {
-      if (a === b) return true;
-      if (Array.isArray(a) || Array.isArray(b)) {
-        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-        for (let i = 0; i < a.length; i++) if (!genDeepEqual(a[i], b[i])) return false;
-        return true;
-      }
-      if (a && b && typeof a === "object" && typeof b === "object") {
-        const ka = Object.keys(a);
-        const kb = Object.keys(b);
-        if (ka.length !== kb.length) return false;
-        for (const k of ka) {
-          if (!Object.prototype.hasOwnProperty.call(b, k) || !genDeepEqual(a[k], b[k])) return false;
-        }
-        return true;
-      }
-      return false;
+    function currentMode() {
+      if (isStripsMode()) return "subject_strips";
+      if (isCustomMode()) return "custom_regions";
+      return "uniform";
     }
 
     function outputDirRel() {
@@ -3934,10 +3231,8 @@
     async function refreshCacheHint() {
       if (!isPipeline) return;
       if (isStripsMode()) {
-        // Strip plans are compared by the backend's generation/plan_id.  The
-        // panel only needs to warn that a mode or plan change clears the
-        // folder and that only checked strips run; a full JS mirror of the
-        // plan object would report false diffs while the CPU route is loading.
+        // The strip plan is computed by the backend; the panel only states the
+        // reuse rule.  Two identical partition types never clear anything.
         const plan = planState && planState.plan;
         lastCacheKey = "";
         if (!plan) {
@@ -3945,24 +3240,21 @@
           return;
         }
         // planInfo/planWarnings already carry the plan and its error.  This
-        // line only states the reset/selection rule, so nothing is repeated
+        // line only states the selection rule, so nothing is repeated
         // and an empty selection stays a single red selectionHint.
         if (!plan.ok) {
           showCacheHint(
             "方形全宽分区未生效：Queue 会按均匀网格运行；" +
-            "修改分区参数会清空该目录。", "warn");
+            "这属于换分区方式，会清空该目录。", "warn");
           return;
         }
         const count = (plan.regions || []).length;
         showCacheHint(
           "方形全宽分区：自动计划 " + count + " 条。" +
-          "切换分区方式或修改分区参数会清空该目录，只重跑勾选的条。", "warn");
+          "修改分区参数只重跑勾选的条；换分区方式或换原图会清空该目录。", "warn");
         return;
       }
       if (isCustomMode()) {
-        // The backend compares the ordered window list in the fingerprint;
-        // the panel only needs to state the reset rule (a per-window resolution
-        // or an order change is not derivable from the tab's other widgets).
         lastCacheKey = "";
         if (!customRegions.length) {
           showCacheHint(
@@ -3971,75 +3263,72 @@
         }
         showCacheHint(
           "自定义分区：" + customRegions.length + " 个窗口，顺序 = 生成顺序。" +
-          "改位置/边长/分辨率/顺序会清空该目录，只重跑勾选的窗口。", "warn");
+          "改位置/边长/分辨率/顺序只重跑勾选的窗口；换分区方式或换原图会清空该目录。", "warn");
         return;
       }
-      const current = currentGeneration();
-      const dir = outputDirRel();
-      const key = dir + "|" + JSON.stringify(current);
+      const mode = currentMode();
+      const ox = Math.max(0, Number(widgetValue(node, "grid_offset_x", 0)) || 0);
+      const oy = Math.max(0, Number(widgetValue(node, "grid_offset_y", 0)) || 0);
+      const key = [outputDirRel(), mode, srcW, srcH,
+        widgetValue(node, "tile_width", 1024),
+        widgetValue(node, "tile_height", 1024),
+        widgetValue(node, "overlap", 128), ox, oy].join("|");
       if (key === lastCacheKey) return;
       lastCacheKey = key;
       let doc;
       try {
-        doc = await getJson("/stlu/tiles/manifest?dir=" + encodeURIComponent(dir));
+        doc = await getJson("/stlu/tiles/manifest?dir=" + encodeURIComponent(outputDirRel()));
       } catch (e) {
         // The manifest is written at the end of a run; keep the reset notice
         // visible while the folder is being regenerated.
         if (!showResetNotice()) showCacheHint("", "");
         return;
       }
-      const old = doc && doc.generation;
-      // A mismatch clears the folder first; an explicit tile selection only
-      // changes how much is regenerated, never whether the folder is reset.
-      const partial = selected.size > 0 && selected.size < total;
-      if (!old || typeof old !== "object") {
-        if (!showResetNotice()) {
-          showCacheHint(partial
-            ? "该目录是旧版结果（没有参数指纹）。Queue 会清空该目录，只重跑选中的 " + selected.size + " 块。"
-            : "该目录是旧版结果（没有参数指纹）。Queue 会清空并重跑全部块。", "warn");
-        }
+      if (!doc || !(Number(doc.count) > 0)) {
+        if (!showResetNotice()) showCacheHint("", "");
         return;
       }
-      const keys = new Set([...Object.keys(current), ...Object.keys(old)]);
-      const changed = Array.from(keys).filter((k) => {
-        // Seed / context padding are targeted re-runs: the backend keeps the
-        // folder and only regenerates the checked tiles.
-        if (k === "random_seed" || k === "context_pad") return false;
-        if (k === "source_size" && (!srcW || !srcH)) return false;
-        return !genDeepEqual(old[k], current[k]);
-      });
-      if (changed.length) {
-        const names = changed.map((k) => GEN_LABELS[k] || k).join("、");
-        showCacheHint(partial
-          ? "检测到生成参数已变：" + names + "。Queue 会清空该目录，只重跑选中的 " + selected.size + " 块。"
-          : "检测到生成参数已变：" + names + "。Queue 会清空该目录并重跑全部块。", "warn");
+      // Only structure matters: partition type, source size/image, block
+      // geometry.  Seeds, steps, models, partition parameters never clear.
+      const reasons = [];
+      const oldMode = modeFamily(doc.mode);
+      if (oldMode !== mode) {
+        reasons.push("分区方式不同（" + (MODE_LABELS[String(doc.mode || "uniform")] || doc.mode || "均匀网格") +
+          " -> " + (MODE_LABELS[mode] || mode) + "）");
+      }
+      const oldSource = Array.isArray(doc.source) ? doc.source : [];
+      if (srcW > 0 && srcH > 0 && oldSource.length >= 2 &&
+          (Number(oldSource[0]) !== srcW || Number(oldSource[1]) !== srcH)) {
+        reasons.push("原图尺寸不同");
+      }
+      const oldTiles = Array.isArray(doc.tile_size) ? doc.tile_size : [];
+      const newTiles = [Number(widgetValue(node, "tile_width", 1024)), Number(widgetValue(node, "tile_height", 1024))];
+      if (oldTiles.length >= 2 && newTiles[0] > 0 && newTiles[1] > 0 &&
+          (Number(oldTiles[0]) !== newTiles[0] || Number(oldTiles[1]) !== newTiles[1])) {
+        reasons.push("块尺寸不同");
+      }
+      if (doc.overlap !== undefined &&
+          Number(doc.overlap) !== Math.max(0, Number(widgetValue(node, "overlap", 128)) || 0)) {
+        reasons.push("重叠不同");
+      }
+      const oldOffset = Array.isArray(doc.offset) ? doc.offset : [0, 0];
+      if (Number(oldOffset[0] || 0) !== ox || Number(oldOffset[1] || 0) !== oy) {
+        reasons.push("网格偏移不同");
+      }
+      if (reasons.length) {
+        showCacheHint("检测到结构变化：" + reasons.join("、") +
+          "。Queue 会自动清空该目录并重新生成全部块。", "warn");
       } else {
-        const localChanged = ["random_seed", "context_pad"].filter((k) =>
-          old[k] !== undefined && !genDeepEqual(old[k], current[k]));
-        if (localChanged.length) {
-          const names = localChanged.map((k) => GEN_LABELS[k] || k).join("、");
-          showCacheHint(partial
-            ? names + "已变：Queue 不清空目录，只重跑选中的 " + selected.size +
-              " 块，未勾选的块保留旧结果。"
-            : names + "已变：Queue 不清空目录，重跑全部块并覆盖。", "warn");
-        } else {
-          showCacheHint("", "");
-        }
+        showCacheHint("", "");
       }
     }
 
     function showCacheReset(payload) {
       const rel = (payload && payload.rel) || outputDirRel();
-      const keys = (payload && payload.keys) || [];
-      const names = keys.map((k) => GEN_LABELS[k] || k).join("、");
+      const reason = (payload && payload.reason) || "结构变化";
       const tiles = payload && payload.tiles ? payload.tiles : 0;
-      if (payload && payload.partial) {
-        cacheResetNotice = "参数变化" + (names ? "（" + names + "）" : "") +
-          "：已清空 " + rel + "，只重跑选中的 " + tiles + " 块";
-      } else {
-        cacheResetNotice = "已清空 " + rel + "，正在重跑全部 " + tiles + " 块" +
-          (names ? "（参数变化：" + names + "）" : "");
-      }
+      cacheResetNotice = reason + "：已自动清空 " + rel +
+        "，正在重新生成全部 " + tiles + " 块";
       cacheResetAt = Date.now();
       showCacheHint(cacheResetNotice, "warn");
       lastCacheKey = "";
@@ -4172,6 +3461,21 @@
         return;
       }
       drawCustomOverlay();  // hides the overlay outside custom mode
+      const tagChip = (c, i) => {
+        // Only tiles hand-adjusted away from the proportional estimate get a
+        // chip; the automatic default is not worth marking on every tile.
+        if (!tileIsCustomized(i)) return;
+        const px = Math.max(12, Math.round(iw / 60));
+        const label = "Tag";
+        ctx.font = "600 " + px + "px system-ui,-apple-system,'Segoe UI',sans-serif";
+        const textW = ctx.measureText(label).width;
+        const bx = c[0] + lw * 2;
+        const by = c[3] - px * 2.2;
+        ctx.fillStyle = "rgba(96,64,160,.85)";
+        ctx.fillRect(bx, by, textW + px, px * 1.6);
+        ctx.fillStyle = "#eee6ff";
+        ctx.fillText(label, bx + px * 0.5, by + px * 1.22);
+      };
       const lw = Math.max(2, Math.round(iw / 500));
       const strips = isPipeline && isStripsMode();
       if (strips && planState && planState.plan && planState.plan.ok) {
@@ -4196,7 +3500,42 @@
         ctx.strokeStyle = on ? "#5b93f5" : "rgba(255,255,255,.55)";
         ctx.lineWidth = lw;
         ctx.strokeRect(c[0] + 0.5, c[1] + 0.5, c[2] - c[0] - 1, c[3] - c[1] - 1);
+        tagChip(c, i);
       });
+    }
+
+    // Identity of a strip plan for the per-tile Tag whitelist.  Only the
+    // geometry (plan_id is the planner's hash of coords/side/resolution)
+    // matters: the pre-run CPU plan, the executed plan and a page reload all
+    // describe the same tiles, so they must produce the same key or simply
+    // re-opening the workflow would wipe the tags.
+    function stripsGeomKey(key, planId) {
+      return planId ? "strips|" + planId : "strips|" + key + "|";
+    }
+
+    // Hand-edited tag whitelists belong to the artwork under a box, not to the
+    // plan id: when the grid is rebuilt (a parameter changed) carry each new
+    // tile's whitelist over from the old tile it covers most.  Tiles that were
+    // pure automatic carry nothing, so they keep following the estimate.
+    function migrateTileTags(oldBoxes, newBoxes, tags) {
+      const next = {};
+      if (!oldBoxes || !oldBoxes.length || !newBoxes || !newBoxes.length) return next;
+      newBoxes.forEach((box, index) => {
+        const area = Math.max(1, (box[2] - box[0]) * (box[3] - box[1]));
+        let best = -1;
+        let bestCover = 0;
+        oldBoxes.forEach((oldBox, oldIndex) => {
+          const cover = Math.min(1, overlapArea(box, oldBox) / area);
+          if (cover > bestCover + 1e-9) {
+            bestCover = cover;
+            best = oldIndex;
+          }
+        });
+        if (best < 0 || bestCover < 0.5) return;
+        const entry = tags[String(best)];
+        if (entry) next[String(index)] = entry;
+      });
+      return next;
     }
 
     function layout() {
@@ -4219,12 +3558,13 @@
       } else if (strips) {
         if (planState && planState.plan && planState.plan.ok) {
           nextCoords = planState.coords || [];
-          nextKey = "strips|" + planState.key + "|" + String(planState.plan.plan_id || "");
+          nextKey = stripsGeomKey(planState.key,
+            String(planState.plan.plan_id || ""));
           plan = planState.plan;
         } else {
           nextKey = "strips_pending|" + srcW + "|" + srcH + "|" + ov + "|" +
             Number(widgetValue(node, "strip_max_side", 2048)) + "|" +
-            Number(widgetValue(node, "resolution", 512)) + "|" +
+            Number(widgetValue(node, "resolution", 1024)) + "|" +
             Number(widgetValue(node, "strip_margin", 32));
         }
       }
@@ -4232,6 +3572,25 @@
       const oldSelected = new Set(selected);
       const oldTotal = total;
       const keyChanged = nextKey !== planAppliedKey;
+      // Per-tile tag whitelists follow the artwork, not the plan id: identical
+      // boxes keep them verbatim, a moved grid carries each one to the tile it
+      // best overlaps.  Only a genuinely new picture (no old boxes) falls back
+      // to the proportional estimate below.
+      // While a strip plan is still being computed there is no geometry to
+      // judge the tags against; never touch them on that transient key.
+      const planPending = strips && !(planState && planState.plan && planState.plan.ok);
+      if (!planPending && Object.keys(tileTags).length && tileTagKey !== nextKey) {
+        const sameBoxes = oldCoords.length === nextCoords.length
+          && oldCoords.every((box, i) => box[0] === nextCoords[i][0]
+            && box[1] === nextCoords[i][1] && box[2] === nextCoords[i][2]
+            && box[3] === nextCoords[i][3]);
+        tileTags = sameBoxes ? tileTags
+          : migrateTileTags(oldCoords, nextCoords, tileTags);
+        tileTagKey = nextKey;
+        setWidget(node, "tile_tags",
+          JSON.stringify({ _key: nextKey, tiles: sortTiles(tileTags) }));
+        if (syncTileTagUi) syncTileTagUi();
+      }
       total = nextCoords.length;
       const involvesStrips = strips || String(planAppliedKey).startsWith("strips");
       const involvesCustom = custom || String(planAppliedKey).startsWith("custom");
@@ -4258,6 +3617,13 @@
       }
       coords = nextCoords;
       planAppliedKey = nextKey;
+      if (!tileTagKey) tileTagKey = nextKey;
+      // A fresh geometry with no saved whitelist starts from the proportional
+      // estimate, written out: the backend only knows "top row keeps the head"
+      // and would otherwise disagree with what the chips show.
+      if (!planPending && total && !Object.keys(tileTags).length) {
+        autoFillAll();
+      }
       buildGrid();
       drawCanvas();
       updateCount();
@@ -4586,6 +3952,21 @@
         if (renderCustomList) renderCustomList();
         layout();
       });
+      // The per-tile Tag whitelist is a JSON widget on the node, so a reloaded
+      // workflow (or another panel) can replace it under us.
+      watchValue(node, "tile_tags", () => {
+        const parsed = readTileTagsFromWidget();
+        if (parsed.key === tileTagKey && JSON.stringify(parsed.tiles) === JSON.stringify(tileTags)) return;
+        tileTags = parsed.tiles;
+        tileTagKey = parsed.key || planAppliedKey;
+        if (syncTileTagUi) syncTileTagUi();
+        drawCanvas();
+      });
+    }
+    {
+      const initial = readTileTagsFromWidget();
+      tileTags = initial.tiles;
+      tileTagKey = initial.key;
     }
     bindParamWatchers();
     if (selectWidget) {
@@ -4699,7 +4080,7 @@
       const modeHint = hint(
         "「方形全宽分区」会忽略块宽/块高/偏移和点图对齐；区域最大边是目标值，"
         + "主体更宽时会自动放大到覆盖全宽，不会竖直切开。"
-        + "「自定义分区」由你在画面上摆放正方形窗口。切换模式会清空输出目录。");
+        + "「自定义分区」由你在画面上摆放正方形窗口。切换模式不会清空输出目录。");
 
       const cut = card("切格");
       const tileRow = line(cut, [
@@ -4788,7 +4169,7 @@
       customCard.appendChild(customList);
       const customHint = hint(
         "自定义窗口顺序 = 生成顺序；后面的窗口会看到前面窗口在重叠区的结果。"
-        + "改位置/边长/分辨率/顺序会清空该目录，只重跑勾选的窗口。"
+        + "改位置/边长/分辨率/顺序不会清空该目录，只重跑勾选的窗口。"
         + "分辨率「跟随全局」使用「拆层质量」里的「分辨率」，每个窗口可单独覆盖。");
 
       function updateCustomField(index, patch) {
@@ -4956,25 +4337,74 @@
         importRow.style.display = "none";
       });
 
-      const quality = card("拆层质量");
+      const quality = card("拆层质量 · " + STLU_BUILD);
       line(quality, [
-        { label: "分辨率", name: "resolution", fallback: 512 },
+        { label: "分辨率", name: "resolution", fallback: 1024 },
         { label: "步数", name: "num_inference_steps", fallback: 30 },
       ]);
       line(quality, [{ label: "深度分辨率（-1=跟随）", name: "depth_resolution", fallback: -1 }]);
+      const randomSeed = () => Math.floor(Math.random() * 0xffffffff);
       const seedRow = el("div", "stlu-line");
-      seedRow.appendChild(el("span", "stlu-label", "种子"));
-      const seedInput = makeInput({ label: "种子", name: "random_seed", fallback: 0 });
+      seedRow.appendChild(el("span", "stlu-label", "拆层种子"));
+      const seedInput = makeInput({ label: "拆层种子", name: "random_seed", fallback: 0 });
       seedRow.appendChild(seedInput);
       const seedBtn = el("button", "stlu-btn", "随机");
       seedBtn.addEventListener("click", () => {
-        const value = Math.floor(Math.random() * 0xffffffff);
+        const value = randomSeed();
         setWidget(node, "random_seed", value);
         seedInput.value = String(value);
       });
       seedRow.appendChild(seedBtn);
       quality.appendChild(seedRow);
+
+      // The depth pass estimates depth on the layers, so its own seed only
+      // changes occlusion / front-back order; -1 follows the layer seed.
+      const depthRow = el("div", "stlu-line");
+      depthRow.appendChild(el("span", "stlu-label", "深度种子"));
+      const depthInput = makeInput({
+        label: "深度种子（-1 = 跟随拆层种子）",
+        name: "depth_random_seed",
+        fallback: DEPTH_SEED_FOLLOW,
+      });
+      depthInput.title = "深度是在拆层结果上估的，换种子只影响遮挡/前后关系，"
+        + "不影响拆出的部件；-1 = 跟随拆层种子。";
+      depthRow.appendChild(depthInput);
+      const depthBtn = el("button", "stlu-btn", "随机");
+      depthBtn.addEventListener("click", () => {
+        const value = randomSeed();
+        setWidget(node, "depth_random_seed", value);
+        depthInput.value = String(value);
+      });
+      depthRow.appendChild(depthBtn);
+      const bothBtn = el("button", "stlu-btn", "双随机");
+      bothBtn.title = "两个种子各换一个新值。";
+      bothBtn.addEventListener("click", () => {
+        const layer = randomSeed();
+        let depth = randomSeed();
+        if (depth === layer) depth = (depth + 1) % 0xffffffff;
+        setWidget(node, "random_seed", layer);
+        setWidget(node, "depth_random_seed", depth);
+        seedInput.value = String(layer);
+        depthInput.value = String(depth);
+      });
+      depthRow.appendChild(bothBtn);
+      quality.appendChild(depthRow);
       line(quality, [{ label: "透明阈值", name: "alpha_threshold", fallback: 8 }]);
+      // Always present in the pipeline panel: if the running server is older
+      // than the head_scope/tile_tags widgets the strip still shows up, which
+      // makes "nothing rendered" impossible to confuse with "tags are gone".
+      // Its own card so the entry is obvious, and a thrown error is shown
+      // in the panel instead of silently eating the rest of the controls.
+      const tagCard = card("每块 Tag 白名单");
+      try {
+        buildTileTagEditor(tagCard);
+      } catch (err) {
+        console.error("[STLU] tag editor failed", err);
+        const box = hint("按块 Tag 编辑器加载失败：" + (err && err.message ? err.message : err)
+          + " —— 先 Ctrl+F5 强刷页面；仍在的话把这一行发给我。");
+        box.className = "stlu-hint error";
+        tagCard.appendChild(box);
+      }
       const qualityHint = hint(
         "「分辨率」是模型推理分辨率，三种分区都用它：均匀网格直接按块裁到该分辨率，"
         + "方形分区按它推理（分区摘要里显示实际值），自定义窗口「跟随全局」也用它。"
@@ -4988,14 +4418,13 @@
       check(postRow, "用 LaMa 去背景", "use_lama", true);
       post.appendChild(postRow);
 
-      // Only the full node exposes the sequential-guide knobs; the simple node
-      // runs the same four-step pipeline without STLU_GuidedLayers, so showing
-      // them there would be dead controls.
+      // Sequential guide knobs: hidden unless the graph feeds ②
+      // STLU_GuidedLayers, where they are actually read.
       if (widgetOf(node, "guide_context")) {
         const guide = card("分块引导（只影响生成）");
         const guideRow = el("div", "stlu-line");
         guideRow.style.flexWrap = "wrap";
-        check(guideRow, "用已生成相邻块的重叠区做引导", "guide_context", true,
+        check(guideRow, "用已生成相邻块的重叠区做引导", "guide_context", false,
           "顺序逐块生成时，把先完成的相邻块在重叠区的像素回填到当前块再拆层；"
           + "只有「引导版」工作流会读取，普通四步流水线忽略。");
         guide.appendChild(guideRow);
@@ -5054,8 +4483,8 @@
           clearCacheResetNotice();
           lastCacheKey = "";
           showCacheHint("已清空 " + (data.dir || dir) + "（" +
-            (data.removed || 0) + " 个文件，锁定快照保留）。"
-            + "Queue 会重新生成勾选的块，锁定的图会找回。", "");
+            (data.removed || 0) + " 个文件）。"
+            + "Queue 会重新生成勾选的块。", "");
           refreshCacheHint();
         } catch (e) {
           showCacheHint("清空失败：" + (e && e.message ? e.message : e), "error");
@@ -5065,6 +4494,225 @@
       });
       clearRow.appendChild(clearBtn);
       output.appendChild(clearRow);
+
+      // -------------------------------------------------------------------
+      // 输入存档：面板上的每个参数（分区方式、几何、Tag、头块、质量、后处理、
+      // 输出与合并）加上游图片文件名，一起存进输出文件夹里的 stlu_inputs.json。
+      // 换到那个文件夹时自动读回来覆盖当前输入，省得每张图重调一遍。
+      // -------------------------------------------------------------------
+      const presetCard = card("输入存档");
+      const presetHint = el("div", "stlu-hint");
+      presetHint.style.whiteSpace = "normal";
+      presetHint.style.wordBreak = "break-all";
+      presetCard.appendChild(presetHint);
+
+      const autoRow = el("div", "stlu-line");
+      const autoCb = document.createElement("input");
+      autoCb.type = "checkbox";
+      autoCb.checked = true;
+      const autoLabel = el("label", "stlu-check");
+      autoLabel.title = "改动参数约 1 秒后自动写进输出文件夹的 stlu_inputs.json；"
+        + "换到别的输出文件夹时自动把它读回来覆盖当前输入。"
+        + "关掉后只能用下面的按钮手动存取。";
+      autoLabel.appendChild(autoCb);
+      autoLabel.appendChild(el("span", null, "自动保存 / 自动读取"));
+      autoRow.appendChild(autoLabel);
+      presetCard.appendChild(autoRow);
+
+      const presetButtons = el("div", "stlu-line");
+      presetButtons.style.flexWrap = "wrap";
+      const saveNow = el("button", "stlu-btn", "保存到此文件夹");
+      saveNow.title = "把当前全部输入写进当前输出文件夹的 stlu_inputs.json";
+      const loadNow = el("button", "stlu-btn", "读取此文件夹");
+      loadNow.title = "用当前输出文件夹里的 stlu_inputs.json 覆盖面板输入";
+      const saveAs = el("button", "stlu-btn", "另存到…");
+      saveAs.title = "选一个文件夹，把当前输入存成那里的 stlu_inputs.json";
+      const importBtn = el("button", "stlu-btn", "导入 JSON…");
+      importBtn.title = "从 output 下任意一个 JSON 存档导入输入";
+      presetButtons.appendChild(saveNow);
+      presetButtons.appendChild(loadNow);
+      presetButtons.appendChild(saveAs);
+      presetButtons.appendChild(importBtn);
+      presetCard.appendChild(presetButtons);
+
+      function collectPreset() {
+        const widgets = {};
+        for (const w of node.widgets || []) {
+          if (!w || !w.name || w.name === "control_after_generate") continue;
+          widgets[w.name] = w.value;
+        }
+        const upstream = findUpstreamImageNode(node);
+        return {
+          version: 1,
+          app: "ComfyUI-SeeThrough-TileFlow",
+          type: node.type || "",
+          saved_at: new Date().toISOString(),
+          // 只记文件名（含子文件夹），换工作流时选回同一张图。
+          image: upstream ? imagePathOf(upstream) : "",
+          widgets,
+        };
+      }
+
+      function applyPreset(doc, source) {
+        if (!doc || typeof doc !== "object") throw new Error("存档格式不对");
+        const widgets = (doc.widgets && typeof doc.widgets === "object")
+          ? doc.widgets : doc;
+        let applied = 0;
+        for (const name of Object.keys(widgets)) {
+          if (name === "control_after_generate" || name.charAt(0) === "_") continue;
+          // 输出位置由「读的是哪个文件夹」决定：存档不覆盖 out_dir/group，
+          // 否则复制过的存档会把面板带到别的目录，来回自动读取。
+          if (name === "out_dir" || name === "group") continue;
+          if (setWidget(node, name, widgets[name])) applied++;
+        }
+        if (!applied) throw new Error("存档里没有能应用的参数");
+        if (doc.image) {
+          let target = findUpstreamImageNode(node);
+          if (!target || !widgetOf(target, "image")) {
+            target = allNodes().find((n) => widgetOf(n, "image")) || null;
+          }
+          if (target) setWidget(target, "image", doc.image);
+        }
+        // 派生状态全部从 widget 重建：分区计划、自定义窗口、按块 Tag。
+        planState = null;
+        planAppliedKey = "";
+        customRegions = readCustomRegionsFromWidget();
+        tileTags = readTileTagsFromWidget().tiles;
+        tagEditIndex = 0;
+        tagEditSel = new Set([0]);
+        if (pipelineControls) pipelineControls.sync();
+        loadSource();
+        if (syncTileTagUi) syncTileTagUi();
+        presetAppliedAt = Date.now();
+        if (source) setPresetHint(source, "ok");
+      }
+
+      let presetDir = widgetOf(node, "out_dir") ? outputDirRel() : "";
+      let presetInit = true;
+      let presetSavedSig = "";
+      let presetTimer = null;
+      let presetBusy = false;
+      let presetAppliedAt = 0;
+
+      function presetSig() {
+        const doc = collectPreset();
+        return JSON.stringify(doc.widgets) + "|" + doc.image;
+      }
+
+      function presetPathLabel(dir) {
+        return "output/" + (dir ? dir + "/" : "") + "stlu_inputs.json";
+      }
+
+      function setPresetHint(text, kind) {
+        presetHint.className = "stlu-hint" + (kind ? " " + kind : "");
+        presetHint.textContent = text || "";
+      }
+
+      async function loadPresetFromDir(dir) {
+        presetBusy = true;
+        try {
+          const data = await getJson("/stlu/preset?dir=" + encodeURIComponent(dir || ""));
+          if (!data.found) {
+            // 新文件夹还没有存档：把当前输入当作它的起点，稍后写进去。
+            presetSavedSig = "";
+            setPresetHint("此文件夹还没有存档；当前输入会自动存到 "
+              + presetPathLabel(dir) + "。", "");
+            return false;
+          }
+          applyPreset(data.data, "已从 " + (data.path || presetPathLabel(dir)) + " 读回输入。");
+          presetSavedSig = presetSig();
+          if (data.mtime) {
+            setPresetHint("已从 " + (data.path || presetPathLabel(dir)) + " 读回输入（"
+              + new Date(data.mtime * 1000).toLocaleString() + "）。", "ok");
+          }
+          return true;
+        } catch (e) {
+          setPresetHint("读取失败：" + (e && e.message ? e.message : e), "error");
+          return false;
+        } finally {
+          presetBusy = false;
+        }
+      }
+
+      async function savePresetToDir(dir) {
+        if (!dir) {
+          setPresetHint("先在上面设置「输出根目录」，存档默认放在那里。", "warn");
+          return false;
+        }
+        try {
+          const data = await postJson("/stlu/preset", { dir, data: collectPreset() });
+          // 只有写回当前目录才算「当前输入已保存」；另存到别处不影响自动保存。
+          if (dir === (widgetOf(node, "out_dir") ? outputDirRel() : "")) {
+            presetSavedSig = presetSig();
+          }
+          setPresetHint("已保存到 " + (data.path || presetPathLabel(dir)) + "。", "ok");
+          return true;
+        } catch (e) {
+          setPresetHint("保存失败：" + (e && e.message ? e.message : e), "error");
+          return false;
+        }
+      }
+
+      // 每秒由外层轮询调用：目录变了先读回存档；有改动就防抖保存。
+      function pollPreset() {
+        if (!autoCb.checked) return;
+        const dir = widgetOf(node, "out_dir") ? outputDirRel() : "";
+        if (presetInit) {
+          // 第一次见到这个目录：先读存档，绝不先写——否则会拿当前面板
+          // 的默认值覆盖用户上次存的输入。
+          presetInit = false;
+          presetDir = dir;
+          if (dir && !presetBusy) { loadPresetFromDir(dir); return; }
+        }
+        if (dir !== presetDir) {
+          presetDir = dir;
+          clearTimeout(presetTimer);
+          if (dir && !presetBusy) { loadPresetFromDir(dir); return; }
+        }
+        if (presetBusy || !dir || Date.now() - presetAppliedAt < 1500) return;
+        const sig = presetSig();
+        if (sig === presetSavedSig) return;
+        clearTimeout(presetTimer);
+        presetTimer = setTimeout(() => {
+          if (!autoCb.checked || presetBusy) return;
+          const now = widgetOf(node, "out_dir") ? outputDirRel() : "";
+          if (now) savePresetToDir(now);
+        }, 1200);
+      }
+
+      saveNow.addEventListener("click", () => savePresetToDir(
+        widgetOf(node, "out_dir") ? outputDirRel() : ""));
+      loadNow.addEventListener("click", () => loadPresetFromDir(
+        widgetOf(node, "out_dir") ? outputDirRel() : ""));
+      saveAs.addEventListener("click", () => {
+        openPicker({
+          title: "把输入存档存到哪个文件夹",
+          mode: "folder",
+          scopes: [{ scope: "output", label: "输出目录" }],
+          start: String(widgetValue(node, "out_dir", "") || ""),
+          onPick: (rel) => { savePresetToDir(rel || ""); },
+        });
+      });
+      importBtn.addEventListener("click", () => {
+        openPicker({
+          title: "导入输入存档（JSON）",
+          mode: "json",
+          scopes: [{ scope: "output", label: "输出目录" }],
+          start: String(widgetValue(node, "out_dir", "") || ""),
+          onPick: async (rel) => {
+            try {
+              const data = await getJson(
+                "/stlu/preset_file?path=" + encodeURIComponent(rel));
+              applyPreset(data.data, "已从 " + (data.path || rel) + " 导入输入。");
+            } catch (e) {
+              setPresetHint("导入失败：" + (e && e.message ? e.message : e), "error");
+            }
+          },
+        });
+      });
+      setPresetHint(presetDir
+        ? "参数会自动存进 " + presetPathLabel(presetDir) + "；换输出文件夹时自动读回。"
+        : "设置「输出根目录」后，参数会自动存进那个文件夹，换文件夹时自动读回。", "");
 
       function updateOut() {
         outLine.textContent = "→ " + wavePreview(node) +
@@ -5165,7 +4813,7 @@
         updateOut();
       }
       sync();
-      return { sync, applyMode, modeCard };
+      return { sync, applyMode, modeCard, pollPreset };
     }
 
     const dom = addDOM(node, "stlu_tile_grid_card", root,
@@ -5212,6 +4860,12 @@
       bindParamWatchers();
       bindWatch(true);
       refreshCacheHint();
+      // Cheap no-op when nothing changed (refresh diffs its own signatures),
+      // but keeps the tag strip in sync with coords/total even if some path
+      // forgets to call updateCount().
+      if (syncTileTagUi) syncTileTagUi();
+      // 输入存档：目录变化时读回、参数变化时防抖保存。
+      if (pipelineControls && pipelineControls.pollPreset) pipelineControls.pollPreset();
     }, 1000);
 
     const oldRemoved = node.onRemoved;
@@ -5261,7 +4915,7 @@
               plan_id: plan.plan_id,
               warnings: plan.warnings,
             };
-            planAppliedKey = "strips|" + key + "|" + plan.plan_id;
+            planAppliedKey = stripsGeomKey(key, String(plan.plan_id || ""));
             if (data.selection != null) setWidget(node, "select", String(data.selection));
             if (plan.plan_id) setWidget(node, "select_plan", plan.plan_id);
             showPlan(plan);
@@ -5280,7 +4934,7 @@
             planAppliedKey = "strips_pending|" + srcW + "|" + srcH + "|" +
               Math.max(0, Number(widgetValue(node, "overlap", 128)) || 0) + "|" +
               Number(widgetValue(node, "strip_max_side", 2048)) + "|" +
-              Number(widgetValue(node, "resolution", 512)) + "|" +
+              Number(widgetValue(node, "resolution", 1024)) + "|" +
               Number(widgetValue(node, "strip_margin", 32));
           } else if (mode === "custom_regions" && data.partition) {
             const p = data.partition;
@@ -5608,6 +5262,89 @@
     loadSource();
   }
 
+  // 新最简两节点的第二半：原图着色 + 写分层 PSD。目录用浏览弹窗选，
+  // 运行后显示层数、合成自检差异，并直接给「打开 PSD」入口。
+  function setupMaskPSD(node) {
+    injectCss();
+
+    const root = el("div", "stlu-panel");
+    root.style.padding = "6px";
+    root.style.gap = "4px";
+
+    const head = el("div", "stlu-line");
+    head.appendChild(el("span", "stlu-cardtitle", "② 分层 PSD"));
+    const tag = el("span", "stlu-tag", "等待运行");
+    head.appendChild(tag);
+    head.appendChild(el("span", "grow"));
+    const pickBtn = el("button", "stlu-btn", "选目录…");
+    head.appendChild(pickBtn);
+    root.appendChild(head);
+
+    const dirLine = el("div", "stlu-hint");
+    dirLine.style.wordBreak = "break-all";
+    dirLine.textContent = "输出目录：output/" +
+      String(widgetValue(node, "out_dir", "SeeThrough/MaskLayers") || "");
+    root.appendChild(dirLine);
+
+    const infoLine = el("div", "stlu-hint", "运行后这里显示写了多少层。");
+    infoLine.style.whiteSpace = "normal";
+    infoLine.style.lineHeight = "1.4";
+    root.appendChild(infoLine);
+
+    const actions = el("div", "stlu-line");
+    const openBtn = el("button", "stlu-btn", "打开 PSD");
+    openBtn.disabled = true;
+    actions.appendChild(openBtn);
+    root.appendChild(actions);
+
+    let psdPath = "";
+
+    pickBtn.addEventListener("click", () => {
+      openPicker({
+        title: "分层 PSD 写到哪个目录",
+        mode: "folder",
+        scopes: [{ scope: "output", label: "输出目录" }],
+        start: String(widgetValue(node, "out_dir", "") || ""),
+        onPick: (rel) => {
+          setWidget(node, "out_dir", rel || "SeeThrough/MaskLayers");
+          dirLine.textContent = "输出目录：output/" +
+            String(widgetValue(node, "out_dir", "") || "");
+        },
+      });
+    });
+
+    openBtn.addEventListener("click", () => {
+      if (psdPath) openPath(psdPath, true);
+    });
+
+    const oldExecuted = node.onExecuted;
+    node.onExecuted = function (message) {
+      const result = oldExecuted ? oldExecuted.apply(this, arguments) : undefined;
+      try {
+        const payload = message && message.stlu_psd;
+        if (payload && payload.length) {
+          const info = payload[0] || {};
+          psdPath = String(info.psd || "");
+          openBtn.disabled = !psdPath;
+          const parts = Array.isArray(info.parts) ? info.parts : [];
+          tag.className = "stlu-tag " + (info.warn ? "warn" : "ok");
+          tag.textContent = info.warn ? "合成有偏差" : "已写出";
+          infoLine.textContent =
+            String(info.layers || 0) + " 层（含兜底）· " +
+            (parts.length ? parts.join(" / ") : "没有拆出部件") +
+            " · 与原图合成差 " + String(info.composite_max_diff || 0);
+          infoLine.title = psdPath;
+        }
+      } catch (e) {
+        console.warn("[STLU] mask psd panel", e);
+      }
+      return result;
+    };
+
+    const dom = addDOM(node, "stlu_mask_psd_card", root, 150, 260);
+    registerPanel(node, "tile", dom, root);
+  }
+
   // Offline stage ③: the source path stays a visible widget; this panel only
   // adds the folder browser, so nothing is hidden.
   function setupRebuildPSD(node) {
@@ -5711,6 +5448,210 @@
     registerPanel(node, "wave", dom, root);
     refresh();
     setTimeout(() => { bindWatchers(); refresh(); }, 400);
+  }
+
+  // ② runs the whole guide → layers → depth → post chain for every tile inside
+  // one execute().  Each tile reloads the models, so minutes can pass with the
+  // socket silent; pipeline_stages pushes a stlu.tile.progress event per phase
+  // and this panel mirrors it so the canvas never looks hung mid-tile.
+  const LOOP_PHASES = {
+    start: "准备（读取已生成的块）",
+    guide: "回填引导图",
+    layers: "拆层生成（模型推理）",
+    depth: "深度图生成",
+    post: "合成部件",
+    crop: "裁回原尺寸",
+    tile_done: "本块完成",
+    end: "全部完成",
+  };
+
+  function fmtClock(seconds) {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    const m = Math.floor(s / 60);
+    return m ? m + ":" + String(s % 60).padStart(2, "0") : s + " 秒";
+  }
+
+  function setupTileLoop(node) {
+    injectCss();
+
+    const root = el("div", "stlu-panel");
+    root.style.padding = "6px";
+    root.style.gap = "4px";
+
+    const head = el("div", "stlu-line");
+    head.appendChild(el("span", "stlu-cardtitle", "② 逐块生成（引导 → 拆层 → 深度 → 合成）"));
+    const tag = el("span", "stlu-tag", "等待运行");
+    head.appendChild(tag);
+    head.appendChild(el("span", "grow"));
+    root.appendChild(head);
+
+    const barWrap = el("div", "stlu-bar");
+    const barFill = el("div", "stlu-bar-fill");
+    barWrap.appendChild(barFill);
+    root.appendChild(barWrap);
+
+    const DEFAULT_HINT =
+      "队列运行后这里显示当前块与块内步骤。每块都要重新加载模型，单块常用几分钟。";
+    const mainLine = el("div", "stlu-hint", DEFAULT_HINT);
+    mainLine.style.whiteSpace = "normal";
+    mainLine.style.lineHeight = "1.4";
+    root.appendChild(mainLine);
+
+    const timeLine = el("div", "stlu-hint", "");
+    root.appendChild(timeLine);
+
+    // ``base`` anchors the backend's reported seconds to a local clock so the
+    // numbers keep moving between events (one phase can run for minutes).
+    const state = {
+      running: false,
+      phase: "",
+      info: null,
+      base: 0,        // local time of the last progress event
+      seconds: 0,     // backend total seconds at that moment
+      tileSeconds: 0, // backend per-tile seconds at that moment
+      estimate: 0,    // seconds left, refreshed only when a tile finishes
+      ticker: 0,
+    };
+
+    function elapsed() {
+      return state.base ? state.seconds + (Date.now() - state.base) / 1000 : 0;
+    }
+
+    function tileElapsed() {
+      return state.base ? state.tileSeconds + (Date.now() - state.base) / 1000 : 0;
+    }
+
+    function paint() {
+      const info = state.info || {};
+      const total = Number(info.total) || 0;
+      const pos = Number(info.pos) || 0;
+
+      if (!state.phase) barFill.style.width = "0%";
+      else if (state.phase === "end") barFill.style.width = "100%";
+      else if (total) barFill.style.width = Math.min(100, Math.round((pos / total) * 100)) + "%";
+
+      if (state.phase) {
+        const parts = [];
+        if (pos && total) parts.push("第 " + pos + "/" + total + " 块");
+        if (info.index != null) parts.push("格子 #" + info.index);
+        parts.push(LOOP_PHASES[state.phase] || state.phase);
+        mainLine.textContent = parts.join(" · ");
+        if (state.phase === "end") {
+          mainLine.textContent = total ? "全部完成 · 共 " + total + " 块" : "全部完成";
+        }
+      }
+
+      const bits = [];
+      if (state.running && state.phase && state.phase !== "start" && state.phase !== "end") {
+        bits.push("本块 " + fmtClock(tileElapsed()));
+      }
+      if (state.running) bits.push("累计 " + fmtClock(elapsed()));
+      if (state.estimate > 0 && state.running) bits.push("预计剩余 " + fmtClock(state.estimate));
+      if (state.phase === "end" && state.seconds) bits.push("总用时 " + fmtClock(state.seconds));
+      const cached = Number(info.cached) || 0;
+      if (cached) bits.push("复用缓存 " + cached + " 块");
+      if (state.phase === "tile_done" && info.empty) bits.push("本块为空");
+      timeLine.textContent = bits.join(" · ");
+    }
+
+    function onProgress(info) {
+      if (!info || !info.phase || !state.running) return;
+      const phase = info.phase;
+      state.info = info;
+      state.phase = phase;
+      state.base = Date.now();
+      state.seconds = Number(info.seconds) || 0;
+      state.tileSeconds = Number(info.tile_seconds) || 0;
+      if (phase === "tile_done" || phase === "end") {
+        const total = Number(info.total) || 0;
+        const done = Number(info.done) || 0;
+        state.estimate = done > 0 && total > done
+          ? (state.seconds / done) * (total - done)
+          : 0;
+      }
+      if (phase === "end") {
+        state.running = false;
+        state.estimate = 0;
+        tag.className = "stlu-tag ok";
+        tag.textContent = "已完成";
+      }
+      paint();
+    }
+
+    function reset() {
+      state.running = true;
+      state.phase = "";
+      state.info = null;
+      state.base = 0;
+      state.seconds = 0;
+      state.tileSeconds = 0;
+      state.estimate = 0;
+      tag.className = "stlu-tag";
+      tag.textContent = "运行中";
+      barFill.className = "stlu-bar-fill";
+      barFill.style.width = "0%";
+      mainLine.textContent = "正在准备块…（模型加载时可能停留几分钟）";
+      timeLine.textContent = "";
+    }
+
+    function onInterrupt() {
+      if (!state.running) return;
+      state.running = false;
+      state.estimate = 0;
+      tag.className = "stlu-tag error";
+      tag.textContent = "已中断";
+      paint();
+    }
+
+    function onError() {
+      state.running = false;
+      state.estimate = 0;
+      tag.className = "stlu-tag error";
+      tag.textContent = "运行失败";
+      barFill.className = "stlu-bar-fill error";
+      paint();
+    }
+
+    // Fires when the queue finishes.  A prompt that never reached this node
+    // (upstream error, or ComfyUI reused the cached result) sends no
+    // stlu.tile.progress at all — reset the panel instead of letting it
+    // pretend to run forever.
+    function onSuccess() {
+      if (!state.running) return;
+      state.running = false;
+      state.estimate = 0;
+      if (!state.phase) {
+        tag.className = "stlu-tag";
+        tag.textContent = "等待运行";
+        barFill.className = "stlu-bar-fill";
+        barFill.style.width = "0%";
+        mainLine.textContent = DEFAULT_HINT;
+        timeLine.textContent = "";
+        return;
+      }
+      tag.className = "stlu-tag ok";
+      tag.textContent = "运行完成";
+      paint();
+    }
+
+    const handlers = { onProgress, reset, onInterrupt, onError, onSuccess };
+    loopStates.add(handlers);
+
+    state.ticker = setInterval(() => {
+      if (!state.running) return;
+      try { paint(); } catch (e) { /* panel removed */ }
+    }, 1000);
+
+    const oldRemoved = node.onRemoved;
+    node.onRemoved = function () {
+      loopStates.delete(handlers);
+      if (state.ticker) clearInterval(state.ticker);
+      state.ticker = 0;
+      return oldRemoved ? oldRemoved.apply(this, arguments) : undefined;
+    };
+
+    const dom = addDOM(node, "stlu_tile_loop_card", root, 130, 260);
+    registerPanel(node, "loop", dom, root);
   }
 
   // ③b runs once per selected tile (ComfyUI expands the list automatically).
@@ -6657,14 +6598,14 @@
   // websocket events
   // -------------------------------------------------------------------------
 
-  function forEachPlanState(fn) {
-    for (const ctx of Array.from(planStates)) {
+  function forEachEditState(fn) {
+    for (const ctx of Array.from(editStates)) {
       try { fn(ctx); } catch (e) { console.error("[STLU]", e); }
     }
   }
 
-  function forEachEditState(fn) {
-    for (const ctx of Array.from(editStates)) {
+  function forEachLoopState(fn) {
+    for (const ctx of Array.from(loopStates)) {
       try { fn(ctx); } catch (e) { console.error("[STLU]", e); }
     }
   }
@@ -6682,85 +6623,16 @@
       }
     };
 
-    listen("execution_start", () => forEachPlanState((ctx) => {
-      if (ctx.running) return;
-      ctx.running = true;
-      resetDoneMarks(ctx);
-      ctx.total = selectedCount(ctx);
-      updateRunState(ctx);
-      setStatus(ctx, "正在运行…");
-    }));
+    listen("execution_start", () => forEachLoopState((ctx) => ctx.reset()));
 
-    listen("stlu.start", (data) => forEachPlanState((ctx) => {
-      ctx.running = true;
-      resetDoneMarks(ctx);
-      ctx.total = Number(data.total) || selectedCount(ctx);
-      updateRunState(ctx);
-      const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
-      if (ctx.total) {
-        setStatus(ctx, "开始放大 " + ctx.total + " 个部件…" +
-          (skipped ? "（跳过 " + skipped + " 个已生成）" : ""));
-      } else if (skipped) {
-        setStatus(ctx, "全部已生成，无需重跑（删掉 UpScale 里的 PNG 可重做）", "ok");
-      }
-    }));
+    listen("execution_interrupted", () => forEachLoopState((ctx) => ctx.onInterrupt()));
 
-    // Fires when a layer starts, before its (slow) model reload.  Without this
-    // the status line sits unchanged for minutes and looks like a hang.
-    listen("stlu.layer_start", (data) => forEachPlanState((ctx) => {
-      if (!ctx.running || !data || !data.name) return;
-      const pos = ctx.done.size + 1;
-      const total = Math.max(ctx.total || 0, pos);
-      setStatus(ctx, "正在放大 " + pos + "/" + total + " · " + data.name + "（单层约数分钟，模型加载中）");
-    }));
+    listen("execution_error", () => forEachLoopState((ctx) => ctx.onError()));
 
-    listen("stlu.progress", (data) => {
-      if (!data || !data.name) return;
-      forEachPlanState((ctx) => {
-        if (!ctx.running) return;
-        if (!ctx.done.has(data.name)) ctx.done.add(data.name);
-        ctx.total = Math.max(ctx.total, ctx.done.size);
-        markRowDone(ctx, data.name);
-        setStatus(ctx, "正在放大 " + ctx.done.size + "/" + Math.max(ctx.total, ctx.done.size) + " · " + data.name);
-      });
-    });
+    listen("execution_success", () => forEachLoopState((ctx) => ctx.onSuccess()));
 
-    listen("stlu.done", (data) => forEachPlanState((ctx) => {
-      if (data && data.error) {
-        setStatus(ctx, "✗ PSD 写入失败：" + String(data.error).split("\n")[0].slice(0, 120), "error");
-      } else if (data && data.filename) {
-        setStatus(ctx, "✓ 已生成 " + data.filename, "ok");
-      } else {
-        setStatus(ctx, "✓ PSD 已生成", "ok");
-      }
-    }));
-
-    listen("execution_interrupted", () => forEachPlanState((ctx) => {
-      ctx.running = false;
-      updateRunState(ctx);
-      setStatus(ctx, "已中断", "error");
-    }));
-
-    listen("execution_success", () => forEachPlanState((ctx) => {
-      const wasRunning = ctx.running;
-      ctx.running = false;
-      updateRunState(ctx);
-      if (wasRunning) {
-        const m = i18n();
-        const shown = (m && m.raw(ctx.statusEl)) || (ctx.statusEl && ctx.statusEl.textContent) || "";
-        if (!ctx.statusEl || !/已生成|运行完成|Generated|Run finished/.test(shown)) {
-          setStatus(ctx, "✓ 运行完成", "ok");
-        }
-        refresh(ctx);
-      }
-    }));
-
-    listen("execution_error", (data) => forEachPlanState((ctx) => {
-      ctx.running = false;
-      updateRunState(ctx);
-      const msg = (data && (data.exception_message || data.exception_type)) || "未知错误";
-      setStatus(ctx, "✗ 运行失败：" + String(msg).split("\n")[0].slice(0, 160), "error");
-    }));
+    // Per-tile, per-phase progress pushed by pipeline_stages.run_guided_tiles.
+    listen("stlu.tile.progress", (data) => forEachLoopState((ctx) => ctx.onProgress(data)));
 
     listen("execution_success", () => {
       // The run may have changed the reference image or the split: re-read
@@ -6781,6 +6653,10 @@
     });
 
     listen("stlu.cache_reset", (data) => {
+      // The backend cleared the folder for a structural change (another
+      // partition type / another source image / moved boxes) because the
+      // reused tiles could not sit in this run's boxes.  Settings changes
+      // never clear, so this is the only automatic reset.
       for (const entry of Array.from(gridStates)) {
         try {
           if (entry.showCacheReset) entry.showCacheReset(data);
@@ -6858,9 +6734,21 @@
       ctx.reveal.disabled = false;
     }));
 
-    // The reference image may be changed from the LoadImage node itself;
-    // refresh that one row when the window regains focus.
-    window.addEventListener("focus", () => forEachPlanState((ctx) => refreshRef(ctx)));
+    // PSD-upscale workflow (① -> ③ -> ④).
+    listen("stlu.psd.plan", (data) => forEachPsdState((ctx) => ctx.on("plan", data)));
+    listen("stlu.psd.start", (data) => forEachPsdState((ctx) => ctx.on("start", data)));
+    listen("stlu.psd.layer", (data) => forEachPsdState((ctx) => ctx.on("layer", data)));
+    listen("stlu.psd.assembled", (data) => forEachPsdState((ctx) => ctx.on("assembled", data)));
+    listen("execution_error", () => forEachPsdState((ctx) => ctx.on("error", {})));
+    listen("execution_interrupted", () => forEachPsdState((ctx) => ctx.on("error", {})));
+
+    // PSD-edit workflow (① 准备 -> ② 编辑 -> ③ 重组).
+    listen("stlu.edit.plan", (data) => forEachEditCdState((ctx) => ctx.on("plan", data)));
+    listen("stlu.edit.start", (data) => forEachEditCdState((ctx) => ctx.on("start", data)));
+    listen("stlu.edit.layer", (data) => forEachEditCdState((ctx) => ctx.on("layer", data)));
+    listen("stlu.edit.assembled", (data) => forEachEditCdState((ctx) => ctx.on("assembled", data)));
+    listen("execution_error", () => forEachEditCdState((ctx) => ctx.on("error", {})));
+    listen("execution_interrupted", () => forEachEditCdState((ctx) => ctx.on("error", {})));
   }
 
   // -------------------------------------------------------------------------
@@ -6912,32 +6800,6 @@
     }
     root.appendChild(tabs);
 
-    // Lock toolbar: the row button fills a whole block / part in one go and
-    // the two page buttons do every thumbnail on screen.  All three send a
-    // single batch request instead of one request per picture.
-    const lockBar = el("div", "stlu-line");
-    lockBar.style.gap = "4px";
-    lockBar.style.flexWrap = "wrap";
-    const lockAll = el("button", "stlu-btn", "全锁");
-    lockAll.title = "锁定当前页显示的所有拆分图";
-    const unlockAll = el("button", "stlu-btn", "全解");
-    unlockAll.title = "解除当前页显示的所有锁";
-    for (const button of [lockAll, unlockAll]) {
-      button.style.fontSize = "10px";
-      button.style.padding = "2px 7px";
-      lockBar.appendChild(button);
-    }
-    const lockHint = el("span", "stlu-hint");
-    lockHint.style.whiteSpace = "normal";
-    lockHint.style.fontSize = "9px";
-    lockHint.style.lineHeight = "1.35";
-    lockHint.style.flex = "1 1 140px";
-    lockHint.style.minWidth = "0";
-    lockHint.textContent = "行尾「锁整行」批量锁这一块/部位；"
-      + "左上角小锁单独切换。参数变化清空目录后仍会找回。";
-    lockBar.appendChild(lockHint);
-    root.appendChild(lockBar);
-
     // Whole-canvas overview on the left, always visible (no click, no fold),
     // and a wall of small cards on the right that are all expanded at once.
     // Nothing scrolls inside the panel: the wheel does not reliably scroll a
@@ -6967,13 +6829,12 @@
 
     const state = {
       mode: "tiles", path: "", maxSide: 768, data: {}, loading: {},
-      // Per-tile model inputs handed over by ② (``stlu_guide`` in the node's
-      // own execution payload).  Not on disk: only the run that produced
-      // them can pin them to a tile row.
-      guide: {},
-      // {tileIndex: Set(lowercase part names)} kept in the run folder's
-      // ``_locks/`` store, outside everything a parameter-change reset wipes.
-      locks: {},
+      // {tileIndex: {layer, depth}} from the run's manifest, so the "by part"
+      // tab can label each copy with the seeds of the tile it came from.
+      seeds: {},
+      // Bumped whenever the target folder changes, so a slow /stlu/psd_preview
+      // reply for the old folder is dropped instead of overwriting the new one.
+      epoch: 0,
     };
 
     // Thumbnail scale, remembered in the browser so it survives reloads.
@@ -7031,122 +6892,6 @@
     function splitW() { return Math.round(44 * state.zoom); }
     function splitH() { return Math.round(40 * state.zoom); }
 
-    // ---- per-tile, per-part locks -----------------------------------------
-    // The backend keeps a copy of each locked layer in <run>/_locks/, so a
-    // lock survives the automatic clear that a parameter change performs.
-
-    function normalizeLocks(raw) {
-      const out = {};
-      if (!raw || typeof raw !== "object") return out;
-      for (const [tile, names] of Object.entries(raw)) {
-        const index = Number(tile);
-        if (!Number.isFinite(index)) continue;
-        const set = new Set();
-        for (const name of names || []) {
-          const key = String(name || "").trim().toLowerCase();
-          if (key) set.add(key);
-        }
-        if (set.size) out[String(index)] = set;
-      }
-      return out;
-    }
-
-    function isLocked(tile, name) {
-      if (tile == null) return false;
-      const set = state.locks[String(Number(tile))];
-      return !!set && set.has(String(name || "").trim().toLowerCase());
-    }
-
-    function lockedInSplit(split) {
-      let count = 0;
-      for (const part of split || []) {
-        if (isLocked(part.tile, part.name || part.layer)) count += 1;
-      }
-      return count;
-    }
-
-    // Every lock write -- one thumbnail, one row, or the whole page -- goes
-    // through this: one optimistic DOM update, one batch POST, one render.
-    async function setLocks(pairs, locked) {
-      const path = state.path || declaredPath();
-      if (!path) return false;
-      const items = [];
-      const seen = new Set();
-      for (const pair of pairs || []) {
-        if (!pair || pair.tile == null) continue;
-        const name = String(pair.name || pair.layer || "").trim();
-        if (!name) continue;
-        const key = String(Number(pair.tile)) + "|" + name.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        items.push({ tile: Number(pair.tile), name, locked });
-      }
-      if (!items.length) return false;
-      const before = {};
-      for (const key of Object.keys(state.locks)) {
-        before[key] = new Set(state.locks[key]);
-      }
-      for (const item of items) {
-        const key = String(item.tile);
-        const set = new Set(state.locks[key] || []);
-        if (locked) set.add(item.name.toLowerCase());
-        else set.delete(item.name.toLowerCase());
-        if (set.size) state.locks[key] = set;
-        else delete state.locks[key];
-      }
-      render();
-      let message = "";
-      let attention = false;
-      try {
-        const doc = await postJson("/stlu/locks", { path, items });
-        if (doc && doc.tiles) state.locks = normalizeLocks(doc.tiles);
-        const failed = (doc && doc.failed) || [];
-        attention = failed.length > 0;
-        message = failed.length
-          ? "锁 " + ((doc && doc.done) || 0) + " 张，" + failed.length
-            + " 张失败：" + ((failed[0] && failed[0].error) || "")
-          : (locked ? "已锁 " : "已解锁 ") + items.length + " 张";
-      } catch (error) {
-        state.locks = before;
-        attention = true;
-        message = "批量锁定失败：" + ((error && error.message) || error);
-      }
-      render();
-      // Written after render so the run summary does not overwrite it; the
-      // next render puts the lock total back.
-      const total = Object.values(state.locks)
-        .reduce((sum, set) => sum + set.size, 0);
-      lockHint.className = attention ? "stlu-hint attention" : "stlu-hint";
-      lockHint.textContent = message;
-      lockHint.style.color = attention || !total ? "" : "#e2b33c";
-      return true;
-    }
-
-    async function toggleLock(tile, name) {
-      const was = isLocked(tile, name);
-      const ok = await setLocks([{ tile, name }], !was);
-      if (ok) {
-        lockHint.className = "stlu-hint";
-        lockHint.style.color = "#e2b33c";
-        lockHint.textContent = (was ? "已解锁 " : "已锁定 ") + name
-          + "（块 " + String(tile).padStart(2, "0") + "）";
-      }
-    }
-
-    // Every lockable thumbnail on the current page / tab.
-    function visibleParts() {
-      const out = [];
-      for (const item of listOf(state.mode)) {
-        for (const part of item.split || []) {
-          if (part.tile != null && (part.name || part.layer)) out.push(part);
-        }
-      }
-      return out;
-    }
-
-    lockAll.addEventListener("click", () => setLocks(visibleParts(), true));
-    unlockAll.addEventListener("click", () => setLocks(visibleParts(), false));
-
     function imageUrl(meta, bust) {
       // Thumbnail filenames already hash the source mtime/size, so a stable
       // ``v`` keeps the browser cache useful; the dialog forces a fresh copy.
@@ -7180,17 +6925,22 @@
 
     // ①-0 参数包里的输出根目录就是 ③ 实际写盘的位置；挑结果文件夹时从
     // 这里出发，免得每个人自己再从 output/ 一层层点下去。
+    function settingsNode() {
+      return allNodes().find(
+        (n) => n && (n.type === PIPELINE_SETTINGS || n.type === PIPELINE)) || null;
+    }
+
     function settingsOutDir() {
-      const graph = app.graph;
-      const nodes = (graph && graph._nodes) || [];
-      const settings = nodes.find(
-        (n) => n && (n.type === PIPELINE_SETTINGS || n.type === SIMPLE));
+      const settings = settingsNode();
       if (!settings) return "";
-      // 后端的运行目录是 out_dir/group（空 group 就落在 out_dir 本身）。
-      const dir = readOutDir(settings);
+      // 后端的运行目录是 out_dir/group（空 group 就落在 out_dir 本身），
+      // 空的 out_dir 后端会落到 SeeThrough；group 会被 safe_name 换成
+      // Windows 安全的名字，这里照做才能猜中同一个文件夹。
+      const dir = String(widgetValue(settings, "out_dir", "SeeThrough") || "SeeThrough")
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim() || "SeeThrough";
       const group = String(widgetValue(settings, "group", "") || "")
-        .trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-      if (!dir) return "";
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim()
+        .replace(/[<>:"|?*\/\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "");
       return group ? dir + "/" + group : dir;
     }
 
@@ -7204,6 +6954,34 @@
 
     function tileTag(tile) {
       return tile == null ? "合并" : "块 " + String(tile).padStart(2, "0");
+    }
+
+    // "种子 42 / 深度 7"; empty when the run predates the split seeds.
+    function seedText(seeds) {
+      if (!seeds || seeds.layer == null) return "";
+      const depth = seeds.depth == null ? seeds.layer : seeds.depth;
+      return "种子 " + seeds.layer + " / 深度 " + depth;
+    }
+
+    function copyText(text) {
+      const nav = window.navigator;
+      const fallback = () => {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand("copy"); } catch (e) { /* ignore */ }
+        document.body.removeChild(area);
+      };
+      try {
+        if (nav && nav.clipboard && nav.clipboard.writeText) {
+          nav.clipboard.writeText(text).catch(fallback);
+        } else {
+          fallback();
+        }
+      } catch (e) { /* clipboard is a nicety */ }
     }
 
     // One split thumbnail in the row's picture list.  Fixed 42px wide so the
@@ -7221,11 +6999,14 @@
       cell.style.width = width + "px";
       cell.style.cursor = "zoom-in";
 
+      // In "parts" mode the hover also names the two seeds its tile ran with,
+      // so a suspect part can be re-tested without leaving this view.
+      const partSeeds = part.tile == null ? "" : seedText(state.seeds[String(part.tile)]);
       const img = document.createElement("img");
       img.src = imageUrl(meta);
       img.alt = title;
       img.title = title + (part.size ? " · " + part.size.join("×") : "")
-        + (mode === "parts" ? " · " + tileTag(part.tile) : "");
+        + (mode === "parts" ? " · " + tileTag(part.tile) + (partSeeds ? " · " + partSeeds : "") : "");
       img.style.display = "block";
       img.style.width = "100%";
       img.style.height = splitH() + "px";
@@ -7235,39 +7016,6 @@
       img.style.background =
         "repeating-conic-gradient(#242426 0% 25%,#1a1a1c 0% 50%) 50%/10px 10px";
       cell.appendChild(img);
-
-      // Lock toggle: keep exactly this tile's copy of this part on the next
-      // run.  The backend snapshots it into _locks/, which a reset does not
-      // clear, so the lock still works after a parameter change.
-      const locked = isLocked(part.tile, title);
-      if (locked) img.style.border = "1px solid #e2b33c";
-      const lockSize = Math.max(14, Math.min(22, Math.round(14 * state.zoom)));
-      const lock = el("button", "", "锁");
-      lock.title = part.tile == null
-        ? "这一份是跨块合并出来的，不能单独锁定；请切到「按块」锁定"
-        : (locked ? "已锁定：重跑这一块时保留这一张（清空后也会找回）"
-                  : "锁定：重跑这一块时保留这一张（清空后也会找回）");
-      lock.disabled = part.tile == null;
-      lock.style.position = "absolute";
-      lock.style.left = "1px";
-      lock.style.top = "1px";
-      lock.style.width = lockSize + "px";
-      lock.style.height = lockSize + "px";
-      lock.style.padding = "0";
-      lock.style.fontSize = Math.max(8, Math.round(lockSize * 0.55)) + "px";
-      lock.style.lineHeight = "1";
-      lock.style.borderRadius = "3px";
-      lock.style.cursor = part.tile == null ? "default" : "pointer";
-      lock.style.border = "1px solid " + (locked ? "#e2b33c" : "#3a3a3c");
-      lock.style.background = locked ? "rgba(226,179,60,.92)" : "rgba(20,20,22,.78)";
-      lock.style.color = locked ? "#161616" : (part.tile == null ? "#777" : "#cfcfd3");
-      lock.style.opacity = part.tile == null ? ".55" : "1";
-      lock.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (part.tile == null) return;
-        toggleLock(part.tile, title);
-      });
-      cell.appendChild(lock);
 
       if (mode === "parts") {
         const badge = el("span", "",
@@ -7313,7 +7061,7 @@
       row.style.minWidth = "0";
 
       const who = el("div");
-      who.style.flex = "0 0 84px";
+      who.style.flex = "0 0 120px";
       who.style.minWidth = "0";
       const name = el("div", "stlu-cardtitle", title);
       name.style.fontSize = "11px";
@@ -7322,48 +7070,36 @@
       name.style.textOverflow = "ellipsis";
       name.title = title;
       who.appendChild(name);
-      const locksHere = lockedInSplit(split);
-      const sub = el("div", "stlu-hint", (mode === "tiles"
+      // Each tile row also names the two seeds it ran with; clicking copies
+      // them so they can be typed back into the settings node for a re-test.
+      const rowSeeds = mode === "tiles" ? seedText(item.seeds) : "";
+      const sub = el("div", "stlu-hint", mode === "tiles"
         ? split.length + " 部位"
-        : (item.count || 1) + " 份" + (item.size ? " · " + item.size.join("×") : ""))
-        + (locksHere ? " · 锁 " + locksHere : ""));
+        : (item.count || 1) + " 份" + (item.size ? " · " + item.size.join("×") : ""));
       sub.style.fontSize = "9px";
-      if (locksHere) sub.style.color = "#e2b33c";
       who.appendChild(sub);
-
-      // Row-level batch lock: one click fills every thumbnail in this row.
-      // A partly locked row fills the rest; a fully locked row releases all.
-      const lockable = split.filter(
-        (part) => part.tile != null && (part.name || part.layer));
-      const lockedHere = lockable.filter(
-        (part) => isLocked(part.tile, part.name || part.layer)).length;
-      const rowLock = el("button", "stlu-btn",
-        !lockable.length ? "锁整行"
-          : lockedHere === lockable.length ? "解锁整行"
-          : lockedHere ? "锁 " + lockedHere + "/" + lockable.length
-          : "锁整行");
-      rowLock.title = mode === "tiles"
-        ? "一次锁定 / 解锁这一块的所有拆分图"
-        : "一次锁定 / 解锁这个部位在所有块里的副本";
-      rowLock.disabled = !lockable.length;
-      rowLock.style.marginTop = "2px";
-      rowLock.style.fontSize = "9px";
-      rowLock.style.padding = "1px 5px";
-      rowLock.style.whiteSpace = "nowrap";
-      if (lockable.length && lockedHere === lockable.length) {
-        rowLock.style.borderColor = "#e2b33c";
-        rowLock.style.color = "#e2b33c";
+      // Both seeds get their own line so the numbers stay fully readable
+      // even when they are long; clicking copies them for a re-test.
+      if (rowSeeds) {
+        const seedLine = el("div", "stlu-hint", rowSeeds);
+        seedLine.style.fontSize = "9px";
+        seedLine.style.lineHeight = "1.25";
+        seedLine.style.whiteSpace = "normal";
+        seedLine.style.overflowWrap = "anywhere";
+        seedLine.style.cursor = "pointer";
+        seedLine.title = "点击复制这一块的两个种子";
+        seedLine.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const seeds = item.seeds || {};
+          const depth = seeds.depth == null ? seeds.layer : seeds.depth;
+          copyText(seeds.layer + " / " + depth);
+        });
+        who.appendChild(seedLine);
       }
-      rowLock.addEventListener("click", (event) => {
-        event.stopPropagation();
-        setLocks(lockable, lockedHere !== lockable.length);
-      });
-      who.appendChild(rowLock);
+
       row.appendChild(who);
 
       // Merged group picture: blue frame + "合" badge, distinct from splits.
-      // The model input (green frame) stacks underneath it, not beside it --
-      // both are square so a column keeps the row one picture wide.
       const merge = mergePx();
       const pair = el("div");
       pair.style.display = "flex";
@@ -7405,69 +7141,6 @@
       frame.appendChild(chip);
       frame.addEventListener("click", () => showBig(item.image || {}, title + " · 合并"));
       pair.appendChild(frame);
-
-      // What the models actually saw for this tile: the crop after guide
-      // backfill and context padding.  It rides in on the node's own
-      // execution payload (temp thumbnails), so it only exists for tiles the
-      // current run really generated -- an empty dashed cell means "did not
-      // run this tile" (unchecked, or reused from an earlier run).
-      // Per-tile only: the "by part" tab has no tile to pin it to.
-      if (mode === "tiles") {
-        // This run's own payload wins (it is pinned to the tile by ②); after a
-        // browser refresh the payload is gone, so fall back to the copy the
-        // backend keeps next to the run in ``_guide/``.
-        const guided = state.guide[String(Number(item.index))];
-        const live = guided && guided.image ? guided.image : null;
-        const disk = !live && item.guide ? item.guide : null;
-        const side = mergePx();
-        const guide = el("div");
-        guide.style.position = "relative";
-        guide.style.flex = "0 0 " + side + "px";
-        guide.style.width = side + "px";
-        guide.style.height = side + "px";
-        guide.style.boxSizing = "border-box";
-        guide.style.borderRadius = "4px";
-        if (live || disk) {
-          guide.style.border = "1px solid rgba(86,178,107,.65)";
-          guide.style.background = "#101013";
-          guide.style.padding = "2px";
-          guide.style.cursor = "zoom-in";
-          const img = document.createElement("img");
-          img.src = live ? imageUrl(live)
-            : (item.guide_thumb ? apiUrl(item.guide_thumb) : imageUrl(disk));
-          img.alt = title + " · 实际输入";
-          img.title = title + " · 引导回填后送进模型的输入 · 点击放大";
-          img.style.display = "block";
-          img.style.width = "100%";
-          img.style.height = "100%";
-          img.style.objectFit = "contain";
-          guide.appendChild(img);
-          const chip = el("span", "", "入");
-          chip.style.position = "absolute";
-          chip.style.right = "1px";
-          chip.style.bottom = "1px";
-          chip.style.fontSize = "8px";
-          chip.style.lineHeight = "1.5";
-          chip.style.padding = "0 2px";
-          chip.style.borderRadius = "2px";
-          chip.style.background = "rgba(86,178,107,.9)";
-          chip.style.color = "#fff";
-          chip.style.pointerEvents = "none";
-          guide.appendChild(chip);
-          guide.addEventListener("click", () => showBig(live || disk,
-            title + " · 实际输入（引导回填后）"));
-        } else {
-          guide.style.border = "1px dashed #3a3a3c";
-          guide.style.display = "flex";
-          guide.style.alignItems = "center";
-          guide.style.justifyContent = "center";
-          guide.style.color = "#555";
-          guide.style.fontSize = "10px";
-          guide.title = "这次没有生成这块（未勾选，或用了上次的结果）";
-          guide.textContent = "—";
-        }
-        pair.appendChild(guide);
-      }
       row.appendChild(pair);
 
       const strip = el("div");
@@ -7561,23 +7234,22 @@
         : (state.data[state.mode] ? "0 个" + noun : "…");
       count.className = "stlu-tag" + (items.length ? " ok" : "");
       hint.className = "stlu-hint";
-      hint.textContent = data.file
-        ? "合并 PSD：" + data.file + (data.canvas
-            ? " · " + data.canvas.join("×") : "")
-        : "当前输出目录为空";
+      if (data.file) {
+        // 带上目录，跟随 ① 的输出位置刷新时一眼能看出换到哪了；
+        // 完整的目标路径放在 title 里。
+        const shown = data.dir ? "output/" + data.dir + "/" + data.file : data.file;
+        hint.textContent = "合并 PSD：" + shown + (data.canvas
+          ? " · " + data.canvas.join("×") : "");
+        hint.title = state.path || "";
+      } else {
+        const guess = settingsOutDir();
+        const where = state.path
+          ? String(state.path).replace(/\\/g, "/")
+          : (guess ? "output/" + guess : "");
+        hint.textContent = where ? where + " 里还没有合并 PSD" : "当前输出目录为空";
+        hint.title = state.path || "";
+      }
       syncCounts();
-      const lockTotal = Object.values(state.locks)
-        .reduce((total, set) => total + set.size, 0);
-      const lockableCount = visibleParts().length;
-      lockAll.disabled = !lockableCount;
-      unlockAll.disabled = !lockableCount;
-      lockHint.className = "stlu-hint";
-      lockHint.textContent = lockTotal
-        ? "已锁定 " + lockTotal + " 张：重跑保留，参数变化清空目录后也会找回。"
-          + "行尾「锁整行」可批量切换。"
-        : "行尾「锁整行」批量锁这一块/部位；左上角小锁单独切换。"
-          + "参数变化清空目录后仍会找回。";
-      lockHint.style.color = lockTotal ? "#e2b33c" : "";
       renderOverview(data);
       groups.innerHTML = "";
       if (!items.length) {
@@ -7635,6 +7307,7 @@
         return;
       }
       if (state.loading[mode]) return;
+      const epoch = state.epoch;
       state.loading[mode] = true;
       hint.className = "stlu-hint";
       hint.textContent = "读取" + (mode === "tiles" ? "分块" : "部位") + "…";
@@ -7644,17 +7317,26 @@
           mode: mode,
           max_side: String(state.maxSide || 768),
         });
-        const [data, lockDoc] = await Promise.all([
-          getJson("/stlu/psd_preview?" + query.toString()),
-          getJson("/stlu/locks?path=" + encodeURIComponent(path)).catch(() => null),
-        ]);
+        const data = await getJson("/stlu/psd_preview?" + query.toString());
+        // 输出位置在这期间又变了：这份结果属于旧目录，丢掉。
+        if (epoch !== state.epoch) return;
         state.path = path;
         state.missed = false;
         state.data[mode] = data;
-        if (lockDoc) state.locks = normalizeLocks(lockDoc.tiles);
+        if (mode === "parts" && data && data.seeds) state.seeds = data.seeds;
+        else if (mode === "tiles") {
+          // Each tile row carries its own seeds; keep the same lookup table
+          // filled so the labels agree whichever tab was opened first.
+          const map = {};
+          for (const row of (data && data.tiles) || []) {
+            if (row && row.seeds) map[String(row.index)] = row.seeds;
+          }
+          if (Object.keys(map).length) state.seeds = map;
+        }
         syncCounts();
         if (mode === state.mode) render();
       } catch (error) {
+        if (epoch !== state.epoch) return;
         if (guessed) {
           // ① 的目录里没有合并结果：保持空状态，露出“浏览其他文件夹”按钮。
           state.path = "";
@@ -7666,9 +7348,49 @@
           hint.className = "stlu-hint attention";
         }
       } finally {
-        state.loading[mode] = false;
+        if (epoch === state.epoch) state.loading[mode] = false;
       }
     }
+
+    // ⑤ 没有自己的目录参数：输出位置跟着 ① 的 out_dir / group 走。改这两项
+    // 就把上一次运行记住的绝对路径作废，按新目录重新找合并 PSD；新目录里没有
+    // 结果就回到空状态，而不是继续显示旧文件夹的缩略图。
+    function followOutput() {
+      if (node.properties) delete node.properties.stlu_last_psd;
+      state.path = "";
+      state.data = {};
+      state.seeds = {};
+      state.loading = {};
+      state.missed = false;
+      state.epoch += 1;
+      if (!settingsOutDir()) {
+        render();
+        return;
+      }
+      ensure(state.mode, true);
+    }
+
+    // 输入框的值是在 change（回车/失焦）时落到 widget 上的，几百毫秒的
+    // 防抖足够合并连续修改，又不会在用户还没改完时就丢掉旧预览。
+    let outputTimer = null;
+    function scheduleOutputFollow() {
+      if (outputTimer) clearTimeout(outputTimer);
+      outputTimer = setTimeout(() => {
+        outputTimer = null;
+        followOutput();
+      }, 350);
+    }
+
+    function bindOutputWatchers() {
+      const settings = settingsNode();
+      if (!settings) return;
+      watchValue(settings, "out_dir", scheduleOutputFollow);
+      watchValue(settings, "group", scheduleOutputFollow);
+    }
+    bindOutputWatchers();
+    // 打开工作流时连线 / widget 可能晚一拍才恢复，补绑一次。
+    setTimeout(bindOutputWatchers, 400);
+    setTimeout(bindOutputWatchers, 1500);
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function () {
@@ -7676,14 +7398,19 @@
       try {
         // ComfyUI restores node.properties before this runs, so the last
         // merged PSD is shown immediately when a saved workflow is opened.
+        state.epoch += 1;
         state.path = declaredPath();
         state.data = {};
-        state.locks = {};
-        state.guide = {};
+        state.seeds = {};
+        state.loading = {};
         state.missed = false;
         if (state.path) ensure(state.mode, true);
         // 没有记录路径时延后一帧再猜：① 的 widget 值可能还没恢复完。
         else setTimeout(() => ensure(state.mode, true), 0);
+        // ① 的 widget 对象在恢复时可能被替换，重新挂一次监听。
+        setTimeout(bindOutputWatchers, 0);
+        setTimeout(bindOutputWatchers, 400);
+        setTimeout(bindOutputWatchers, 1500);
       } catch (e) {
         console.warn("[STLU] PSD preview restore", e);
       }
@@ -7694,26 +7421,16 @@
     node.onExecuted = function (message) {
       const result = oldExecuted ? oldExecuted.apply(this, arguments) : undefined;
       try {
-        // ②'s per-tile model inputs arrive as temp thumbnails keyed by grid
-        // index.  Replace (never merge) so a run that generated nothing can
-        // not leave the previous run's pictures pinned to the rows.
-        const guided = message && message.stlu_guide;
-        if (Array.isArray(guided)) {
-          state.guide = {};
-          for (const entry of guided) {
-            if (!entry || entry.index == null || !entry.image) continue;
-            state.guide[String(Number(entry.index))] = entry;
-          }
-        }
         const payload = message && message.stlu_parts;
         const path = payload && payload.length && payload[0].path;
         if (path) {
           if (!node.properties) node.properties = {};
           node.properties.stlu_last_psd = String(path);
+          state.epoch += 1;
           state.path = String(path);
           state.missed = false;
           state.data = {};
-          state.locks = {};
+          state.loading = {};
           ensure(state.mode, true);
         }
       } catch (e) {
@@ -7739,6 +7456,1085 @@
       // 新建节点时 ① 可能还没进图，延后一帧再按 ① 的输出目录猜一次。
       setTimeout(() => ensure(state.mode, true), 0);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // PSD-upscale panels (finished PSD -> crops -> Qwen edit -> PSD)
+  // -------------------------------------------------------------------------
+
+  const psdStates = new Set();
+
+  function forEachPsdState(fn) {
+    for (const ctx of Array.from(psdStates)) {
+      try { fn(ctx); } catch (e) { console.error("[STLU] PSD panel", e); }
+    }
+  }
+
+  function psdPreviewSrc(dirRel) {
+    if (!dirRel) return "";
+    return thumbUrl(dirRel + "/preview.png", 480) + "&t=" + Date.now();
+  }
+
+  // Shared card: title + tag on one line, a hint, a path line, a preview
+  // thumbnail that only shows once there is something to see, and buttons.
+  function psdPanel(node, title, hintText) {
+    injectCss();
+    const root = el("div", "stlu-panel");
+    root.style.padding = "6px";
+    root.style.gap = "4px";
+
+    const head = el("div", "stlu-line");
+    head.appendChild(el("span", "stlu-cardtitle", title));
+    const tag = el("span", "stlu-tag", "等待运行");
+    head.appendChild(tag);
+    head.appendChild(el("span", "grow"));
+    root.appendChild(head);
+
+    if (hintText) root.appendChild(el("div", "stlu-hint", hintText));
+
+    const line = el("div", "stlu-hint");
+    line.style.wordBreak = "break-all";
+    root.appendChild(line);
+
+    const wrap = el("div", "stlu-gridwrap");
+    wrap.style.display = "none";
+    const thumb = document.createElement("img");
+    thumb.style.width = "100%";
+    thumb.style.maxHeight = "150px";
+    thumb.style.objectFit = "contain";
+    thumb.style.borderRadius = "4px";
+    thumb.alt = "";
+    wrap.appendChild(thumb);
+    root.appendChild(wrap);
+
+    const actions = el("div", "stlu-line");
+    root.appendChild(actions);
+    const actions2 = el("div", "stlu-line");
+    root.appendChild(actions2);
+
+    return { root, head, tag, line, wrap, thumb, actions, actions2 };
+  }
+
+  function addPsdState(node, state, name, minHeight, maxHeight) {
+    psdStates.add(state);
+    const oldRemoved = node.onRemoved;
+    node.onRemoved = function () {
+      psdStates.delete(state);
+      return oldRemoved ? oldRemoved.apply(this, arguments) : undefined;
+    };
+    const dom = addDOM(node, name, state.root, minHeight, maxHeight);
+    registerPanel(node, "psd", dom, state.root);
+    return dom;
+  }
+
+  // Same card, different broadcast set: stlu.edit.* never hits stlu.psd.*.
+  function forEachEditCdState(fn) {
+    for (const ctx of Array.from(editCdStates)) {
+      try { fn(ctx); } catch (e) { console.error("[STLU] PSD edit panel", e); }
+    }
+  }
+
+  function addEditCdState(node, state, name, minHeight, maxHeight) {
+    editCdStates.add(state);
+    const oldRemoved = node.onRemoved;
+    node.onRemoved = function () {
+      editCdStates.delete(state);
+      return oldRemoved ? oldRemoved.apply(this, arguments) : undefined;
+    };
+    const dom = addDOM(node, name, state.root, minHeight, maxHeight);
+    registerPanel(node, "psd", dom, state.root);
+    return dom;
+  }
+
+  // ① reads the finished PSD, writes one crop per layer.
+  function setupPsdPrepare(node) {
+    hideWidget(widgetOf(node, "psd_path"));
+    hideWidget(widgetOf(node, "out_dir"));
+    hideWidget(widgetOf(node, "reference_path"));
+
+    const ui = psdPanel(node, "① PSD 准备（裁剪每层）",
+      "选好成品 PSD 后运行一次：整张 PSD 按「倍率」等比放大，每个图层裁一块带白边的 PNG 交给 ③。");
+    const outBtn = el("button", "stlu-btn", "输出位置：默认");
+    const pick = el("button", "stlu-btn stlu-primary", "选择成品 PSD…");
+    const openPsd = el("button", "stlu-btn", "打开 PSD");
+    const openOut = el("button", "stlu-btn", "打开输出文件夹");
+    openPsd.disabled = true;
+    openOut.disabled = true;
+    ui.actions.append(pick);
+    ui.actions.append(outBtn);
+    ui.actions2.append(openPsd);
+    ui.actions2.append(openOut);
+
+    // Optional high-resolution reference: same frame, finer pixels.  Each
+    // crop box is cut out of it again and fed to the edit model as a colour
+    // guide, so 4K sources survive the round trip into the upscale.
+    const refRow = el("div", "stlu-line");
+    const refBtn = el("button", "stlu-btn", "选择参考原图…");
+    const refOpen = el("button", "stlu-btn", "打开原图");
+    const refClear = el("button", "stlu-btn", "清除");
+    refBtn.title = "可选：与 PSD 同构图的高分辨率原图，会按同一位置为每层裁出参考块";
+    refOpen.disabled = true;
+    refClear.disabled = true;
+    refRow.append(refBtn);
+    refRow.append(refOpen);
+    refRow.append(refClear);
+    ui.line.after(refRow);
+    const refLine = el("div", "stlu-hint");
+    refLine.style.wordBreak = "break-all";
+    refRow.after(refLine);
+
+    const state = {
+      root: ui.root,
+      psd: String(widgetValue(node, "psd_path", "") || ""),
+      out: "",
+      on(kind, data) {
+        if (kind === "plan") {
+          state.out = String(data.out_dir || "");
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = (Number(data.count) || 0) + " 层";
+          const canvas = data.canvas || [];
+          ui.line.textContent = (canvas.length === 2 ? "画布 " + canvas[0] + "×" + canvas[1] + " · " : "") +
+            "→ output/" + (state.out || "") + "/";
+          ui.line.title = state.out;
+          openOut.disabled = !state.out;
+          openPsd.disabled = !state.psd;
+          const ref = data.reference;
+          if (ref && ref.file) {
+            const sc = ref.scale || [];
+            refLine.textContent = "参考原图：" + baseNameOf(ref.file) +
+              " · 已裁 " + (Number(ref.count) || 0) + " 块" +
+              (sc.length === 2 ? " · 坐标比例 " + Number(sc[0]).toFixed(3) + "×" + Number(sc[1]).toFixed(3) : "");
+            refLine.title = ref.file;
+          }
+          const src = psdPreviewSrc(state.out);
+          if (src) {
+            ui.wrap.style.display = "";
+            ui.thumb.src = src;
+          }
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "未完成";
+        }
+      },
+    };
+
+    function refresh() {
+      ui.line.textContent = state.psd
+        ? "PSD：" + baseNameOf(state.psd)
+        : "还没有选择成品 PSD";
+      ui.line.title = state.psd;
+      openPsd.disabled = !state.psd;
+      const out = String(widgetValue(node, "out_dir", "") || "");
+      outBtn.textContent = "输出位置：" + (out || "默认");
+      const ref = String(widgetValue(node, "reference_path", "") || "");
+      refLine.textContent = ref
+        ? "参考原图：" + baseNameOf(ref)
+        : "参考原图：未选择（可选，选了会按层裁参考块喂给 ③）";
+      refLine.title = ref;
+      refOpen.disabled = !ref;
+      refClear.disabled = !ref;
+    }
+
+    pick.addEventListener("click", () => openFsPicker({
+      title: "选择成品 PSD",
+      mode: "psd",
+      start: state.psd,
+      onPick(abs) {
+        state.psd = abs;
+        setWidget(node, "psd_path", abs);
+        refresh();
+      },
+    }));
+    refBtn.addEventListener("click", () => openFsPicker({
+      title: "选择参考原图（与 PSD 同构图的高分辨率原图）",
+      mode: "image",
+      start: String(widgetValue(node, "reference_path", "") || ""),
+      onPick(abs) {
+        setWidget(node, "reference_path", abs);
+        refresh();
+      },
+    }));
+    refOpen.addEventListener("click", () => openLocal(
+      String(widgetValue(node, "reference_path", "") || ""), true));
+    refClear.addEventListener("click", () => {
+      setWidget(node, "reference_path", "");
+      refresh();
+    });
+    outBtn.addEventListener("click", () => openPicker({
+      title: "选择输出位置（output 内）",
+      mode: "folder",
+      scopes: [{ scope: "output", label: "输出目录" }],
+      start: String(widgetValue(node, "out_dir", "") || ""),
+      onPick(rel) {
+        setWidget(node, "out_dir", rel || "SeeThrough/PsdUpscale");
+        refresh();
+      },
+    }));
+    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    openOut.addEventListener("click", () => openPath(state.out, false));
+
+    refresh();
+    addPsdState(node, state, "stlu_psd_prepare_card", 230, 420);
+  }
+
+  // Crop reader: the batch node wires the file automatically.
+  function setupPsdLoadCrop(node) {
+    hideWidget(widgetOf(node, "file"));
+
+    const ui = psdPanel(node, "裁剪读取（裁图→工作尺寸）",
+      "按工作尺寸读入裁剪图和它的轮廓 MASK。③ 批量节点会自动连好，一般不用手选。");
+    const pick = el("button", "stlu-btn", "选择裁剪图…");
+    const open = el("button", "stlu-btn", "打开图片");
+    open.disabled = true;
+    ui.actions.append(pick);
+    ui.actions.append(open);
+
+    const state = {
+      root: ui.root,
+      on(kind) {
+        if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "未完成";
+        }
+      },
+    };
+
+    function refresh() {
+      const file = String(widgetValue(node, "file", "") || "");
+      ui.line.textContent = file ? "图片：" + baseNameOf(file) : "还没有选择裁剪图";
+      ui.line.title = file;
+      open.disabled = !file;
+    }
+
+    pick.addEventListener("click", () => openFsPicker({
+      title: "选择裁剪图",
+      mode: "image",
+      start: String(widgetValue(node, "file", "") || ""),
+      onPick(abs) {
+        setWidget(node, "file", abs);
+        refresh();
+      },
+    }));
+    open.addEventListener("click", () => openLocal(String(widgetValue(node, "file", "") || ""), true));
+
+    refresh();
+    addPsdState(node, state, "stlu_psd_crop_card", 130, 250);
+  }
+
+  // Cut the edited crop back to the layer: geometry comes from ③.
+  function setupPsdCutToLayer(node) {
+    hideWidget(widgetOf(node, "geometry"));
+
+    const ui = psdPanel(node, "裁回图层（输出放大层）",
+      "把放大后的裁剪图裁回该层的目标尺寸，去掉白底、恢复原轮廓，写出一份放大层 PNG。由 ③ 自动驱动。");
+    const open = el("button", "stlu-btn", "打开图层所在文件夹");
+    open.disabled = true;
+    ui.actions.append(open);
+
+    const state = {
+      root: ui.root,
+      file: "",
+      on(kind, data) {
+        if (kind === "layer") {
+          state.file = String(data.file || "");
+          const size = data.size || [];
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = size.length === 2 ? size[0] + "×" + size[1] : "已写入";
+          ui.line.textContent = "✓ " + baseNameOf(state.file);
+          ui.line.title = state.file;
+          open.disabled = !state.file;
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "未完成";
+        }
+      },
+    };
+
+    open.addEventListener("click", () => openLocal(state.file, false));
+    addPsdState(node, state, "stlu_psd_cut_card", 130, 250);
+  }
+
+  // ④ rebuilds the layered PSD once every layer exists.
+  function setupPsdAssemble(node) {
+    hideWidget(widgetOf(node, "plan_json"));
+
+    const ui = psdPanel(node, "④ 重组 PSD",
+      "所有图层放大完以后运行：按计划里的分组、混合模式和透明度重新拼成一份新 PSD。");
+    const pick = el("button", "stlu-btn", "选择计划文件…");
+    const openPsd = el("button", "stlu-btn", "打开 PSD");
+    const openOut = el("button", "stlu-btn", "打开文件夹");
+    openPsd.disabled = true;
+    openOut.disabled = true;
+    ui.actions.append(pick);
+    ui.actions2.append(openPsd);
+    ui.actions2.append(openOut);
+
+    const state = {
+      root: ui.root,
+      plan: String(widgetValue(node, "plan_json", "") || ""),
+      out: "",
+      psd: "",
+      on(kind, data) {
+        if (kind === "plan") {
+          // Follow ① until the user picks a plan by hand.
+          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
+            setWidget(node, "plan_json", String(data.plan));
+            state.plan = String(data.plan);
+            refresh();
+          }
+          if (!state.out) state.out = String(data.out_dir || "");
+        } else if (kind === "assembled") {
+          state.out = String(data.dir || state.out);
+          state.psd = String(data.psd || "");
+          const canvas = data.canvas || [];
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = "✓ 已重组";
+          ui.line.textContent = (canvas.length === 2 ? canvas[0] + "×" + canvas[1] + " · " : "") +
+            (data.upscaled || 0) + " 层放大" +
+            (Number(data.fallback) ? " · " + data.fallback + " 层回退原图" : "") +
+            " — " + (data.name || "");
+          ui.line.title = state.psd;
+          openPsd.disabled = !state.psd;
+          openOut.disabled = !state.out;
+          const src = psdPreviewSrc(state.out);
+          if (src) {
+            ui.wrap.style.display = "";
+            ui.thumb.src = src;
+          }
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "未完成";
+        }
+      },
+    };
+
+    function refresh() {
+      ui.line.textContent = state.plan
+        ? "计划：" + baseNameOf(absDirOf(state.plan)) + "/psd_plan.json"
+        : "还没有计划文件：先运行 ①，或手动选择 psd_plan.json";
+      ui.line.title = state.plan;
+    }
+
+    pick.addEventListener("click", () => openPicker({
+      title: "选择 psd_plan.json",
+      mode: "json",
+      scopes: [{ scope: "output", label: "输出目录" }],
+      start: state.out || "",
+      onPick(rel, abs, file) {
+        const target = (file && file.abs) || abs || rel;
+        state.plan = String(target || "");
+        setWidget(node, "plan_json", state.plan);
+        if (file && file.rel) state.out = absDirOf(file.rel);
+        refresh();
+      },
+    }));
+    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    openOut.addEventListener("click", () => openPath(state.out, false));
+
+    refresh();
+    addPsdState(node, state, "stlu_psd_assemble_card", 210, 400);
+  }
+
+  // ③ clones the Qwen edit subgraph once per selected layer.
+  function setupPsdUpscale(node) {
+    hideWidget(widgetOf(node, "plan_json"));
+    hideWidget(widgetOf(node, "workflow_json"));
+
+    const ui = psdPanel(node, "③ 逐层放大（Qwen 编辑）",
+      "为每个选中图层克隆一遍编辑工作流并依次放大。去噪越低越贴近原图；生成慢是正常的，每层跑完才会到下一层。");
+    const pick = el("button", "stlu-btn", "选择计划文件…");
+    const wf = el("button", "stlu-btn", "选择编辑工作流…");
+    const openPsd = el("button", "stlu-btn", "打开 PSD");
+    const openOut = el("button", "stlu-btn", "打开输出文件夹");
+    openPsd.disabled = true;
+    openOut.disabled = true;
+    ui.actions.append(pick);
+    ui.actions.append(wf);
+    ui.actions2.append(openPsd);
+    ui.actions2.append(openOut);
+
+    const state = {
+      root: ui.root,
+      out: "",
+      psd: "",
+      total: 0,
+      done: new Set(),
+      on(kind, data) {
+        if (kind === "plan") {
+          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
+            setWidget(node, "plan_json", String(data.plan));
+            refresh();
+          }
+        } else if (kind === "start") {
+          state.total = Number(data.total) || 0;
+          state.done.clear();
+          state.out = String(data.out_dir || state.out);
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "正在放大…";
+          ui.line.textContent = "开始放大 " + state.total + " 层（去噪 " +
+            Number(data.denoise || 0).toFixed(2) + "）：" +
+            (data.parts || []).join("、");
+          openOut.disabled = !state.out;
+        } else if (kind === "layer") {
+          const file = String(data.file || "");
+          if (file && !state.done.has(file)) state.done.add(file);
+          const total = Math.max(state.total, state.done.size);
+          ui.line.textContent = "正在放大 " + state.done.size + "/" + total +
+            " · " + baseNameOf(file);
+        } else if (kind === "assembled") {
+          state.out = String(data.dir || state.out);
+          state.psd = String(data.psd || "");
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = "✓ 完成";
+          ui.line.textContent = "已生成：" + (data.name || baseNameOf(state.psd)) +
+            (Number(data.fallback) ? "（" + data.fallback + " 层回退原图）" : "");
+          ui.line.title = state.psd;
+          openPsd.disabled = !state.psd;
+          openOut.disabled = !state.out;
+          const src = psdPreviewSrc(state.out);
+          if (src) {
+            ui.wrap.style.display = "";
+            ui.thumb.src = src;
+          }
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "已中断";
+        }
+      },
+    };
+
+    function refresh() {
+      const plan = String(widgetValue(node, "plan_json", "") || "");
+      const workflow = String(widgetValue(node, "workflow_json", "") || "");
+      ui.line.textContent = (plan ? "计划：" + baseNameOf(absDirOf(plan)) + "/psd_plan.json" : "计划：跟随 ① 自动填写") +
+        " · 工作流：" + (workflow ? baseNameOf(workflow) : "默认模板");
+      ui.line.title = plan || workflow;
+    }
+
+    pick.addEventListener("click", () => openPicker({
+      title: "选择 psd_plan.json",
+      mode: "json",
+      scopes: [{ scope: "output", label: "输出目录" }],
+      start: state.out || "",
+      onPick(rel, abs, file) {
+        const target = (file && file.abs) || abs || rel;
+        setWidget(node, "plan_json", String(target || ""));
+        if (file && file.rel) state.out = absDirOf(file.rel);
+        refresh();
+      },
+    }));
+    wf.addEventListener("click", () => openPicker({
+      title: "选择图编辑工作流",
+      mode: "workflow",
+      scopes: [{ scope: "workflows", label: "工作流" }],
+      start: "",
+      onPick(rel, abs, file) {
+        setWidget(node, "workflow_json", String((file && file.abs) || abs || rel || ""));
+        refresh();
+      },
+    }));
+    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    openOut.addEventListener("click", () => openPath(state.out, false));
+
+    refresh();
+    addPsdState(node, state, "stlu_psd_upscale_card", 210, 400);
+  }
+
+  // -------------------------------------------------------------------------
+  // PSD edit workflow (① prepare -> ② per-task edit -> ③ assemble)
+  // -------------------------------------------------------------------------
+
+  // ① reads the finished PSD, cuts one crop per task and writes edit_plan.json.
+  // The task table is the whole point: every row is one layer to edit (or a
+  // new accessory that does not exist yet), serialized to the hidden
+  // ``tasks`` widget as JSON so nothing has to be typed by hand.
+  function setupEditPrepare(node) {
+    hideWidget(widgetOf(node, "psd_path"));
+    hideWidget(widgetOf(node, "tasks"));
+    hideWidget(widgetOf(node, "out_dir"));
+    hideWidget(widgetOf(node, "reference_path"));
+
+    const ui = psdPanel(node, "① 编辑准备（切层 + 任务表）",
+      "选好成品 PSD，再一行一个任务：选原图层改色/改材质，或新增一个饰品层。运行一次即按任务裁好每块裁剪图。");
+    const outBtn = el("button", "stlu-btn", "输出位置：默认");
+    const pick = el("button", "stlu-btn stlu-primary", "选择成品 PSD…");
+    const openPsd = el("button", "stlu-btn", "打开 PSD");
+    const openOut = el("button", "stlu-btn", "打开输出文件夹");
+    openPsd.disabled = true;
+    openOut.disabled = true;
+    ui.actions.append(pick);
+    ui.actions.append(outBtn);
+    ui.actions2.append(openPsd);
+    ui.actions2.append(openOut);
+
+    // Optional high-resolution reference: same frame, finer pixels, cut at
+    // the same boxes so the encoder sees real detail instead of upsampling.
+    const refRow = el("div", "stlu-line");
+    const refBtn = el("button", "stlu-btn", "选择参考原图…");
+    const refOpen = el("button", "stlu-btn", "打开原图");
+    const refClear = el("button", "stlu-btn", "清除");
+    refBtn.title = "可选：与 PSD 同构图的高分辨率原图，会按同一位置为每层裁出参考块";
+    refOpen.disabled = true;
+    refClear.disabled = true;
+    refRow.append(refBtn);
+    refRow.append(refOpen);
+    refRow.append(refClear);
+    ui.line.after(refRow);
+    const refLine = el("div", "stlu-hint");
+    refLine.style.wordBreak = "break-all";
+    refRow.after(refLine);
+
+    // The task table lives below the reference row.
+    const tableEl = el("div");
+    tableEl.style.display = "flex";
+    tableEl.style.flexDirection = "column";
+    tableEl.style.gap = "6px";
+    refLine.after(tableEl);
+    const addBtn = el("button", "stlu-btn", "＋ 添加任务");
+    tableEl.after(addBtn);
+
+    const state = {
+      root: ui.root,
+      psd: String(widgetValue(node, "psd_path", "") || ""),
+      out: "",
+      layers: [],
+      layerNames: new Set(),
+      canvas: [],
+      tasks: [],
+      on(kind, data) {
+        if (kind === "plan") {
+          state.out = String(data.out_dir || "");
+          const canvas = data.canvas || [];
+          const nl = Array.isArray(data.new_layers) ? data.new_layers.length : 0;
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = (Number(data.count) || 0) + " 个任务";
+          ui.line.textContent = (canvas.length === 2 ? "画布 " + canvas[0] + "×" + canvas[1] + " · " : "") +
+            (Number(data.count) || 0) + " 个编辑任务" + (nl ? "（含 " + nl + " 个新层）" : "") +
+            " → output/" + (state.out || "") + "/";
+          ui.line.title = state.out;
+          openOut.disabled = !state.out;
+          openPsd.disabled = !state.psd;
+          const src = psdPreviewSrc(state.out);
+          if (src) {
+            ui.wrap.style.display = "";
+            ui.thumb.src = src;
+          }
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "未完成";
+        }
+      },
+    };
+
+    let writing = false;
+
+    function optionEl(value, label) {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = label;
+      return o;
+    }
+
+    function intOr(value, fallback) {
+      const n = parseInt(value, 10);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function serializeTask(task) {
+      const out = { name: String(task.name || "").trim(), prompt: String(task.prompt || "") };
+      if (String(task.ref_file || "").trim()) out.ref_file = task.ref_file;
+      out.silhouette = task.silhouette === "key" ? "key" : "lock";
+      if (task.isNew) {
+        const b = task.box || {};
+        out.box = { x: intOr(b.x, 0), y: intOr(b.y, 0), w: intOr(b.w, 512), h: intOr(b.h, 512) };
+        out.insert = String(task.insert || "");
+      }
+      return out;
+    }
+
+    function serialize() {
+      if (writing) return;
+      writing = true;
+      try {
+        const tasks = state.tasks.map(serializeTask).filter((t) => t.name);
+        setWidget(node, "tasks", JSON.stringify({ tasks }, null, 2));
+      } finally {
+        writing = false;
+      }
+    }
+
+    function parseTasks(text) {
+      const raw = String(text || "").trim();
+      if (!raw) return [];
+      if (raw.startsWith("[") || raw.startsWith("{")) {
+        try {
+          const data = JSON.parse(raw);
+          if (Array.isArray(data)) return data;
+          if (data && Array.isArray(data.tasks)) return data.tasks;
+        } catch (e) { /* fall through to text rows */ }
+      }
+      const rows = [];
+      for (const line of raw.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const cells = t.split(/\s*[|\t]\s*/);
+        rows.push({
+          name: cells[0] || "", prompt: cells[1] || "", ref_file: cells[2] || "",
+          silhouette: cells[3] || "", box: cells[4] || "", insert: cells[5] || "",
+        });
+      }
+      return rows;
+    }
+
+    function normalizeTask(raw) {
+      const name = String(raw.name || "").trim();
+      const prompt = String(raw.prompt || raw.instruction || "").trim();
+      const ref = String(raw.ref_file || raw.reference || "").trim();
+      const sil = String(raw.silhouette || raw.mode || "lock").toLowerCase();
+      const silhouette = /绿幕|key|green|chroma|抠图/.test(sil) ? "key" : "lock";
+      let box = { x: 0, y: 0, w: 512, h: 512 };
+      const b = raw.box;
+      if (b && typeof b === "object" && !Array.isArray(b)) {
+        box = { x: intOr(b.x, 0), y: intOr(b.y, 0), w: intOr(b.w, 512), h: intOr(b.h, 512) };
+      } else if (Array.isArray(b) && b.length === 4) {
+        box = { x: intOr(b[0], 0), y: intOr(b[1], 0), w: intOr(b[2], 0) - intOr(b[0], 0), h: intOr(b[3], 0) - intOr(b[1], 0) };
+      } else if (typeof b === "string" && b.trim()) {
+        const p = b.split(",").map((v) => intOr(v, 0));
+        if (p.length === 4) box = { x: p[0], y: p[1], w: p[2], h: p[3] };
+      }
+      const insert = String(raw.insert || raw.insert_after || "").trim();
+      const hasBox = raw.box != null && raw.box !== "";
+      const known = state.layerNames.size > 0;
+      const isNew = hasBox || !name || (known && !state.layerNames.has(name));
+      return { name, prompt, ref_file: ref, silhouette, box, insert, isNew };
+    }
+
+    function numField(task, key, label) {
+      const wrap = el("label", "stlu-check");
+      wrap.appendChild(el("span", null, label));
+      const inp = el("input", "stlu-input");
+      inp.type = "number";
+      inp.style.width = "56px";
+      const b = task.box || {};
+      inp.value = String(b[key] != null ? b[key] : 0);
+      inp.addEventListener("input", () => {
+        task.box = task.box || {};
+        task.box[key] = intOr(inp.value, 0);
+        serialize();
+      });
+      wrap.appendChild(inp);
+      return wrap;
+    }
+
+    function buildRow(task) {
+      const card = el("div");
+      card.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:6px;" +
+        "border:1px solid #2f2f31;border-radius:6px;background:#171719;";
+
+      // Layer picker: an existing layer, or a brand-new accessory.
+      const head = el("div", "stlu-line");
+      const sel = document.createElement("select");
+      sel.className = "stlu-input";
+      sel.style.maxWidth = "200px";
+      sel.appendChild(optionEl("__new__", "＋ 新增图层"));
+      for (const name of Array.from(state.layerNames)) sel.appendChild(optionEl(name, name));
+      const isNew = task.isNew || !state.layerNames.has(task.name) || !task.name;
+      sel.value = isNew ? "__new__" : task.name;
+      task.isNew = sel.value === "__new__";
+      head.appendChild(sel);
+
+      if (task.isNew) {
+        const nameInput = el("input", "stlu-input");
+        nameInput.style.width = "120px";
+        nameInput.placeholder = "新图层名";
+        nameInput.value = task.name || "";
+        nameInput.addEventListener("input", () => { task.name = nameInput.value; serialize(); });
+        head.appendChild(nameInput);
+      }
+      head.appendChild(el("span", "grow"));
+      const del = el("button", "stlu-btn", "删除");
+      del.addEventListener("click", () => {
+        const idx = state.tasks.indexOf(task);
+        if (idx >= 0) state.tasks.splice(idx, 1);
+        renderAll(true);
+      });
+      head.appendChild(del);
+      card.appendChild(head);
+
+      sel.addEventListener("change", () => {
+        task.isNew = sel.value === "__new__";
+        if (!task.isNew) task.name = sel.value;
+        renderAll(true);
+      });
+
+      // Edit instruction.
+      const prompt = el("input", "stlu-input");
+      prompt.placeholder = "编辑指令（例如：换成红色外套 / 加一个发卡 / 放大细节）";
+      prompt.value = task.prompt || "";
+      prompt.addEventListener("input", () => { task.prompt = prompt.value; serialize(); });
+      card.appendChild(prompt);
+
+      // Silhouette mode + optional reference image.
+      const line2 = el("div", "stlu-line");
+      const sil = document.createElement("select");
+      sil.className = "stlu-input";
+      sil.style.maxWidth = "150px";
+      sil.title = "锁定轮廓=保持原形状只改内容；绿幕重抠=允许改形状，抠回时按绿幕重抠";
+      sil.appendChild(optionEl("lock", "锁定轮廓"));
+      sil.appendChild(optionEl("key", "绿幕重抠"));
+      sil.value = task.silhouette === "key" ? "key" : "lock";
+      sil.addEventListener("change", () => { task.silhouette = sil.value; serialize(); });
+      line2.appendChild(sil);
+
+      const refBtn = el("button", "stlu-btn", "参考图…");
+      const refLbl = el("span", "stlu-hint", task.ref_file ? baseNameOf(task.ref_file) : "无参考图");
+      refLbl.style.maxWidth = "150px";
+      refLbl.style.overflow = "hidden";
+      refLbl.style.textOverflow = "ellipsis";
+      refLbl.style.whiteSpace = "nowrap";
+      refLbl.title = task.ref_file || "";
+      const refClear = el("button", "stlu-btn", "清除");
+      refBtn.addEventListener("click", () => openFsPicker({
+        title: "选择该任务的参考图（可选）",
+        mode: "image",
+        start: task.ref_file || "",
+        onPick(abs) {
+          task.ref_file = abs;
+          refLbl.textContent = baseNameOf(abs);
+          refLbl.title = abs;
+          serialize();
+        },
+      }));
+      refClear.addEventListener("click", () => {
+        task.ref_file = "";
+        refLbl.textContent = "无参考图";
+        refLbl.title = "";
+        serialize();
+      });
+      line2.appendChild(refBtn);
+      line2.appendChild(refLbl);
+      line2.appendChild(refClear);
+      card.appendChild(line2);
+
+      // New layers need a box on the canvas and an insertion point.
+      if (task.isNew) {
+        const line3 = el("div", "stlu-line");
+        line3.appendChild(numField(task, "x", "X"));
+        line3.appendChild(numField(task, "y", "Y"));
+        line3.appendChild(numField(task, "w", "宽"));
+        line3.appendChild(numField(task, "h", "高"));
+        card.appendChild(line3);
+
+        const line4 = el("div", "stlu-line");
+        const ins = document.createElement("select");
+        ins.className = "stlu-input";
+        ins.style.maxWidth = "220px";
+        ins.appendChild(optionEl("", "插入：最上层"));
+        ins.appendChild(optionEl("bottom", "插入：最下层"));
+        for (const name of Array.from(state.layerNames)) {
+          ins.appendChild(optionEl(name, "插入：在「" + name + "」之后"));
+        }
+        ins.value = task.insert || "";
+        if (Array.from(ins.options).every((o) => o.value !== ins.value)) ins.value = "";
+        ins.addEventListener("change", () => { task.insert = ins.value; serialize(); });
+        line4.appendChild(ins);
+        card.appendChild(line4);
+      }
+      return card;
+    }
+
+    function renderAll(write) {
+      tableEl.innerHTML = "";
+      if (!state.tasks.length) {
+        tableEl.appendChild(el("div", "stlu-hint",
+          "还没有任务：点下面「＋ 添加任务」，选一个原图层修改，或新增一个饰品层。"));
+      }
+      for (const task of state.tasks) tableEl.appendChild(buildRow(task));
+      if (write) serialize();
+    }
+
+    function restore() {
+      state.tasks = parseTasks(widgetValue(node, "tasks", "")).map(normalizeTask);
+      renderAll(false);
+    }
+
+    function refresh() {
+      const out = String(widgetValue(node, "out_dir", "") || "");
+      outBtn.textContent = "输出位置：" + (out || "默认（SeeThrough/PsdEdit）");
+      const ref = String(widgetValue(node, "reference_path", "") || "");
+      refLine.textContent = ref
+        ? "参考原图：" + baseNameOf(ref)
+        : "参考原图：未选择（可选，选了会按同位置裁参考块喂给 ②）";
+      refLine.title = ref;
+      refOpen.disabled = !ref;
+      refClear.disabled = !ref;
+      if (state.psd) {
+        const c = state.canvas || [];
+        ui.line.textContent = "PSD：" + baseNameOf(state.psd) +
+          (c.length === 2 ? " · 画布 " + c[0] + "×" + c[1] : "") +
+          (state.layerNames.size ? " · " + state.layerNames.size + " 层可编辑" : "");
+      } else {
+        ui.line.textContent = "还没有选择成品 PSD";
+      }
+      ui.line.title = state.psd;
+      openPsd.disabled = !state.psd;
+    }
+
+    async function loadLayers() {
+      state.layers = [];
+      state.layerNames = new Set();
+      state.canvas = [];
+      if (!state.psd) { refresh(); return; }
+      try {
+        const data = await getJson("/stlu/psd_layers?path=" + encodeURIComponent(state.psd));
+        state.layers = Array.isArray(data.layers) ? data.layers : [];
+        state.canvas = Array.isArray(data.canvas) ? data.canvas : [];
+        state.layerNames = new Set(state.layers.map((l) => String(l.name)));
+      } catch (e) {
+        console.warn("[STLU] psd layers", e);
+      }
+      refresh();
+      restore(); // recompute new/existing now that layer names are known
+    }
+
+    addBtn.addEventListener("click", () => {
+      state.tasks.push({
+        name: "", prompt: "", ref_file: "", silhouette: "lock",
+        box: { x: 0, y: 0, w: 512, h: 512 }, insert: "", isNew: true,
+      });
+      renderAll(true);
+    });
+    pick.addEventListener("click", () => openFsPicker({
+      title: "选择成品 PSD",
+      mode: "psd",
+      start: state.psd,
+      onPick(abs) {
+        state.psd = abs;
+        setWidget(node, "psd_path", abs);
+        refresh();
+        loadLayers();
+      },
+    }));
+    refBtn.addEventListener("click", () => openFsPicker({
+      title: "选择参考原图（与 PSD 同构图的高分辨率原图）",
+      mode: "image",
+      start: String(widgetValue(node, "reference_path", "") || ""),
+      onPick(abs) {
+        setWidget(node, "reference_path", abs);
+        refresh();
+      },
+    }));
+    refOpen.addEventListener("click", () => openLocal(
+      String(widgetValue(node, "reference_path", "") || ""), true));
+    refClear.addEventListener("click", () => {
+      setWidget(node, "reference_path", "");
+      refresh();
+    });
+    outBtn.addEventListener("click", () => openPicker({
+      title: "选择输出位置（output 内）",
+      mode: "folder",
+      scopes: [{ scope: "output", label: "输出目录" }],
+      start: String(widgetValue(node, "out_dir", "") || ""),
+      onPick(rel) {
+        setWidget(node, "out_dir", rel || "SeeThrough/PsdEdit");
+        refresh();
+      },
+    }));
+    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    openOut.addEventListener("click", () => openPath(state.out, false));
+
+    refresh();
+    restore();
+    if (state.psd) loadLayers();
+    watchValue(node, "tasks", () => { if (!writing) restore(); });
+    // Catch widget values restored by onConfigure (they bypass watchValue).
+    setTimeout(() => {
+      state.psd = String(widgetValue(node, "psd_path", "") || "");
+      refresh();
+      if (state.psd) loadLayers(); else restore();
+    }, 0);
+    addEditCdState(node, state, "stlu_edit_prepare_card", 320, 720);
+  }
+
+  // ② clones the Qwen edit subgraph once per task.
+  function setupEditLayer(node) {
+    hideWidget(widgetOf(node, "plan_json"));
+    hideWidget(widgetOf(node, "workflow_json"));
+    hideWidget(widgetOf(node, "psd_filename"));
+
+    const ui = psdPanel(node, "② 逐层编辑（Qwen 图编辑）",
+      "为每个编辑任务克隆一遍编辑工作流：锁定轮廓的换色/改材质，绿幕项重画形状，新饰品层在绿幕上生成。");
+    const pick = el("button", "stlu-btn", "选择计划文件…");
+    const wf = el("button", "stlu-btn", "选择编辑工作流…");
+    const openOut = el("button", "stlu-btn", "打开输出文件夹");
+    openOut.disabled = true;
+    ui.actions.append(pick);
+    ui.actions.append(wf);
+    ui.actions2.append(openOut);
+
+    const state = {
+      root: ui.root,
+      out: "",
+      total: 0,
+      done: new Set(),
+      on(kind, data) {
+        if (kind === "plan") {
+          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
+            setWidget(node, "plan_json", String(data.plan));
+            refresh();
+          }
+          if (!state.out) state.out = String(data.out_dir || "");
+        } else if (kind === "start") {
+          state.total = Number(data.total) || 0;
+          state.done.clear();
+          state.out = String(data.out_dir || state.out);
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "正在编辑…";
+          const parts = Array.isArray(data.parts) ? data.parts : [];
+          ui.line.textContent = "开始编辑 " + state.total + " 个任务：" + parts.join("、");
+          openOut.disabled = !state.out;
+        } else if (kind === "layer") {
+          const file = String(data.file || "");
+          if (file && !state.done.has(file)) state.done.add(file);
+          const total = Math.max(state.total, state.done.size);
+          ui.line.textContent = "正在编辑 " + state.done.size + "/" + total + " · " + baseNameOf(file);
+        } else if (kind === "assembled") {
+          state.out = String(data.dir || state.out);
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = "✓ 完成";
+          const edited = Array.isArray(data.edited) ? data.edited.length : (Number(data.edited) || 0);
+          ui.line.textContent = "已生成：" + (data.name || baseNameOf(String(data.psd || ""))) +
+            "（" + edited + " 层编辑）";
+          openOut.disabled = !state.out;
+          const src = psdPreviewSrc(state.out);
+          if (src) {
+            ui.wrap.style.display = "";
+            ui.thumb.src = src;
+          }
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "已中断";
+        }
+      },
+    };
+
+    function refresh() {
+      const plan = String(widgetValue(node, "plan_json", "") || "");
+      const workflow = String(widgetValue(node, "workflow_json", "") || "");
+      ui.line.textContent = (plan ? "计划：" + baseNameOf(absDirOf(plan)) + "/edit_plan.json" : "计划：跟随 ① 自动填写") +
+        " · 工作流：" + (workflow ? baseNameOf(workflow) : "默认模板");
+      ui.line.title = plan || workflow;
+    }
+
+    pick.addEventListener("click", () => openPicker({
+      title: "选择 edit_plan.json",
+      mode: "json",
+      scopes: [{ scope: "output", label: "输出目录" }],
+      start: state.out || "",
+      onPick(rel, abs, file) {
+        const target = (file && file.abs) || abs || rel;
+        setWidget(node, "plan_json", String(target || ""));
+        if (file && file.rel) state.out = absDirOf(file.rel);
+        refresh();
+      },
+    }));
+    wf.addEventListener("click", () => openPicker({
+      title: "选择图编辑工作流",
+      mode: "workflow",
+      scopes: [{ scope: "workflows", label: "工作流" }],
+      start: "",
+      onPick(rel, abs, file) {
+        setWidget(node, "workflow_json", String((file && file.abs) || abs || rel || ""));
+        refresh();
+      },
+    }));
+    openOut.addEventListener("click", () => openPath(state.out, false));
+
+    refresh();
+    addEditCdState(node, state, "stlu_edit_layer_card", 190, 380);
+  }
+
+  // ③ rebuilds the edited PSD once every task has been cut back to a layer.
+  function setupEditAssemble(node) {
+    hideWidget(widgetOf(node, "plan_json"));
+    hideWidget(widgetOf(node, "psd_filename"));
+
+    const ui = psdPanel(node, "③ 重组编辑 PSD",
+      "所有编辑任务都抠回图层以后运行：按原顺序、混合模式和透明度重拼成新 PSD，新饰品层按插入位置入列。");
+    const pick = el("button", "stlu-btn", "选择计划文件…");
+    const openPsd = el("button", "stlu-btn", "打开 PSD");
+    const openOut = el("button", "stlu-btn", "打开文件夹");
+    openPsd.disabled = true;
+    openOut.disabled = true;
+    ui.actions.append(pick);
+    ui.actions2.append(openPsd);
+    ui.actions2.append(openOut);
+
+    const state = {
+      root: ui.root,
+      plan: String(widgetValue(node, "plan_json", "") || ""),
+      out: "",
+      psd: "",
+      on(kind, data) {
+        if (kind === "plan") {
+          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
+            setWidget(node, "plan_json", String(data.plan));
+            state.plan = String(data.plan);
+            refresh();
+          }
+          if (!state.out) state.out = String(data.out_dir || "");
+        } else if (kind === "assembled") {
+          state.out = String(data.dir || state.out);
+          state.psd = String(data.psd || "");
+          const canvas = data.canvas || [];
+          const edited = Array.isArray(data.edited) ? data.edited.length : (Number(data.edited) || 0);
+          const fb = Array.isArray(data.fallback) ? data.fallback.length : (Number(data.fallback) || 0);
+          const nl = Array.isArray(data.new_layers) ? data.new_layers.length : 0;
+          ui.tag.className = "stlu-tag ok";
+          ui.tag.textContent = "✓ 已重组";
+          ui.line.textContent = (canvas.length === 2 ? canvas[0] + "×" + canvas[1] + " · " : "") +
+            edited + " 层编辑" + (fb ? " · " + fb + " 层回退原图" : "") +
+            (nl ? " · " + nl + " 个新层" : "") + " — " + (data.name || "");
+          ui.line.title = state.psd;
+          openPsd.disabled = !state.psd;
+          openOut.disabled = !state.out;
+          const src = psdPreviewSrc(state.out);
+          if (src) {
+            ui.wrap.style.display = "";
+            ui.thumb.src = src;
+          }
+        } else if (kind === "error") {
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "未完成";
+        }
+      },
+    };
+
+    function refresh() {
+      ui.line.textContent = state.plan
+        ? "计划：" + baseNameOf(absDirOf(state.plan)) + "/edit_plan.json"
+        : "还没有计划文件：先运行 ①，或手动选择 edit_plan.json";
+      ui.line.title = state.plan;
+    }
+
+    pick.addEventListener("click", () => openPicker({
+      title: "选择 edit_plan.json",
+      mode: "json",
+      scopes: [{ scope: "output", label: "输出目录" }],
+      start: state.out || "",
+      onPick(rel, abs, file) {
+        const target = (file && file.abs) || abs || rel;
+        state.plan = String(target || "");
+        setWidget(node, "plan_json", state.plan);
+        if (file && file.rel) state.out = absDirOf(file.rel);
+        refresh();
+      },
+    }));
+    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    openOut.addEventListener("click", () => openPath(state.out, false));
+
+    refresh();
+    addEditCdState(node, state, "stlu_edit_assemble_card", 200, 390);
   }
 
   // -------------------------------------------------------------------------
@@ -7770,8 +8566,7 @@
         };
       }
 
-      if (nodeData.name === PIPELINE || nodeData.name === PIPELINE_SETTINGS
-          || nodeData.name === SIMPLE) {
+      if (nodeData.name === PIPELINE || nodeData.name === PIPELINE_SETTINGS) {
         const hideCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
           const result = hideCreated ? hideCreated.apply(this, arguments) : undefined;
@@ -7787,17 +8582,21 @@
         };
       }
 
-      if (nodeData.name !== PLAN && nodeData.name !== BATCH
-          && nodeData.name !== ASSEMBLE && nodeData.name !== EDIT_BATCH
+      if (nodeData.name !== EDIT_BATCH
           && nodeData.name !== TILES && nodeData.name !== TILE_SELECT
           && nodeData.name !== TILE_MERGE && nodeData.name !== TILE_GRID
           && nodeData.name !== PIPELINE
           && nodeData.name !== PIPELINE_SETTINGS
-          && nodeData.name !== SIMPLE
           && nodeData.name !== SELECT_TILES && nodeData.name !== REBUILD_PSD
           && nodeData.name !== SAVE_TILES && nodeData.name !== WAVE
           && nodeData.name !== TILE_PSD && nodeData.name !== WAVE_INDEX
-          && nodeData.name !== PSD_PREVIEW) return;
+          && nodeData.name !== PSD_PREVIEW && nodeData.name !== SEQ_LOOP
+          && nodeData.name !== PSD_PREPARE && nodeData.name !== PSD_LOAD_CROP
+          && nodeData.name !== PSD_CUT && nodeData.name !== PSD_ASSEMBLE
+          && nodeData.name !== PSD_UPSCALE
+          && nodeData.name !== EDIT_PREPARE && nodeData.name !== EDIT_LAYER
+          && nodeData.name !== EDIT_ASSEMBLE
+          && nodeData.name !== "STLU_LayerPSD") return;
       bindEvents();
       const onCreated = nodeType.prototype.onNodeCreated;
       nodeType.prototype.onNodeCreated = function () {
@@ -7805,16 +8604,13 @@
         try {
           const m = i18n();
           if (m && m.enabled) m.labelCombos(this);
-          if (nodeData.name === PLAN) setupPlan(this);
-          else if (nodeData.name === BATCH) setupBatch(this);
-          else if (nodeData.name === EDIT_BATCH) setupEditBatch(this);
+          if (nodeData.name === EDIT_BATCH) setupEditBatch(this);
           else if (nodeData.name === TILES) setupTiles(this);
           else if (nodeData.name === TILE_SELECT) setupTileSelect(this);
           else if (nodeData.name === TILE_MERGE) setupTileMerge(this);
           else if (nodeData.name === TILE_GRID) setupTileGrid(this);
           else if (nodeData.name === PIPELINE
-            || nodeData.name === PIPELINE_SETTINGS
-            || nodeData.name === SIMPLE) setupTileGrid(this);
+            || nodeData.name === PIPELINE_SETTINGS) setupTileGrid(this);
           else if (nodeData.name === SELECT_TILES) setupSelectTiles(this);
           else if (nodeData.name === REBUILD_PSD) setupRebuildPSD(this);
           else if (nodeData.name === SAVE_TILES) setupSaveTiles(this);
@@ -7822,7 +8618,16 @@
           else if (nodeData.name === TILE_PSD) setupTilePSD(this);
           else if (nodeData.name === WAVE_INDEX) setupWaveIndex(this);
           else if (nodeData.name === PSD_PREVIEW) setupPartsPreview(this);
-          else setupAssemble(this);
+          else if (nodeData.name === SEQ_LOOP) setupTileLoop(this);
+          else if (nodeData.name === PSD_PREPARE) setupPsdPrepare(this);
+          else if (nodeData.name === PSD_LOAD_CROP) setupPsdLoadCrop(this);
+          else if (nodeData.name === PSD_CUT) setupPsdCutToLayer(this);
+          else if (nodeData.name === PSD_ASSEMBLE) setupPsdAssemble(this);
+          else if (nodeData.name === PSD_UPSCALE) setupPsdUpscale(this);
+          else if (nodeData.name === EDIT_PREPARE) setupEditPrepare(this);
+          else if (nodeData.name === EDIT_LAYER) setupEditLayer(this);
+          else if (nodeData.name === EDIT_ASSEMBLE) setupEditAssemble(this);
+          else if (nodeData.name === "STLU_LayerPSD") setupMaskPSD(this);
         } catch (e) {
           console.error("[STLU] failed to build UI for " + nodeData.name, e);
         }

@@ -23,7 +23,7 @@ import folder_paths
 if __package__:  # ComfyUI loads the folder as a package
     from . import (core_compose, core_geometry, core_io, core_mask4k, core_plan,
                    core_reference, edit_expand, edit_parts, psd_reader,
-                   psd_writer, subgraph_clone, tile_psd, tile_strips)
+                   psd_writer, tile_psd, tile_strips)
     from .stlu import json_io, limits as stlu_limits
 else:  # standalone import used by the tests and tools
     import core_compose
@@ -36,7 +36,6 @@ else:  # standalone import used by the tests and tools
     import edit_parts
     import psd_reader
     import psd_writer
-    import subgraph_clone
     import tile_psd
     import tile_strips
     from stlu import json_io, limits as stlu_limits
@@ -377,11 +376,10 @@ class STLU_SaveLayer:
 class STLU_DetailBatch:
     """Rebuild every layer from a higher-resolution reference (CPU only).
 
-    This is the alternative to ``STLU_UpscaleBatch`` for character art whose
-    full-body reference is a sharper version of the same picture.  Instead of
-    asking an edit model to redraw a 20x20 pupil (which only blurs and invents),
-    each layer's alpha is cut out of the split and its colour is taken from the
-    reference wherever the two agree.  Visible pixels keep the artist's real
+    For character art whose full-body reference is a sharper version of the
+    same picture.  Instead of asking an edit model to redraw a 20x20 pupil
+    (which only blurs and invents), each layer's alpha is cut out of the split
+    and its colour is taken from the reference wherever the two agree.  Visible pixels keep the artist's real
     linework; hidden pixels keep the layer's own colour.
 
     No model inputs are needed, so running this node loads nothing onto the GPU.
@@ -536,128 +534,6 @@ class STLU_DetailBatch:
         # when the reference or the split changes size.
         return float("nan")
 
-class STLU_AssemblePSD:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "plan": ("STRING", {"default": ""}),
-                # plan 自带的 out_dir 优先；这里只是没接 plan 时的兜底。
-                "out_dir": ("STRING", {"default": ""}),
-            },
-            "optional": {
-                "deps": ("*",),
-                "psd_filename": ("STRING", {"default": ""}),
-                "fallback": (["both", "psd", "json"], {"default": "both"}),
-                "write_layers_json": ("BOOLEAN", {"default": True}),
-                "alpha_threshold": ("INT", {"default": 8, "min": 0, "max": 255, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "IMAGE")
-    RETURN_NAMES = ("psd_path", "layers_json_path", "report", "preview")
-    FUNCTION = "execute"
-    CATEGORY = CATEGORY
-    OUTPUT_NODE = True
-
-    def execute(self, plan, out_dir, deps=None, psd_filename="", fallback="both",
-                write_layers_json=True, alpha_threshold=8):
-        plan_data = _load_plan(plan)
-        output_root = _output_root()
-        plan_out_dir = plan_data.get("out_dir") or out_dir
-        target_dir = core_io.out_dir_abs(output_root, plan_out_dir)
-
-        canvas, psd_layers, notes = core_compose.build_canvas(
-            plan_data, output_root, alpha_threshold=int(alpha_threshold)
-        )
-        preview = core_compose.canvas_to_preview(canvas)
-        preview_tensor = torch.from_numpy(preview.astype(np.float32) / 255.0)[None]
-
-        stem = core_plan.safe_name(psd_filename or (
-            str(plan_data.get("source", {}).get("prefix") or "seethrough") + "_upscaled"
-        ))
-        psd_path = os.path.join(target_dir, stem + ".psd")
-        # A small RGBA preview next to the PSD: shown in the node card and
-        # handy for checking the result without opening Photoshop.
-        preview_png = os.path.join(target_dir, stem + "_preview.png")
-        try:
-            core_io.write_rgba(preview_png, canvas)
-        except Exception as exc:  # noqa: BLE001
-            notes.append("preview write failed: %s" % exc)
-            preview_png = ""
-        # Deliberately not "*_layers.json": the Plan node discovers source
-        # layers by that suffix and must not pick up this assembled file.
-        layers_json_path = os.path.join(target_dir, stem + "_psdinfo.json")
-
-        report = {
-            "layers": len(psd_layers),
-            "canvas": [int(canvas.shape[1]), int(canvas.shape[0])],
-            "selected": plan_data.get("total", 0),
-            "notes": notes[:50],
-            "psd": None,
-            "layers_json": None,
-        }
-
-        if fallback != "json":
-            try:
-                psd_writer.write_psd(psd_path, psd_layers, canvas.shape[1], canvas.shape[0], "rle")
-                report["psd"] = psd_path
-                print("[STLU] PSD written: %s" % psd_path, flush=True)
-            except Exception as exc:  # noqa: BLE001
-                notes.append("PSD write failed: %s" % exc)
-                report["psd_error"] = str(exc)
-                if fallback == "psd":
-                    raise
-
-        if write_layers_json or report.get("psd") is None:
-            try:
-                core_compose.write_layers_json(plan_data, psd_layers, layers_json_path)
-                report["layers_json"] = layers_json_path
-                # NOTE: we intentionally do not rewrite ``seethrough_psd_info.log``:
-                # the SeeThrough frontend button fetches layers from the output
-                # *root* and cannot resolve our sub folder, so the automatic PSD
-                # above is the supported path.  The JSON is still written for
-                # other tools that can read it.
-            except Exception as exc:  # noqa: BLE001
-                notes.append("layers.json write failed: %s" % exc)
-
-        report_text = json.dumps(report, ensure_ascii=False, indent=2)
-
-        psd_folder, psd_name = _output_rel(psd_path)
-        info = {
-            "filename": psd_name,
-            "subfolder": psd_folder,
-            "out_dir": plan_out_dir,
-            "layers": len(psd_layers),
-            "canvas": [int(canvas.shape[1]), int(canvas.shape[0])],
-            "size": os.path.getsize(psd_path) if os.path.isfile(psd_path) else 0,
-            "preview": None,
-            "error": report.get("psd_error") or (None if report.get("psd") else
-                                                 "PSD 未生成 / PSD not generated"),
-        }
-        if preview_png and os.path.isfile(preview_png):
-            pfolder, pname = _output_rel(preview_png)
-            info["preview"] = {
-                "filename": pname,
-                "subfolder": pfolder,
-                "type": "output",
-                "v": int(os.path.getmtime(preview_png) * 1000),
-            }
-        _notify("stlu.done", info)
-
-        return {
-            "ui": {"stlu_psd": [info]},
-            "result": (
-                report.get("psd") or "",
-                report.get("layers_json") or "",
-                report_text,
-                preview_tensor,
-            ),
-        }
-
-    @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
-        return float("nan")
 
 class STLU_Gate:
     """Pass conditioning/latent through while waiting on a pipeline barrier.
@@ -1227,7 +1103,6 @@ class STLU_TilesPSD:
                 include_original=True,
                 run_dir_abs=wave_dir,
                 generation=(grid_doc or {}).get("generation"),
-                generation_id=str((grid_doc or {}).get("generation_id") or ""),
                 tile_coords=(grid_doc or {}).get("coords") or None,
                 grid_offset=(grid_doc or {}).get("offset") or (0, 0),
             )
@@ -1543,7 +1418,6 @@ NODE_CLASS_MAPPINGS = {
     "STLU_PasteBack": STLU_PasteBack,
     "STLU_SaveLayer": STLU_SaveLayer,
     "STLU_DetailBatch": STLU_DetailBatch,
-    "STLU_AssemblePSD": STLU_AssemblePSD,
     "STLU_Gate": STLU_Gate,
     "STLU_Barrier": STLU_Barrier,
     "STLU_ChromaToAlpha": STLU_ChromaToAlpha,
@@ -1562,7 +1436,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "STLU_FocusCrop": "SeeThrough Focus Crop",
     "STLU_PasteBack": "SeeThrough Focus Paste Back",
     "STLU_SaveLayer": "SeeThrough Upscale Save Layer",
-    "STLU_AssemblePSD": "SeeThrough Upscale Assemble PSD",
     "STLU_DetailBatch": "SeeThrough Detail Rebuild (CPU)",
     "STLU_Gate": "SeeThrough Pipeline Gate",
     "STLU_Barrier": "SeeThrough Pipeline Barrier",
@@ -1583,7 +1456,6 @@ __all__ = [
     "STLU_PasteBack",
     "STLU_SaveLayer",
     "STLU_DetailBatch",
-    "STLU_AssemblePSD",
     "STLU_Gate",
     "STLU_Barrier",
     "STLU_ChromaToAlpha",

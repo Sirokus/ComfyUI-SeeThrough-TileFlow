@@ -19,6 +19,11 @@ DEPTH_STEP = 64
 SEED_MIN = 0
 SEED_MAX = 2 ** 32 - 1
 
+# The depth pass can either get its own seed or follow the layer seed; -1 is
+# the "follow" sentinel, so a workflow saved before the split keeps producing
+# exactly the pixels it used to.
+DEPTH_SEED_FOLLOW = -1
+
 STEPS_MIN = 1
 STEPS_MAX = 100
 
@@ -80,3 +85,21 @@ def check_all(resolution, num_inference_steps, depth_resolution, random_seed):
         check_depth_resolution(depth_resolution),
         check_seed(random_seed),
     )
+
+
+def check_depth_seed(value):
+    """``-1`` (follow the layer seed) or a normal seed."""
+    value = int(value)
+    if value == DEPTH_SEED_FOLLOW:
+        return value
+    if not SEED_MIN <= value <= SEED_MAX:
+        raise ValueError(
+            "depth_random_seed=%d 超出范围（%d（跟随拆层种子）或 %d-%d）。"
+            % (value, DEPTH_SEED_FOLLOW, SEED_MIN, SEED_MAX))
+    return value
+
+
+def resolve_depth_seed(depth_seed, layer_seed):
+    """The number actually handed to the depth model."""
+    depth_seed = int(depth_seed)
+    return int(layer_seed) if depth_seed == DEPTH_SEED_FOLLOW else depth_seed

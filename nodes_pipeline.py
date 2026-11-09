@@ -9,7 +9,6 @@ old pipeline (``nodes_legacy``) from growing this file back into a monolith.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import os
 import traceback
@@ -19,12 +18,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import folder_paths
-
 if __package__:  # ComfyUI loads the folder as a package
     from . import (core_compose, core_geometry, core_io, core_mask4k, core_plan,
                    core_reference, edit_expand, edit_parts,
-                   psd_writer, region_plan, subgraph_clone, tile_psd, tile_strips)
+                   psd_writer, region_plan, tile_psd, tile_strips)
     from .stlu import json_io, limits as stlu_limits
 else:  # standalone import used by the tests and tools
     import core_compose
@@ -37,7 +34,6 @@ else:  # standalone import used by the tests and tools
     import edit_parts
     import psd_writer
     import region_plan
-    import subgraph_clone
     import tile_psd
     import tile_strips
     from stlu import json_io, limits as stlu_limits
@@ -97,25 +93,27 @@ def _seethrough_node_class(name: str):
 # old tests keep reaching them through ``nodes`` / ``nodes_pipeline``.
 if __package__:  # ComfyUI loads the folder as a package
     from .pipeline_stages import (  # noqa: F401
-        GUIDE_EMPTY, GUIDE_ERROR, GUIDE_OK, GUIDED_EMPTY_RETRIES,
+        GUIDE_EMPTY, GUIDE_ERROR, GUIDE_OK,
+        HEAD_SCOPE_CHOICES,
         _apply_tile_guide, _box_blur_3x3, _crop_tile_parts,
         _guide_composite, _guide_composite_result, _guide_feather_mask,
-        _restore_locked_orphans, _run_seethrough_tile,
+        _run_seethrough_tile,
         crop_tiles, describe_run, grid_info, guide_state, guide_tile,
         make_plan, merge_run_doc, normalize_settings, pick_tiles, plan_context,
-        prepare_run, restore_locks, run_guided_tiles, save_original,
+        prepare_run, run_guided_tiles, save_original,
         tile_context, tile_index_of, tile_is_empty, write_manifest,
         write_tile_images, write_tile_psd,
     )
 else:  # standalone import used by the tests and tools
     from pipeline_stages import (  # noqa: F401
-        GUIDE_EMPTY, GUIDE_ERROR, GUIDE_OK, GUIDED_EMPTY_RETRIES,
+        GUIDE_EMPTY, GUIDE_ERROR, GUIDE_OK,
+        HEAD_SCOPE_CHOICES,
         _apply_tile_guide, _box_blur_3x3, _crop_tile_parts,
         _guide_composite, _guide_composite_result, _guide_feather_mask,
-        _restore_locked_orphans, _run_seethrough_tile,
+        _run_seethrough_tile,
         crop_tiles, describe_run, grid_info, guide_state, guide_tile,
         make_plan, merge_run_doc, normalize_settings, pick_tiles, plan_context,
-        prepare_run, restore_locks, run_guided_tiles, save_original,
+        prepare_run, run_guided_tiles, save_original,
         tile_context, tile_index_of, tile_is_empty, write_manifest,
         write_tile_images, write_tile_psd,
     )
@@ -157,17 +155,6 @@ def run_pipeline_input(image, options=None, **overrides):
     }
 
 
-# The simplified ① node's panel has no widgets for these; every other input
-# still behaves exactly like STLU_PipelineInput.  Dropping a widget is enough:
-# normalize_settings fills the shared DEFAULT_SETTINGS value for anything the
-# graph does not pass, so the fingerprint of the simple node is the guided
-# node's at its defaults instead of a second, divergent set of numbers.
-SIMPLE_INPUT_DROP = (
-    "guide_context", "guide_feather", "guide_strength", "guide_tolerance",
-    "context_pad", "strip_max_resolution",
-)
-
-
 class STLU_PipelineInput:
     """The single node the user edits: image in, every setting in one place.
 
@@ -200,11 +187,11 @@ class STLU_PipelineInput:
                                     "tooltip": "相邻块重叠的像素数；合并时用正弦窗平滑接缝。默认 128，0 = 不重叠。"}),
                 "select": ("STRING", {"default": "all",
                                       "tooltip": "只跑这些块：all / none / 0-2,5。点面板里的格子会写这里；未勾选的块不跑 GPU。"}),
-                "resolution": ("INT", {"default": 512,
+                "resolution": ("INT", {"default": 1024,
                                        "min": stlu_limits.RES_MIN,
                                        "max": stlu_limits.RES_MAX,
                                        "step": stlu_limits.RES_STEP,
-                                       "tooltip": "拆层模型的推理分辨率（512-2048，与上游一致）。512 兼顾速度与细节；显存紧时别调大。"}),
+                                       "tooltip": "拆层模型的推理分辨率（512-2048）。上游 SeeThrough 默认 1280；低于块边长会先缩小再放大，整块容易丢失。建议与块宽一致（1024 块配 1024）。"}),
                 "num_inference_steps": ("INT", {"default": 30,
                                                 "min": stlu_limits.STEPS_MIN,
                                                 "max": stlu_limits.STEPS_MAX,
@@ -220,7 +207,7 @@ class STLU_PipelineInput:
                 "random_seed": ("INT", {"default": 0,
                                         "min": stlu_limits.SEED_MIN,
                                         "max": stlu_limits.SEED_MAX,
-                                        "tooltip": "随机种子，拆层和深度共用（0-2^32-1，上游限制）。同图同块、种子相同则结果可复现。"}),
+                                        "tooltip": "拆层随机种子（0-2^32-1，上游限制）。同图同块、种子相同则结果可复现。"}),
                 "tblr_split": ("BOOLEAN", {"default": True,
                                            "tooltip": "把左右不对称的部件按中线拆成 -l / -r，便于分别修。"}),
                 "use_lama": ("BOOLEAN", {"default": True,
@@ -244,9 +231,9 @@ class STLU_PipelineInput:
                                               "tooltip": "额外写一个独立的 <名字>_depth.psd；depth 永远不会进入彩色 PSD。"}),
                 "include_original": ("BOOLEAN", {"default": False,
                                                  "tooltip": "在合并 PSD 底部加入原图图层，方便对照。"}),
-                "guide_context": ("BOOLEAN", {"default": True,
-                                              "tooltip": "顺序生成时，把已经生成好的相邻块在重叠区的内容回填到当前块再送进拆层，"
-                                                         "让相邻块看到同一份像素；只有「引导版」工作流会用到。"}),
+                "guide_context": ("BOOLEAN", {"default": False,
+                                              "tooltip": "顺序生成时，把已经生成好的相邻块在重叠区的内容回填到当前块再送进拆层。"
+                                                         "默认关闭：回填会改变模型看到的原始像素，上一块的补全/幻觉也会被带进来。"}),
                 "guide_feather": ("INT", {"default": 32, "min": 0, "max": 512,
                                           "tooltip": "回填重叠区的羽化像素。0 = 硬边；越大过渡越软。默认 32。"}),
                 "guide_strength": ("INT", {"default": 40, "min": 0, "max": 100,
@@ -265,10 +252,10 @@ class STLU_PipelineInput:
                 # they do not shift the serialized widget values.
                 "layerdiff_model": ("SEETHROUGH_LAYERDIFF_MODEL", {
                     "forceInput": True,
-                    "tooltip": "可选：接拆层模型加载器。接上后换模型会触发清空重跑。"}),
+                    "tooltip": "可选：接拆层模型加载器。接上后指纹会记录模型；换模型不会自动清空目录，需要时手动点「清空此目录」。"}),
                 "depth_model": ("SEETHROUGH_DEPTH_MODEL", {
                     "forceInput": True,
-                    "tooltip": "可选：接深度模型加载器。接上后换模型会触发清空重跑。"}),
+                    "tooltip": "可选：接深度模型加载器。接上后指纹会记录模型；换模型不会自动清空目录，需要时手动点「清空此目录」。"}),
                 # Grid phase.  Appended after the sockets so older workflows
                 # keep their widget order; 0 is exactly the classic layout.
                 "grid_offset_x": ("INT", {"default": 0, "min": 0, "max": 65536,
@@ -310,6 +297,23 @@ class STLU_PipelineInput:
                 "custom_regions": ("STRING", {"default": "[]",
                     "tooltip": "内部使用：自定义正方形窗口 JSON（x/y/size/res/name）。"
                                "由 ① 面板的画布编辑自动维护，不用手填。"}),
+                # Appended LAST for the same reason as the two above.
+                "head_scope": (list(HEAD_SCOPE_CHOICES), {"default": HEAD_SCOPE_CHOICES[0],
+                    "tooltip": "哪些块保留 v3 的头部子层（face/eyes/mouth/ears…）。"
+                               "模型对每块都强制跑一遍头部，腿/衣服块会被硬画出五官；"
+                               "默认只让最上一行保留，其余块把这些层直接丢掉。"}),
+                # Appended LAST for the same reason.  Written by the ① panel's
+                # per-tile tag editor (a JSON map of tile index -> whitelist).
+                "tile_tags": ("STRING", {"default": "{}",
+                    "tooltip": "内部使用：按块 Tag 白名单 JSON。由 ① 面板的「按块 Tag」"
+                               "编辑自动维护，不用手填。"}),
+                # Appended LAST for the same reason.  -1 = follow the layer
+                # seed, which is exactly what this node did before the split.
+                "depth_random_seed": ("INT", {"default": stlu_limits.DEPTH_SEED_FOLLOW,
+                    "min": stlu_limits.DEPTH_SEED_FOLLOW,
+                    "max": stlu_limits.SEED_MAX,
+                    "tooltip": "深度随机种子。深度是在拆层结果上估的，换种子只影响"
+                               "遮挡/前后关系，不影响拆出的部件；-1 = 跟随拆层种子。"}),
             },
         }
 
@@ -326,7 +330,7 @@ class STLU_PipelineInput:
         "拆层分辨率，接到 ② GenerateLayers。",
         "拆层采样步数，接到 ② GenerateLayers。",
         "深度图分辨率（-1 = 跟随拆层），接到 ② GenerateDepth。",
-        "随机种子，同时接到拆层和深度，保证两者一致。",
+        "拆层随机种子，接到 ② GenerateLayers（深度种子单独在 settings 里）。",
         "左右拆分开关，接到 ② PostProcess。",
         "LaMa 补全开关，接到 ② PostProcess。",
     )
@@ -342,39 +346,6 @@ class STLU_PipelineInput:
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
-
-
-class STLU_SimpleInput(STLU_PipelineInput):
-    """The lightweight ① node: same planning, fewer knobs.
-
-    The input list comes from :class:`STLU_PipelineInput` with
-    :data:`SIMPLE_INPUT_DROP` removed, and the whole run is
-    :func:`run_pipeline_input` -- so geometry, selection, cache clearing and
-    the ``grid_doc`` contract are byte-for-byte the guided version's.  Only
-    the guided loop's widgets and the crop-back padding are gone: neither is
-    read by the plain four-step graph this node drives, and the shared
-    defaults fill their settings back in unchanged.
-
-    The inputs are derived rather than re-listed on purpose: a new shared
-    option reaches both nodes, and there is no second copy of the widget
-    order that could drift and shift an old workflow's saved values.
-    """
-
-    DESCRIPTION = (
-        "简化版 ①：只保留四步流水线真正会用到的开关（切块/选块、拆层质量、"
-        "分区、后处理、输出与合并），去掉顺序引导与块外上下文。规划、缓存和 "
-        "grid_doc 与完整版完全同源。"
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        types = STLU_PipelineInput.INPUT_TYPES()
-        optional = {name: spec for name, spec in types["optional"].items()
-                    if name not in SIMPLE_INPUT_DROP}
-        return {"required": dict(types["required"]), "optional": optional}
-
-    def execute(self, image, **options):
-        return run_pipeline_input(image, options)
 
 
 class STLU_GuidedLayers:
@@ -412,7 +383,7 @@ class STLU_GuidedLayers:
                 "random_seed": ("INT", {"default": 42,
                                         "min": stlu_limits.SEED_MIN,
                                         "max": stlu_limits.SEED_MAX}),
-                "resolution": ("INT", {"default": 512,
+                "resolution": ("INT", {"default": 1024,
                                        "min": stlu_limits.RES_MIN,
                                        "max": stlu_limits.RES_MAX,
                                        "step": stlu_limits.RES_STEP}),
@@ -425,6 +396,14 @@ class STLU_GuidedLayers:
                                              "step": stlu_limits.DEPTH_STEP}),
                 "tblr_split": ("BOOLEAN", {"default": True}),
                 "use_lama": ("BOOLEAN", {"default": True}),
+                # -1 = take the depth seed from ①'s settings document (which is
+                # what the subgraph does); set it here only when driving this
+                # node by hand.
+                "depth_random_seed": ("INT", {"default": stlu_limits.DEPTH_SEED_FOLLOW,
+                                              "min": stlu_limits.DEPTH_SEED_FOLLOW,
+                                              "max": stlu_limits.SEED_MAX,
+                                              "tooltip": "深度种子；-1 = 跟随拆层种子"
+                                                         "（或 ① settings 里的值）。"}),
             },
         }
 
@@ -440,8 +419,9 @@ class STLU_GuidedLayers:
     CATEGORY = CATEGORY
 
     def execute(self, tiles, indices, layerdiff_model, depth_model, grid_doc="",
-                random_seed=42, resolution=512, num_inference_steps=30,
-                depth_resolution=-1, tblr_split=True, use_lama=True):
+                random_seed=42, resolution=1024, num_inference_steps=30,
+                depth_resolution=-1, tblr_split=True, use_lama=True,
+                depth_random_seed=stlu_limits.DEPTH_SEED_FOLLOW):
         doc = None
         raw_grid = _first(grid_doc, "")
         if str(raw_grid or "").strip():
@@ -453,11 +433,21 @@ class STLU_GuidedLayers:
                     " / check the ①→② grid_doc link, then re-queue ①." % (exc, exc)) from exc
         state = guide_state({"doc": doc or {}})
         state["doc"] = doc
+        # The ① settings document is the authority; the widget only overrides
+        # it when someone wires this node up by hand.
+        raw_depth = _first(depth_random_seed, stlu_limits.DEPTH_SEED_FOLLOW)
+        depth_seed = (stlu_limits.DEPTH_SEED_FOLLOW if raw_depth is None
+                      else int(raw_depth))
+        if depth_seed == stlu_limits.DEPTH_SEED_FOLLOW:
+            depth_seed = int(((doc or {}).get("generation") or {}).get(
+                "depth_random_seed", stlu_limits.DEPTH_SEED_FOLLOW))
         run_dir = str(((doc or {}).get("out") or {}).get("dir") or "")
         parts_out, indices_out, _guided, _composites = run_guided_tiles(
             tiles, indices, state, run_dir, layerdiff_model, depth_model,
             random_seed, resolution, num_inference_steps, depth_resolution,
-            tblr_split, use_lama)
+            tblr_split, use_lama,
+            progress=lambda info: _notify("stlu.tile.progress", info),
+            depth_seed=depth_seed)
         return (parts_out, indices_out)
 
 class STLU_TilePSD:
@@ -533,7 +523,6 @@ class STLU_TilePSD:
         merged_doc["out"] = merged_out
 
         plan = {"doc": merged_doc}
-        parts = restore_locks(parts, plan, index)
         record = write_tile_psd(parts, plan, index)
         if record.get("status") == "empty":
             return {"ui": {"stlu_tile": [{"index": record["index"],
@@ -552,8 +541,8 @@ class STLU_WaveIndex:
     builds ``images.json`` + ``manifest.json`` with the same fields the old
     single-node stage three produced, so step four reads them unchanged.
 
-    Because the output folder is fixed, it also folds in the tiles an earlier
-    run already finished there (verified against the source fingerprint).  A
+    Because the output folder is fixed, it also folds in every tile already
+    finished there -- the folder is the cache, no fingerprint gate.  A
     partial re-run therefore writes a manifest that still describes the whole
     picture, and step four merges the new tiles together with the cached ones.
     """
@@ -832,122 +821,6 @@ class STLU_TileMerge:
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
 
-_GUIDE_THUMB_MAX = 384
-_GUIDE_INDEX = "inputs.json"
-
-
-def _write_guide_index(dest_dir: str, indices) -> None:
-    """Record which tiles have a persisted input picture.
-
-    The panel trusts this list rather than the bare PNGs, so pictures left
-    over from an earlier run (a bigger grid) never show up on a row that
-    this run did not generate.  Rewritten only when the content changes so
-    the file's mtime stays a usable cache stamp.
-    """
-    wanted = sorted(int(i) for i in indices)
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-        path = os.path.join(dest_dir, _GUIDE_INDEX)
-        data = json.dumps({"indices": wanted})
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                if fh.read() == data:
-                    _prune_guide_files(dest_dir, wanted)
-                    return
-        except OSError:
-            pass
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(data)
-        _prune_guide_files(dest_dir, wanted)
-    except OSError as exc:  # noqa: BLE001 - the panel just falls back to dash
-        print("[STLU] guide index not written: %s" % exc, flush=True)
-
-
-def _prune_guide_files(dest_dir: str, keep) -> None:
-    kept = set(int(i) for i in keep)
-    try:
-        names = os.listdir(dest_dir)
-    except OSError:
-        return
-    for name in names:
-        if not (name.startswith("stlu_guide_") and name.endswith(".png")):
-            continue
-        try:
-            index = int(name[len("stlu_guide_"):-len(".png")])
-        except ValueError:
-            continue
-        if index in kept:
-            continue
-        try:
-            os.remove(os.path.join(dest_dir, name))
-        except OSError:
-            pass
-
-
-def _guide_thumb(tensor, index: int, dest_dir: str = "") -> dict:
-    """White-backed thumbnail of one tile's model input.
-
-    This is the debug picture ② used to hand to a PreviewImage: the tile
-    after guide backfill and context padding, i.e. exactly what the seam
-    models saw.  The ⑤ panel shows it on the tile's own row instead of a
-    second preview node flooding the queue with images.
-
-    With ``dest_dir`` the picture is also written there under a stable name
-    (so the panel can find it again after a refresh); otherwise only the
-    throwaway ``temp/`` copy is kept.
-    """
-    if tensor is None:
-        return {}
-    try:
-        arr = tensor.detach().cpu().float().numpy()
-    except Exception:  # noqa: BLE001 - plain numpy arrays are accepted too
-        arr = np.asarray(tensor, dtype=np.float32)
-    if arr.ndim == 4:
-        if not arr.shape[0]:
-            return {}
-        arr = arr[0]
-    if arr.ndim != 3 or arr.shape[-1] not in (1, 3, 4):
-        return {}
-    arr = np.clip(arr, 0.0, 1.0)
-    rgb = arr[..., :3]
-    if arr.shape[-1] == 4:
-        alpha = arr[..., 3:4]
-        rgb = rgb * alpha + (1.0 - alpha)
-    elif arr.shape[-1] == 1:
-        rgb = np.repeat(arr, 3, axis=-1)
-    from PIL import Image
-    image = Image.fromarray(
-        np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8), "RGB")
-    if max(image.width, image.height) > _GUIDE_THUMB_MAX:
-        scale = _GUIDE_THUMB_MAX / float(max(image.width, image.height))
-        image = image.resize(
-            (max(1, int(round(image.width * scale))),
-             max(1, int(round(image.height * scale)))),
-            Image.Resampling.LANCZOS)
-    if dest_dir:
-        # Persisted next to the run so the ⑤ panel can still show each tile's
-        # model input after a browser refresh (the temp file survives a
-        # refresh but nothing maps tile -> file once the payload is gone).
-        os.makedirs(dest_dir, exist_ok=True)
-        name = "stlu_guide_%02d.png" % int(index)
-        path = os.path.join(dest_dir, name)
-        image.save(path, compress_level=3)
-        sub = _relative_to_output(dest_dir)
-        if sub is not None:
-            return {"filename": name, "subfolder": sub, "type": "output",
-                    "v": int(os.path.getmtime(path) * 1000)}
-    temp = folder_paths.get_temp_directory()
-    os.makedirs(temp, exist_ok=True)
-    digest = hashlib.sha1(
-        ("%d|%d|%d|" % (index, image.width, image.height)).encode("utf-8")
-        + np.asarray(image).tobytes()).hexdigest()[:10]
-    name = "stlu_guide_%02d_%s.png" % (int(index), digest)
-    path = os.path.join(temp, name)
-    if not os.path.isfile(path):
-        image.save(path, compress_level=3)
-    return {"filename": name, "subfolder": "", "type": "temp",
-            "v": int(os.path.getmtime(path) * 1000)}
-
 
 class STLU_PSDPreview:
     """Show the merged PSD inside the graph through its own panel.
@@ -957,15 +830,11 @@ class STLU_PSDPreview:
     tensor, while the panel drawn by ``web/stlu.js`` shows a compact overview
     plus the per-tile / per-part groups.  Point it at the ``psd_path`` output
     of ④, or at the run folder (it then picks ``merged.psd``).
-
-    ``guide_images`` is optional: ② can hand over the per-tile pictures it
-    actually fed the model, and the panel puts each on its tile's row.
     """
 
     DESCRIPTION = (
         "显示合并后的 PSD。接 ④ 的 psd_path，或直接填输出文件夹；面板先给全身总览，"
-        "再按块 / 按部位分组列出拆分图。老版把 ② 的 guided_inputs / indices "
-        "接进来，每块那一行还会多一张「输入」——引导回填后真正送进模型的图。纯 CPU。"
+        "再按块 / 按部位分组列出拆分图。纯 CPU。"
     )
 
     @classmethod
@@ -981,13 +850,6 @@ class STLU_PSDPreview:
                 "show_parts": ("BOOLEAN", {"default": True,
                                            "tooltip": "兼容旧工作流的开关：面板现在始终"
                                                       "按块 / 按部位列出拆分图。"}),
-                "guide_images": ("IMAGE", {
-                    "forceInput": True,
-                    "tooltip": "② 的 guided_inputs：每块回填后真正送进模型的图；"
-                               "接上后「按块」每一行多一张「输入」缩略图。"}),
-                "guide_indices": ("STRING", {
-                    "forceInput": True,
-                    "tooltip": "② 的 indices，与 guided_inputs 一一对应。"}),
             },
         }
 
@@ -1000,8 +862,7 @@ class STLU_PSDPreview:
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
 
-    def execute(self, psd_path, max_side=1600, show_parts=True,
-                guide_images=None, guide_indices=None):
+    def execute(self, psd_path, max_side=1600, show_parts=True):
         raw = str(psd_path or "").strip()
         if not raw:
             raise ValueError("STLU_PSDPreview: 接上 ④ 的 psd_path（或填输出文件夹）/ connect ④'s psd_path (or fill in the output folder)")
@@ -1048,12 +909,6 @@ class STLU_PSDPreview:
             int(rgb.shape[1]), int(rgb.shape[0])), flush=True)
         tensor = torch.from_numpy(
             np.ascontiguousarray(rgb.astype(np.float32) / 255.0))[None]
-        # Keep this run's model inputs next to the PSD: the panel falls back
-        # to these copies when the browser is refreshed and the execution
-        # payload (stlu_guide) is gone.
-        guide_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "_guide")
-        guide = self._guide_payload(guide_images, guide_indices, guide_dir)
-        _write_guide_index(guide_dir, [item["index"] for item in guide])
 
         return {
             "ui": {
@@ -1064,34 +919,9 @@ class STLU_PSDPreview:
                     "path": os.path.abspath(path),
                     "canvas": [width, height],
                 }],
-                # Per-tile model inputs travel with the panel instead of a
-                # separate PreviewImage: one small PNG per tile, keyed by the
-                # grid index so the panel pins it to the right row.
-                "stlu_guide": guide,
             },
             "result": (tensor,),
         }
-
-    @staticmethod
-    def _guide_payload(guide_images, guide_indices, dest_dir=""):
-        if guide_images is None:
-            return []
-        frames = guide_images if isinstance(guide_images, (list, tuple)) \
-            else [guide_images]
-        raw_indices = (guide_indices if isinstance(guide_indices, (list, tuple))
-                       else [guide_indices])
-        out = []
-        for pos, frame in enumerate(frames):
-            raw = raw_indices[pos] if pos < len(raw_indices) else pos
-            try:
-                index = int(str(raw).strip())
-            except (TypeError, ValueError):
-                index = pos
-            ref = _guide_thumb(frame, index, dest_dir)
-            if ref:
-                out.append({"index": index, "image": ref})
-        return out
-
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
@@ -1100,7 +930,6 @@ class STLU_PSDPreview:
 
 NODE_CLASS_MAPPINGS = {
     "STLU_PipelineInput": STLU_PipelineInput,
-    "STLU_SimpleInput": STLU_SimpleInput,
     "STLU_GuidedLayers": STLU_GuidedLayers,
     "STLU_TilePSD": STLU_TilePSD,
     "STLU_WaveIndex": STLU_WaveIndex,
@@ -1113,7 +942,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "STLU_TileMerge": "SeeThrough ④ 合并分格 PSD",
     "STLU_PSDPreview": "SeeThrough ⑤ 预览合并 PSD",
     "STLU_PipelineInput": "SeeThrough ① 用户输入（只改这里）",
-    "STLU_SimpleInput": "SeeThrough ① 用户输入（简化版）",
     "STLU_TilePSD": "SeeThrough ③ 每块存 PSD（自动逐块）",
     "STLU_GuidedLayers": "SeeThrough ② 顺序拆层（带重叠引导）",
     "STLU_WaveIndex": "SeeThrough ③ 写清单（全部块完成后）",
@@ -1122,7 +950,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 __all__ = [
     "STLU_PipelineInput",
-    "STLU_SimpleInput",
     "STLU_GuidedLayers",
     "STLU_TilePSD",
     "STLU_WaveIndex",
@@ -1136,7 +963,6 @@ __all__ = [
     "GUIDE_ERROR",
     "_guide_composite_result",
     "_guide_composite",
-    "GUIDED_EMPTY_RETRIES",
     "_run_seethrough_tile",
     "_apply_tile_guide",
     "_crop_tile_parts",
@@ -1153,7 +979,6 @@ __all__ = [
     "pick_tiles",
     "plan_context",
     "prepare_run",
-    "restore_locks",
     "run_guided_tiles",
     "save_original",
     "tile_context",

@@ -32,14 +32,13 @@ import folder_paths
 
 if __package__:  # ComfyUI loads the folder as a package
     from . import (core_compose, core_plan, edit_parts, psd_reader, psd_writer,
-                   subgraph_clone, tile_psd, tile_strips)
+                   tile_psd, tile_strips)
 else:  # standalone import used by the tests
     import core_compose
     import core_plan
     import edit_parts
     import psd_reader
     import psd_writer
-    import subgraph_clone
     import tile_psd
     import tile_strips
 
@@ -119,6 +118,21 @@ def _resolve_any(path: str) -> str:
         if _inside(_scope_root(scope), candidate):
             return candidate
     raise web.HTTPForbidden(text="path is outside the workspace")
+
+
+def _resolve_local(path: str) -> str:
+    """Resolve a path the user picked in the local file browser.
+
+    Unlike ``_resolve_any`` this accepts any absolute location: the PSD
+    upscale flow starts from a finished artwork that usually lives outside
+    ComfyUI's output tree.
+    """
+    raw = (path or "").strip().strip('"')
+    if not raw:
+        raise web.HTTPBadRequest(text="empty path")
+    if not os.path.isabs(raw):
+        raise web.HTTPBadRequest(text="absolute path required")
+    return os.path.realpath(os.path.expanduser(raw))
 
 
 def _json_error(message: str, status: int = 400) -> web.Response:
@@ -293,15 +307,15 @@ async def list_directory(request: web.Request) -> web.Response:
         entry = {
             "name": name,
             "rel": _relative(scope, full) or name,
+            "abs": full,
             "size": size,
             "is_image": lower.endswith(IMAGE_EXTS),
+            "is_json": lower.endswith(".json"),
             "is_layers": lower.endswith("_layers.json") and not lower.endswith("_psdinfo.json"),
             "is_workflow": scope == "workflows" and lower.endswith(".json"),
         }
         if entry["is_image"]:
             entry["thumb"] = _thumb_url(full, 64)
-        if scope == "workflows":
-            entry["abs"] = full
         files.append(entry)
 
     rel = _relative(scope, path) or ""
@@ -316,6 +330,81 @@ async def list_directory(request: web.Request) -> web.Response:
         "path": rel,
         "parent": parent,
         "at_root": not rel,
+        "dirs": dirs,
+        "files": files,
+    })
+
+
+# ---------------------------------------------------------------------------
+# /stlu/fs_ls -- browser for the whole machine (PSD source picking)
+# ---------------------------------------------------------------------------
+
+def _drive_roots() -> List[Dict[str, str]]:
+    if os.name != "nt":
+        return [{"name": "/", "rel": "/"}]
+    return [{"name": letter + ":\\", "rel": letter + ":\\"}
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            if os.path.isdir(letter + ":\\")]
+
+
+async def fs_list(request: web.Request) -> web.Response:
+    """List drives / folders / files at an absolute path.
+
+    The scope-based ``/stlu/ls`` cannot reach the user's artwork folder, so
+    this endpoint takes a raw absolute path.  It only ever reads names and
+    sizes; nothing is written here.  ``ext=image`` lists editable image types
+    (the PSD crop picker) instead of the default ``.psd``.
+    """
+    raw = (request.query.get("path") or "").strip().strip('"')
+    want_image = (request.query.get("ext") or "").strip().lower() == "image"
+    if not raw:
+        return web.json_response({
+            "path": "", "parent": "", "at_root": True,
+            "dirs": _drive_roots(), "files": [],
+        })
+    try:
+        path = _resolve_local(raw)
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    if not os.path.isdir(path):
+        return _json_error("not a directory: %s" % raw, 404)
+
+    allowed = IMAGE_EXTS if want_image else (".psd",)
+    dirs: List[Dict[str, str]] = []
+    files: List[Dict[str, Any]] = []
+    try:
+        names = sorted(os.listdir(path),
+                       key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+    except OSError as exc:
+        return _json_error(str(exc), 500)
+
+    for name in names:
+        if name.startswith(".") or name.startswith("$") or name.startswith("~"):
+            continue
+        full = os.path.join(path, name)
+        if os.path.isdir(full):
+            dirs.append({"name": name, "rel": full})
+            continue
+        lower = name.lower()
+        if not lower.endswith(allowed):
+            continue
+        try:
+            size = os.path.getsize(full)
+        except OSError:
+            size = 0
+        files.append({"name": name, "rel": full, "abs": full, "size": size,
+                      "is_psd": lower.endswith(".psd"),
+                      "is_image": lower.endswith(IMAGE_EXTS)})
+
+    parent = os.path.dirname(path.rstrip("\\/"))
+    # ``dirname('C:')`` is ``'C:'`` on Windows: a drive root has no parent
+    # above it, so the picker falls back to the drive list.
+    if not parent or len(parent.rstrip("\\/")) <= 2 or not os.path.isdir(parent):
+        parent = ""
+    return web.json_response({
+        "path": path,
+        "parent": parent,
+        "at_root": False,
         "dirs": dirs,
         "files": files,
     })
@@ -519,15 +608,18 @@ def _open_target(target: str) -> None:
         subprocess.Popen(["xdg-open", target])
 
 
-async def reveal_path(request: web.Request) -> web.Response:
-    """Open the containing folder (or the folder itself) in the OS file manager."""
+async def _open_route(request: web.Request, allow_local: bool,
+                      as_folder: bool) -> web.Response:
+    raw = request.query.get("path", "")
     try:
-        path = _resolve_any(request.query.get("path", ""))
+        path = _resolve_local(raw) if allow_local else _resolve_any(raw)
     except web.HTTPException as exc:
         return _json_error(exc.text or "invalid path", exc.status)
     if not os.path.exists(path):
-        return _json_error("not found: %s" % request.query.get("path", ""), 404)
-    target = path if os.path.isdir(path) else os.path.dirname(path)
+        return _json_error("not found: %s" % raw, 404)
+    target = path
+    if as_folder and not os.path.isdir(path):
+        target = os.path.dirname(path)
     try:
         _open_target(target)
     except Exception as exc:  # noqa: BLE001
@@ -535,34 +627,24 @@ async def reveal_path(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "path": target})
 
 
+async def reveal_path(request: web.Request) -> web.Response:
+    """Open the containing folder (or the folder itself) in the OS file manager."""
+    return await _open_route(request, allow_local=False, as_folder=True)
+
+
 async def open_path(request: web.Request) -> web.Response:
     """Open a file (or folder) with its default application."""
-    try:
-        path = _resolve_any(request.query.get("path", ""))
-    except web.HTTPException as exc:
-        return _json_error(exc.text or "invalid path", exc.status)
-    if not os.path.exists(path):
-        return _json_error("not found: %s" % request.query.get("path", ""), 404)
-    try:
-        _open_target(path)
-    except Exception as exc:  # noqa: BLE001
-        return _json_error(str(exc), 500)
-    return web.json_response({"ok": True, "path": path})
+    return await _open_route(request, allow_local=False, as_folder=False)
 
 
-async def check_workflow(request: web.Request) -> web.Response:
-    """Report whether the configured subgraph template still exists."""
-    raw = (request.query.get("path") or "").strip()
-    path = raw or subgraph_clone.default_workflow_path()
-    try:
-        full = _resolve_any(path)
-    except web.HTTPException:
-        return web.json_response({"path": path, "name": os.path.basename(path), "exists": False})
-    return web.json_response({
-        "path": full,
-        "name": os.path.basename(full),
-        "exists": os.path.isfile(full),
-    })
+async def reveal_local(request: web.Request) -> web.Response:
+    """Like ``reveal_path`` but for any absolute path (PSD source folders)."""
+    return await _open_route(request, allow_local=True, as_folder=True)
+
+
+async def open_local(request: web.Request) -> web.Response:
+    """Like ``open_path`` but for any absolute path (a PSD outside output/)."""
+    return await _open_route(request, allow_local=True, as_folder=False)
 
 
 async def edit_parts_catalogue(request: web.Request) -> web.Response:
@@ -1533,38 +1615,12 @@ def _psd_target(path: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
     return full, tile_psd.read_manifest(run_dir), run_dir
 
 
-def _guide_files(run_dir: str) -> Dict[int, str]:
-    """Per-tile model inputs ⑤ kept next to the run, keyed by grid index.
-
-    ``_guide/inputs.json`` lists the tiles this run actually produced, so a
-    picture left over from an earlier (larger) grid is never shown.
-    """
-    folder = os.path.join(run_dir, "_guide")
-    try:
-        with open(os.path.join(folder, "inputs.json"),
-                  "r", encoding="utf-8") as fh:
-            indices = json.load(fh).get("indices") or []
-    except (OSError, ValueError):
-        return {}
-    out: Dict[int, str] = {}
-    for raw in indices:
-        try:
-            index = int(raw)
-        except (TypeError, ValueError):
-            continue
-        path = os.path.join(folder, "stlu_guide_%02d.png" % index)
-        if os.path.isfile(path):
-            out[index] = path
-    return out
-
-
 def _psd_tile_groups(run_dir: str, manifest: Optional[Dict[str, Any]],
                      limit: int) -> List[Dict[str, Any]]:
     entries = (manifest or {}).get("tiles") or []
     if not entries:
         return []
     coords = tile_psd._coords_from_manifest(manifest)
-    guides = _guide_files(run_dir)
     groups: List[Dict[str, Any]] = []
     for entry in sorted(entries, key=lambda e: int(e.get("index") or 0)):
         index = int(entry.get("index") or 0)
@@ -1604,11 +1660,9 @@ def _psd_tile_groups(run_dir: str, manifest: Optional[Dict[str, Any]],
             "image": image,
             "thumb": thumb,
             "split": split,
-            # Model input for this tile, persisted by ⑤ so a refreshed page
-            # still shows it (the live payload is gone by then).
-            "guide": _image_ref(guides[index]) if index in guides else None,
-            "guide_thumb": (_thumb_url(guides[index], 192)
-                            if index in guides else ""),
+            # Two seeds this tile was made with, so a re-test can be aimed at
+            # one tile without going back to the settings node.
+            "seeds": entry.get("seeds") or None,
         })
     return groups
 
@@ -1757,6 +1811,13 @@ def _psd_preview_build(path: str, max_side: int, mode: str) -> Dict[str, Any]:
     if mode == "parts":
         payload["parts"] = _psd_part_groups(psd_path, manifest, limit)
         payload["parts_count"] = len(payload["parts"])
+        # A part knows which tile it came from, not which seeds made it, so
+        # hand the UI every tile's seeds once and let it look them up.
+        payload["seeds"] = {
+            str(int(entry.get("index"))): entry.get("seeds") or None
+            for entry in (manifest or {}).get("tiles") or []
+            if entry.get("seeds")
+        }
     else:
         payload["tiles"] = _psd_tile_groups(run_dir, manifest, limit)
         payload["tiles_count"] = len(payload["tiles"])
@@ -1781,15 +1842,7 @@ async def psd_preview(request: web.Request) -> web.Response:
     except (OSError, FileNotFoundError) as exc:
         return _json_error(str(exc), 404)
 
-    # The per-tile inputs land in the run folder after the PSD does, so the
-    # cached payload must be invalidated when that list changes.
-    try:
-        guide_stamp = os.stat(
-            os.path.join(_run_dir, "_guide", "inputs.json")).st_mtime_ns
-    except OSError:
-        guide_stamp = 0
-    key = (psd_path, stat.st_mtime_ns, stat.st_size, max_side, mode,
-           guide_stamp)
+    key = (psd_path, stat.st_mtime_ns, stat.st_size, max_side, mode)
     payload = _PSD_PREVIEW_CACHE.get(key)
     if payload is None:
         loop = asyncio.get_running_loop()
@@ -1811,269 +1864,159 @@ async def psd_preview(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# /stlu/locks -- per-tile, per-part locks from the ⑤ preview panel
+# /stlu/psd_layers -- the raw layer names of a finished PSD, for the edit table
 # ---------------------------------------------------------------------------
-#
-# A lock copies the layer into ``<run>/_locks/``.  That folder is outside
-# everything the clear-on-parameter-change deletes, so the locked picture is
-# still there after the run folder was wiped.
 
-def _tile_manifest_entry(manifest: Optional[Dict[str, Any]],
-                         index: int) -> Optional[Dict[str, Any]]:
-    for entry in (manifest or {}).get("tiles") or []:
-        try:
-            if int(entry.get("index", -1)) == int(index):
-                return entry
-        except (TypeError, ValueError):
-            continue
-    return None
+def _psd_layers_build(path: str) -> Dict[str, Any]:
+    """Layer names the edit planner can target.
 
-
-def _tile_images_dir(run_dir: str, manifest: Optional[Dict[str, Any]],
-                     index: int) -> str:
-    """The ``images/<tile>`` folder an earlier write left for ``index``."""
-    path = os.path.join(run_dir, "images", "images.json")
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                doc = json.load(handle)
-            for tile in doc.get("tiles") or []:
-                if int(tile.get("index", -1)) == int(index) and tile.get("dir"):
-                    return os.path.join(run_dir, "images", str(tile["dir"]))
-        except Exception:  # noqa: BLE001 - depth is a bonus
-            pass
-    coords = tile_psd._coords_from_manifest(manifest or {})
-    try:
-        row, col = tile_psd.tile_rc(coords, int(index)) if coords else (0, 0)
-        folder = ("tile_%02d_r%d_c%d" % (int(index), row, col)
-                  if coords else "tile_%02d" % int(index))
-    except Exception:  # noqa: BLE001
-        folder = "tile_%02d" % int(index)
-    return os.path.join(run_dir, "images", folder)
-
-
-def _find_tile_layer(layers: List[Dict[str, Any]], name: str,
-                     tile_index: int) -> Optional[Dict[str, Any]]:
-    """The layer a preview thumbnail names, inside that tile's own PSD."""
-    wanted = str(name or "").strip().lower()
-    if not wanted:
-        return None
-    # A per-tile PSD stores plain part names; a merged copy may carry the
-    # tile suffix (face_3).  Both identify the same layer for this tile.
-    candidates = {wanted, "%s_%d" % (wanted, int(tile_index))}
-    for layer in layers:
-        label = str(layer.get("name") or "").strip().lower()
-        if label in candidates:
-            return layer
-    return None
-
-
-def _preview_tile_layers(run_dir: str, manifest: Optional[Dict[str, Any]],
-                         tile: int, cache: Dict[int, Any]
-                         ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    """Visible layers of one tile PSD, read at most once per request."""
-    if tile in cache:
-        return cache[tile]
-    prefix = str((manifest or {}).get("prefix") or "tile")
-    tile_path = tile_psd.find_tile_psd(run_dir, prefix, tile)
-    if not tile_path:
-        result = (None, "找不到块 %02d 的 PSD；先在「按块」里确认这一块已经生成"
-                  " / PSD for tile %02d not found; first confirm this tile has"
-                  " been generated in the \"By tile\" view." % (tile, tile))
-    else:
-        try:
-            data = psd_reader.read_psd(tile_path)
-        except Exception as exc:  # noqa: BLE001
-            result = (None, "无法读取 %s：%s"
-                      " / cannot read %s: %s"
-                      % (os.path.basename(tile_path), exc,
-                         os.path.basename(tile_path), exc))
-        else:
-            result = ([layer for layer in data.get("layers") or []
-                       if str(layer.get("kind") or "layer") == "layer"
-                       and not layer.get("hidden")], None)
-    cache[tile] = result
-    return result
-
-
-def _lock_preview_layer(run_dir: str, manifest: Optional[Dict[str, Any]],
-                        tile: int, name: str, cache: Dict[int, Any],
-                        images_cache: Optional[Dict[int, str]] = None
-                        ) -> Optional[str]:
-    """Snapshot one layer into ``_locks/``; returns an error message or None."""
-    layers, error = _preview_tile_layers(run_dir, manifest, tile, cache)
-    if error:
-        return error
-    layer = _find_tile_layer(layers or [], name, tile)
-    if layer is None:
-        return ("块 %02d 的 PSD 里没有名为 %s 的图层"
-                " / the PSD of tile %02d has no layer named %s"
-                % (tile, name, tile, name))
-    palette = np.asarray(layer.get("pixels"))
-    if palette.ndim != 3 or palette.shape[-1] != 4:
-        return ("图层 %s 没有可保存的 RGBA 像素 / layer %s has no RGBA pixels"
-                " to save" % (name, name))
-    entry = _tile_manifest_entry(manifest, tile) or {}
-    depth_median = 1.0
-    for item in entry.get("layers") or []:
-        if str(item.get("name") or "") == str(layer.get("name") or ""):
-            try:
-                depth_median = float(item.get("depth_median", 1.0))
-            except (TypeError, ValueError):
-                depth_median = 1.0
-            break
-    if images_cache is not None and tile in images_cache:
-        images_dir = images_cache[tile]
-    else:
-        images_dir = _tile_images_dir(run_dir, manifest, tile)
-        if images_cache is not None:
-            images_cache[tile] = images_dir
-    depth = tile_psd._load_part_depth(
-        images_dir, str(layer.get("name") or name))
-    try:
-        tile_psd.store_locked_layer(
-            run_dir, tile, str(layer.get("name") or name), palette,
-            int(layer.get("left") or 0), int(layer.get("top") or 0),
-            tile_box=entry.get("tile"), canvas=entry.get("canvas"),
-            source=(manifest or {}).get("source"),
-            depth=depth, depth_median=depth_median)
-    except (OSError, ValueError) as exc:
-        return "锁定失败：%s / lock failed: %s" % (exc, exc)
-    print("[STLU] locked tile %d part %s" % (
-        tile, layer.get("name")), flush=True)
-    return None
-
-
-def _locks_update_many(run_dir: str, manifest: Optional[Dict[str, Any]],
-                       items: List[Any]) -> web.Response:
-    """Lock/unlock many layers in one request (row / page buttons).
-
-    Each tile's PSD is parsed once and reused, so locking a whole row does
-    not re-read the same file for every part.
+    Same filter as ``_tile_split``: only real, visible, non-suppressed, named,
+    non-empty layers -- exactly the set ``prepare_edit_plan`` can match, so
+    the panel's dropdown never offers a name the backend would reject.
     """
-    cache: Dict[int, Any] = {}
-    images_cache: Dict[int, str] = {}
-    done = 0
-    failed: List[Dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            failed.append({"tile": None, "name": "",
-                           "error": "invalid item"})
+    psd_path, _manifest, _run_dir = _psd_target(path)
+    data = psd_reader.read_psd(psd_path)
+    layers = data.get("layers") or []
+    suppressed = psd_writer.hidden_record_mask(layers)
+    rows: List[Dict[str, Any]] = []
+    for pos, layer in enumerate(layers):
+        if str(layer.get("kind") or "layer") != "layer":
             continue
-        try:
-            tile = int(item.get("tile"))
-        except (TypeError, ValueError):
-            failed.append({"tile": None,
-                           "name": str(item.get("name") or ""),
-                           "error": "tile must be an integer"})
+        if layer.get("hidden") or suppressed[pos]:
             continue
-        name = str(item.get("name") or "").strip()
-        if not name:
-            failed.append({"tile": tile, "name": "",
-                           "error": "name is required"})
+        label = str(layer.get("name") or "")
+        if not label or label.lower() == "original":
             continue
-        if bool(item.get("locked", True)):
-            error = _lock_preview_layer(
-                run_dir, manifest, tile, name, cache, images_cache)
-            if error:
-                failed.append({"tile": tile, "name": name, "error": error})
-                continue
-        else:
-            tile_psd.remove_locked_layer(run_dir, tile, name)
-            print("[STLU] unlocked tile %d part %s" % (tile, name),
-                  flush=True)
-        done += 1
-    return web.json_response({
-        "ok": True,
-        "dir": _relative("output", run_dir) or "",
-        "tiles": tile_psd.lock_summary(run_dir),
-        "done": done,
-        "failed": failed,
-    })
+        left, top = int(layer.get("left", 0)), int(layer.get("top", 0))
+        right, bottom = int(layer.get("right", 0)), int(layer.get("bottom", 0))
+        if right <= left or bottom <= top:
+            continue
+        rows.append({
+            "name": label,
+            "bounds": [left, top, right, bottom],
+            "opacity": int(layer.get("opacity", 255) or 255),
+            "blend": str(layer.get("blend") or "norm"),
+        })
+    return {
+        "file": os.path.basename(psd_path),
+        "canvas": [int(data.get("width") or 0), int(data.get("height") or 0)],
+        "layers": rows,
+    }
 
 
-async def locks_list(request: web.Request) -> web.Response:
-    """GET /stlu/locks?path=<merged PSD or run folder>."""
+async def psd_layers(request: web.Request) -> web.Response:
     raw = (request.query.get("path") or "").strip()
+    if not raw:
+        return _json_error("缺少 path", 400)
+    loop = asyncio.get_running_loop()
     try:
-        _psd_path, _manifest, run_dir = _psd_target(raw)
+        payload = await loop.run_in_executor(None, _psd_layers_build, raw)
     except web.HTTPException as exc:
         return _json_error(exc.text or "invalid path", exc.status)
     except (OSError, FileNotFoundError) as exc:
         return _json_error(str(exc), 404)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("读取 PSD 图层失败: %s" % exc, 500)
+    return web.json_response(payload)
+
+
+# ---------------------------------------------------------------------------
+# /stlu/preset -- persist every panel input as JSON inside the output folder
+# ---------------------------------------------------------------------------
+
+_PRESET_NAME = "stlu_inputs.json"
+
+
+def _preset_read(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def preset_load(request: web.Request) -> web.Response:
+    """Read ``<dir>/stlu_inputs.json``.  A missing file is ``found: false``,
+    not an error: a fresh output folder simply has no saved inputs yet."""
+    try:
+        folder = _resolve("output", request.query.get("dir", ""))
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    path = os.path.join(folder, _PRESET_NAME)
+    rel_file = _relative("output", path) or ""
+    if not os.path.isfile(path):
+        return web.json_response({"found": False, "path": rel_file})
+    data = _preset_read(path)
+    if data is None:
+        return _json_error("存档文件不是有效的 JSON：%s" % rel_file, 500)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
     return web.json_response({
-        "ok": True,
-        "dir": _relative("output", run_dir) or "",
-        "tiles": tile_psd.lock_summary(run_dir),
+        "found": True, "path": rel_file, "data": data, "mtime": mtime,
     })
 
 
-async def locks_update(request: web.Request) -> web.Response:
-    """POST /stlu/locks {path, tile, name, locked} or {path, items: [...]}.
-
-    ``items`` is the batch form the row / page buttons use: one request for a
-    whole row instead of one per thumbnail.
-    """
+async def preset_save(request: web.Request) -> web.Response:
+    """Write ``body.data`` to ``<dir>/<name>`` (default ``stlu_inputs.json``).
+    Written to a temp file first so a crash never leaves a truncated preset."""
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - aiohttp raises several types here
         return _json_error("invalid JSON body", 400)
-    if not isinstance(body, dict):
-        return _json_error("invalid JSON body", 400)
-    raw = str(body.get("path") or "").strip()
-    items = body.get("items")
-    if items is not None and not isinstance(items, list):
-        return _json_error("items must be a list", 400)
-    if items is None:
-        try:
-            int(body.get("tile"))
-        except (TypeError, ValueError):
-            return _json_error("tile must be an integer", 400)
-        if not str(body.get("name") or "").strip():
-            return _json_error("name is required", 400)
+    if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+        return _json_error("data must be a JSON object", 400)
     try:
-        _psd_path, manifest, run_dir = _psd_target(raw)
+        folder = _resolve("output", str(body.get("dir") or ""))
     except web.HTTPException as exc:
         return _json_error(exc.text or "invalid path", exc.status)
-    except (OSError, FileNotFoundError) as exc:
-        return _json_error(str(exc), 404)
+    name = str(body.get("name") or _PRESET_NAME).strip()
+    if ("/" in name or "\\" in name or name.startswith(".")
+            or not name.lower().endswith(".json")):
+        name = _PRESET_NAME
+    try:
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(body["data"], fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError as exc:
+        return _json_error("cannot write preset: %s" % exc, 500)
+    return web.json_response({"ok": True, "path": _relative("output", path) or ""})
 
-    if items is not None:
-        return _locks_update_many(run_dir, manifest, items)
 
-    tile = int(body.get("tile"))
-    name = str(body.get("name") or "").strip()
-    if bool(body.get("locked", True)):
-        error = _lock_preview_layer(run_dir, manifest, tile, name, {})
-        if error:
-            # The helper's messages are ours: a missing tile / layer reads as
-            # "not there" (404), a write failure is a server error (500).
-            missing = ("找不到块" in error or "没有名为" in error
-                       or "无法读取" in error)
-            return _json_error(error, 404 if missing else 500)
-    else:
-        tile_psd.remove_locked_layer(run_dir, tile, name)
-        print("[STLU] unlocked tile %d part %s" % (tile, name), flush=True)
-
+async def preset_read_file(request: web.Request) -> web.Response:
+    """Read any output-relative JSON file (the "import from file" button)."""
+    try:
+        path = _resolve("output", request.query.get("path", ""))
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    if not os.path.isfile(path) or not path.lower().endswith(".json"):
+        return _json_error("not a JSON file", 404)
+    data = _preset_read(path)
+    if data is None:
+        return _json_error("文件不是有效的 JSON 对象", 500)
     return web.json_response({
-        "ok": True,
-        "dir": _relative("output", run_dir) or "",
-        "tiles": tile_psd.lock_summary(run_dir),
+        "ok": True, "path": _relative("output", path) or "", "data": data,
     })
 
 
 if _ROUTES is not None:
     _ROUTES.get("/stlu/ls")(list_directory)
+    _ROUTES.get("/stlu/fs_ls")(fs_list)
+    _ROUTES.get("/stlu/reveal_local")(reveal_local)
+    _ROUTES.get("/stlu/open_local")(open_local)
     _ROUTES.get("/stlu/layers")(list_layers)
     _ROUTES.get("/stlu/thumb")(thumb)
     _ROUTES.get("/stlu/preview")(preview_plan)
     _ROUTES.get("/stlu/reveal")(reveal_path)
     _ROUTES.get("/stlu/open")(open_path)
-    _ROUTES.get("/stlu/wf")(check_workflow)
     _ROUTES.get("/stlu/imgsize")(image_size)
     _ROUTES.get("/stlu/psd_preview")(psd_preview)
-    _ROUTES.get("/stlu/locks")(locks_list)
-    _ROUTES.post("/stlu/locks")(locks_update)
+    _ROUTES.get("/stlu/psd_layers")(psd_layers)
     _ROUTES.get("/stlu/tiles/strips")(tiles_strips)
     _ROUTES.get("/stlu/edit_parts")(edit_parts_catalogue)
     _ROUTES.get("/stlu/tiles/dirs")(tiles_dirs)
@@ -2085,3 +2028,6 @@ if _ROUTES is not None:
     _ROUTES.get("/stlu/tiles/grid")(tiles_grid)
     _ROUTES.get("/stlu/tiles/images")(tiles_images)
     _ROUTES.post("/stlu/tiles/from_images")(tiles_from_images)
+    _ROUTES.get("/stlu/preset")(preset_load)
+    _ROUTES.post("/stlu/preset")(preset_save)
+    _ROUTES.get("/stlu/preset_file")(preset_read_file)

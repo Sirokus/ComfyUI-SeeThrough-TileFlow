@@ -115,7 +115,7 @@ def test_merge(tmp):
         filename_prefix="tile", source_size=SOURCE, tile_size=(1024, 1024),
         overlap=0, tile_coords=coords, tile_index_map=[0, 1],
         write_depth=False, include_original=False,
-        generation={"test": 1}, generation_id="custom-merge",
+        generation={"test": 1},
     )
     run_dir = os.path.join(tmp, manifest["dir"])
     check([entry["canvas"] for entry in manifest["tiles"]] ==

@@ -140,15 +140,13 @@ def main():
         "tile_size": [1024, 1024],
         "overlap": 128,
         "offset": [0, 0],
-        "generation_id": "abc",
         "source_fingerprint": "fp",
     }
-    doc["generation_id"] = "abc"
     doc["source"]["fingerprint"] = "fp"
-    check(not tile_psd.cache_compatible(manifest, doc),
-          "a folder from offset 0 is not reused for a phased grid")
+    check("偏移" in tile_psd.cache_mismatch_reason(manifest, doc),
+          "a folder from offset 0 is cleared for a phased grid")
     manifest["offset"] = [phase, 0]
-    check(tile_psd.cache_compatible(manifest, doc),
+    check(tile_psd.cache_mismatch_reason(manifest, doc) == "",
           "the same phase is reusable")
     rebuilt = tile_psd._coords_from_manifest(manifest)
     check(rebuilt == doc["coords"], "a manifest without a grid_doc rebuilds the phase")

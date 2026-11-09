@@ -1,8 +1,7 @@
-"""CPU-only checks for the generation fingerprint's algorithm version."""
+"""CPU-only checks for the generation record and the structural reset rule."""
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -29,18 +28,63 @@ def check(cond, message):
         _failures.append(message)
 
 
+def _manifest(mode="uniform", size=(128, 128), tiles=(64, 64),
+              overlap=0, offset=(0, 0), coords=((0, 0, 64, 64),)):
+    return {
+        "mode": mode,
+        "source": list(size),
+        "source_fingerprint": "abc",
+        "tile_size": list(tiles),
+        "overlap": overlap,
+        "offset": list(offset),
+        "tiles": [{"index": i, "tile": list(box)} for i, box in enumerate(coords)],
+    }
+
+
+def _doc(mode="uniform", size=(128, 128), tiles=(64, 64),
+         overlap=0, offset=(0, 0), coords=((0, 0, 64, 64),)):
+    return {
+        "mode": mode,
+        "source": {"image": "a.png", "width": size[0], "height": size[1],
+                   "fingerprint": "abc"},
+        "tile_size": list(tiles),
+        "overlap": overlap,
+        "offset": list(offset),
+        "coords": [list(box) for box in coords],
+    }
+
+
 def main():
-    print("[algorithm version is part of the fingerprint]")
-    old = {"version": 1, "random_seed": 1}
-    new = {"version": 1, "algo_version": 1, "random_seed": 1}
-    check(tile_psd.generation_id(old) != tile_psd.generation_id(new),
-          "adding algo_version changes generation_id")
-    check(not tile_psd.generation_matches(old, new),
-          "an old folder without algo_version does not match")
-    check(tile_psd.generation_matches(
-        {"version": 1, "algo_version": 1, "random_seed": 1},
-        {"version": 1, "algo_version": 1, "random_seed": 1}),
-        "identical fingerprints match")
+    print("[structural mismatch is the only automatic reset]")
+    check(tile_psd.cache_mismatch_reason(_manifest(), _doc()) == "",
+          "same layout -> reusable")
+    check("分区方式" in tile_psd.cache_mismatch_reason(
+        _manifest(mode="subject_strips"), _doc()), "another mode -> reset")
+    check("原图尺寸" in tile_psd.cache_mismatch_reason(
+        _manifest(size=(64, 64)), _doc(size=(128, 128))),
+        "another source size -> reset")
+    check("原图" in tile_psd.cache_mismatch_reason(
+        dict(_manifest(), source_fingerprint="old"), _doc()),
+        "another source image -> reset")
+    check("分块尺寸" in tile_psd.cache_mismatch_reason(
+        _manifest(tiles=(32, 32)), _doc()), "another tile size -> reset")
+    check("重叠" in tile_psd.cache_mismatch_reason(
+        _manifest(overlap=16), _doc()), "another overlap -> reset")
+    check("偏移" in tile_psd.cache_mismatch_reason(
+        _manifest(offset=(8, 0)), _doc()), "another offset -> reset")
+    check("位置" in tile_psd.cache_mismatch_reason(
+        _manifest(coords=((0, 0, 64, 64),)), _doc(coords=((0, 32, 64, 64),))),
+        "moved box -> reset")
+    # A folder whose manifest only knows some tiles (an interrupted run) keeps
+    # the tiles it does know about; only the shared indices are compared.
+    check(tile_psd.cache_mismatch_reason(
+        _manifest(coords=((0, 0, 64, 64),)),
+        _doc(coords=((0, 0, 64, 64), (0, 64, 64, 64)))) == "",
+        "a partial manifest still joins the run")
+    check(tile_psd.cache_mismatch_reason({}, _doc()) == "",
+          "no manifest -> nothing to compare")
+    check(tile_psd.cache_mismatch_reason(_manifest(), {}) == "",
+          "no plan -> nothing to compare")
 
     with tempfile.TemporaryDirectory() as tmp:
         print("[PipelineInput writes algo_version]")
@@ -58,8 +102,7 @@ def main():
         generation = doc.get("generation") or {}
         check(generation.get("algo_version") == tile_psd.ALGO_VERSION,
               "grid_doc carries algo_version=%s" % generation.get("algo_version"))
-        check(doc.get("generation_id") == tile_psd.generation_id(generation),
-              "generation_id matches the document")
+        check("generation_id" not in doc, "grid_doc carries no fingerprint")
 
     if _failures:
         print("\nFAILED:", len(_failures))

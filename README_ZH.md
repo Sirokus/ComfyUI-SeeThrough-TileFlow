@@ -14,11 +14,11 @@
 - **只跑勾选的块**：未勾选的格子不会进入 GPU，已生成过的格子直接复用。
 - **顺序引导回填**：每块生成前，把已经完成的相邻块在重叠区的像素填回去再送进
   模型（`STLU_GuidedLayers` / `STLU_SeqTileLoop`），减轻拼缝。
-- **固定输出目录 + 参数指纹**：参数变了才清空重跑；只改合并选项时只重新合并。
+- **固定输出目录 + 参数指纹**：参数变了只提示、不自动删结果；清空永远是手动操作。
 - **分层 PSD + 逐块清单**：每块存独立分层 PSD，全部完成后写 `manifest.json` /
   `images.json` / `generation.json`，并合并出整图分层 PSD。
-- **两套工作流**：一套四步流水线（节点最少），一套「透明版」把每个阶段摊成子图，
-  内部每一步都可见，两套共用同一套底层实现。
+- **一套分块工作流**：规划切块、顺序拆层、存盘、合并、预览各是一个可见节点，
+  每个节点职责单一。
 - **中英双语面板**：界面默认中文，`Comfy.Locale` 为英文时由 `locales/en` 与
   `web/stlu_i18n.js` 提供英文显示（不改写任何存档值）。
 
@@ -48,10 +48,7 @@ git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
 
 | 文件 | 说明 |
 |---|---|
-| `workflow/seethrough-tile-flow-simple.json` | 四步流水线：`STLU_SimpleInput` → SeeThrough 自动拆层 → `STLU_TilePSD` / `STLU_WaveIndex` → `STLU_TileMerge` → `STLU_PSDPreview`。节点最少，适合直接用。 |
-| `workflow/seethrough-tile-flow.json` | 透明版：① 计划与切块、② 顺序拆层、③ 存盘、④ 合并各是一个子图，⑤ 预览单独显示；每个内部步骤都是可见节点。 |
-
-两套工作流读同一份 `settings` 参数、写同一种输出目录，结果可以互相接手。
+| `workflow/seethrough-tile-flow.json` | 分块流水线：① `STLU_PipelineInput` 规划、切块、算指纹 → ② `STLU_GuidedLayers` 逐块带跨块引导拆层 → ③ 每块存 PSD 与清单 → ④ `STLU_TileMerge` 合并 → ⑤ `STLU_PSDPreview` 预览。只跑勾选的块，已生成的块自动复用。 |
 
 ## 快速开始
 
@@ -66,15 +63,18 @@ git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
 
 ## 流水线
 
-| 阶段 | 做什么 | 简化版节点 | 透明版节点 |
+| 阶段 | 做什么 | 流水线节点 | 可选的拆分单步节点 |
 |---|---|---|---|
-| ① 计划与切块 | 规划网格、选块、上下文外扩、写入参数指纹、裁剪 | `STLU_SimpleInput` / `STLU_PipelineInput` | `STLU_PipelineSettings` → `STLU_PlanGrid` → `STLU_PickTiles` → `STLU_PlanContext` → `STLU_PrepareRun` → `STLU_CropTiles` |
+| ① 计划与切块 | 规划网格、选块、上下文外扩、写入参数指纹、裁剪 | `STLU_PipelineInput` | `STLU_PipelineSettings` → `STLU_PlanGrid` → `STLU_PickTiles` → `STLU_PlanContext` → `STLU_PrepareRun` → `STLU_CropTiles` |
 | ② 顺序拆层 | 逐块运行 LayerDiff → Depth → PostProcess，重叠区回填引导 | `STLU_GuidedLayers` | `STLU_SeqTileLoop`（唯一必须留在 Python 里的循环），`STLU_GuideTile` / `STLU_CropBack` 为调试用单块版本 |
-| ③ 存盘 | 恢复锁定部件、逐块写分层 PSD 与分层 PNG、存原图、汇总清单 | `STLU_TilePSD` + `STLU_WaveIndex` | `STLU_RestoreLocks` → `STLU_WriteTilePSD` / `STLU_WriteTileImages` → `STLU_SaveOriginal` → `STLU_WriteManifest` |
+| ③ 存盘 | 逐块写分层 PSD 与分层 PNG、存原图、汇总清单 | `STLU_TilePSD` + `STLU_WaveIndex` | `STLU_WriteTilePSD` / `STLU_WriteTileImages` → `STLU_SaveOriginal` → `STLU_WriteManifest` |
 | ④ 合并 | 接缝归属、缩放、整部件例外、分层组装 | `STLU_TileMerge` | `STLU_MergeTiles`（整块算法，保留为单节点） |
-| ⑤ 预览 | 合并 PSD 总览、按块 / 按部位分组 | `STLU_PSDPreview` | 同左，额外接收 ② 的 `guided_inputs` 与 `indices`，显示每块实际喂给模型的输入 |
+| ⑤ 预览 | 合并 PSD 总览、按块 / 按部位分组 | `STLU_PSDPreview` | 同左，直接读取 ④ 的 `psd_path` |
 
 只在 **①** 上操作；②③④ 的参数 widget 会被锁定，仅显示进度和结果。
+
+随附的工作流用的是「流水线节点」一列。第三列是同一套实现拆成的单职责节点，
+方便调试或自己搭图，但不再随附示例工作流。
 
 ## 常用参数
 
@@ -108,40 +108,38 @@ git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
 ## 缓存、复用与重跑
 
 - 会改变像素的参数（原图、块尺寸 / 重叠、分辨率、步数、深度分辨率、种子、左右
-  拆分、LaMa、透明阈值、拆层 / 深度模型）一旦变化，Queue 时会自动清空该输出目录
-  并重跑全部块，`generation.json` 记录原因。
+  拆分、LaMa、透明阈值、拆层 / 深度模型）发生变化时，`generation.json` 会记录并在
+  界面提示，但**不会删除任何结果**：Queue 只重跑你勾选的块并覆盖它们，其余块和
+  合并图都保留。想整体重来请手动点「清空此目录」。
 - 只改合并选项（同名图层单独成组、是否导出 depth、是否放原图、接缝羽化）不会重跑
   块，只重新合并。
 - 同一目录里已经生成的块会自动复用：只勾选要重跑的块即可，未勾选的块仍参与合并。
-- 换了原图（即使尺寸相同）不会误用旧块——清单里带源图指纹。
+- 换了原图（即使尺寸相同）不会误用旧块——清单里带源图指纹；旧块会留在目录里，
+  需要时手动清空。
 
 ## 节点总览
 
 主流水线之外，包内还提供其他工作流用的节点（分类 **SeeThrough/LayerUpscale**）：
 
-- `STLU_Plan` / `STLU_UpscaleBatch`：按计划批量放大 SeeThrough 图层并组装 PSD。
 - `STLU_Mask4K` / `STLU_Mask4KBatch`：纯 CPU 的 4K 部件遮罩（引导滤波 + 边缘吸附）。
 - `STLU_EditPartsBatch`：图编辑模型批量抠取 Live2D 部件。
 - `STLU_RebuildPSD`：从已导出的分层图片重建合并 PSD（CPU）。
 - Legacy 分类下的旧节点（`STLU_LoadLayer`、`STLU_ContextBackdrop`、
-  `STLU_FocusCrop`、`STLU_PasteBack`、`STLU_DetailBatch`、`STLU_AssemblePSD`、
+  `STLU_FocusCrop`、`STLU_PasteBack`、`STLU_DetailBatch`、
   `STLU_ChromaToAlpha`、`STLU_PartsPSD`、`STLU_TileGrid` 等）保持可用，
   但不再出现在新流水线里。
 
 ## 工具
 
 ```bash
-# 构建 / 修复透明版工作流（保留用户调过的 widget 值，可重复执行）
+# 构建 / 修复「逐步骤拆分版」工作流（每个内部步骤一个可见节点；不是默认示例）
+# 保留用户调过的 widget 值，可重复执行
 python tools/build_transparent_workflow.py <workflow_dir>
 python tools/build_transparent_workflow.py <workflow_dir> --force
 python tools/build_transparent_workflow.py <workflow_dir> --validate
 
 # 其他工作流生成器
-python tools/build_batch_workflow.py
-python tools/build_detail_workflow.py
 python tools/build_edit_workflow.py
-python tools/build_mask4k_workflow.py
-python tools/validate_batch_workflow.py <workflow.json>
 ```
 
 ## 测试
@@ -155,10 +153,10 @@ python tests/run_all.py tile mask4k     # 只跑文件名匹配的测试
 
 ## 前端与 HTTP 接口
 
-- `web/stlu.js`：① 输入面板、格子勾选、③ 进度、⑤ PSD 预览、锁定部件面板等。
+- `web/stlu.js`：① 输入面板、格子勾选、③ 进度、⑤ PSD 预览等。
 - `web/stlu_i18n.js` + `locales/en/`：英文界面。
 - `routes.py` 向 ComfyUI 的 prompt server 注册 `/stlu/*` 接口：`ls`、`layers`、
-  `thumb`、`preview`、`reveal`、`open`、`wf`、`imgsize`、`psd_preview`、`locks`、
+  `thumb`、`preview`、`reveal`、`open`、`wf`、`imgsize`、`psd_preview`、
   `tiles/*`（grids、grid、images、from_images、dirs、manifest、clear、merge、
   merge-mixed、strips）、`edit_parts`。
 

@@ -82,7 +82,6 @@ def write_old_manifest(run_dir):
         "overlap": 256,
         "offset": [0, 0],
         "generation": generation,
-        "generation_id": "old",
         "tiles": tiles,
         "count": 2,
     }
@@ -116,6 +115,30 @@ def expected_boxes(regions):
         x, y, size = int(region["x"]), int(region["y"]), int(region["size"])
         boxes.append([x, y, x + size, y + size])
     return boxes
+
+
+def write_custom_manifest(run_dir, regions):
+    """A finished custom run from before, as ③ would have left it."""
+    os.makedirs(run_dir, exist_ok=True)
+    side = max(int(region["size"]) for region in regions)
+    tiles = [
+        {"index": index, "file": "tile_%02d.psd" % index,
+         "canvas": [512, 512], "tile": list(box)}
+        for index, box in enumerate(expected_boxes(regions))
+    ]
+    manifest = {
+        "source": [1751, 4096],
+        "tile_size": [side, side],
+        "overlap": 256,
+        "offset": [0, 0],
+        "mode": region_plan.CUSTOM_MODE,
+        "partition_plan": region_plan.custom_document(
+            regions, 1751, 4096)["partition_plan"],
+        "tiles": tiles,
+        "count": len(tiles),
+    }
+    with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
 
 
 def test_custom_run():
@@ -178,9 +201,11 @@ def test_subset_does_not_clear(doc, plan_id):
     return doc2
 
 
-def test_size_change_resets(before, plan_id):
-    print("[① resizing a window changes the plan and clears the folder]")
+def test_size_change_resets(before, plan_id, tmp):
+    print("[① resizing a window moves its box, so the folder is cleared]")
     frame = synthetic_frame()
+    run_dir = os.path.join(tmp, "SeeThrough", "Custom")
+    write_custom_manifest(run_dir, WINDOWS)
     resized = [dict(region) for region in WINDOWS]
     resized[0]["size"] = 1152
     out, tiles, indices, doc, _res, _depth = run_node(
@@ -190,12 +215,14 @@ def test_size_change_resets(before, plan_id):
     check(plan["plan_id"] != before["partition_plan"]["plan_id"],
           "the plan id changes with the geometry")
     reset = (doc.get("out") or {}).get("reset") or {}
-    check(reset.get("required") is True, "the folder is cleared")
-    check("partition" in (reset.get("keys") or []),
-          "the partition change is named in the reset keys (%s)"
-          % (reset.get("keys"),))
-    check(reset.get("partial") is None and len(indices) == 3,
-          "a full selection re-runs every window")
+    check(reset.get("required") is False and reset.get("changed") is True,
+          "the change only reports a reset (%s)" % (reset,))
+    check("位置" in str(reset.get("reason") or ""),
+          "the moved box is the stated reason (%s)" % (reset.get("reason"),))
+    check(len(indices) == 3,
+          "a cleared folder runs every window, whatever was ticked")
+    check(not os.path.isfile(os.path.join(run_dir, "manifest.json")),
+          "the old manifest is gone until ③ writes the new one")
     check(doc["coords"][0] == [100, 40, 1252, 1192],
           "the resized box is what gets cropped")
 
@@ -221,22 +248,76 @@ def test_order_change():
           "per-window sizes travel with their window")
 
 
+def test_append_window_is_incremental(tmp):
+    print("[① appending one more window keeps every existing tile]")
+    frame = synthetic_frame()
+    run_dir = os.path.join(tmp, "SeeThrough", "Append")
+    write_custom_manifest(run_dir, WINDOWS)
+    grown = WINDOWS + [
+        {"x": 0, "y": 1000, "size": 1728, "res": 0, "name": "新"},
+    ]
+    plan_id = region_plan.custom_document(
+        grown, 1751, 4096, global_resolution=512,
+        created=0)["partition_plan"]["plan_id"]
+    out, tiles, indices, doc, _res, _depth = run_node(
+        frame, "3", "SeeThrough/Append", regions=grown, select_plan=plan_id)
+    check((doc.get("out") or {}).get("reset") is None,
+          "a bigger appended window does not clear the folder")
+    check(os.path.isfile(os.path.join(run_dir, "manifest.json")),
+          "the existing manifest survives")
+    check(indices == ["3"] and len(tiles) == 1,
+          "only the new window is handed on (%s)" % indices)
+    check(tuple(tiles[0].shape) == (1, 1728, 1728, 3),
+          "the new crop is the 1728 px window (%s)" % (tuple(tiles[0].shape),))
+
+
+def test_reorder_keeps_tiles(tmp):
+    print("[① reordering the array keeps the cached tiles]")
+    frame = synthetic_frame()
+    run_dir = os.path.join(tmp, "SeeThrough", "Reorder")
+    write_custom_manifest(run_dir, WINDOWS)
+    swapped = [WINDOWS[1], WINDOWS[0], WINDOWS[2]]
+    plan_id = region_plan.plan_key(swapped, 1751, 4096)
+    out, tiles, indices, doc, _res, _depth = run_node(
+        frame, "0", "SeeThrough/Reorder", regions=swapped, select_plan=plan_id)
+    check((doc.get("out") or {}).get("reset") is None,
+          "a reorder does not clear the folder")
+    check(os.path.isfile(os.path.join(run_dir, "manifest.json")),
+          "the existing manifest survives")
+    check(indices == ["0"], "only the checked window runs (%s)" % indices)
+
+
+def test_box_remap():
+    print("[cache: adopted tiles are re-keyed by box, not by old index]")
+    entries = [{"index": index, "tile": list(box)}
+               for index, box in enumerate(expected_boxes(WINDOWS))]
+    swapped = [WINDOWS[1], WINDOWS[0], WINDOWS[2]]
+    doc = {"mode": region_plan.CUSTOM_MODE,
+           "coords": expected_boxes(swapped)}
+    remapped = tile_psd._remap_custom_entries(entries, doc)
+    check([entry["index"] for entry in remapped] == [1, 0, 2],
+          "each tile follows its box (%s)"
+          % [entry["index"] for entry in remapped])
+    check([entry["tile"] for entry in remapped] == expected_boxes(WINDOWS),
+          "boxes are untouched by the remap")
+
+
 def test_mapping_from_uniform(tmp):
-    print("[① old uniform selection maps by area, never widened]")
+    print("[① an old uniform folder is cleared when the partition type changes]")
     frame = synthetic_frame()
     old_dir = os.path.join(tmp, "SeeThrough", "Mapped")
     write_old_manifest(old_dir)
     out, tiles, indices, doc, _res, _depth = run_node(
         frame, "0,1", "SeeThrough/Mapped", select_plan="")
-    check(indices == ["0"] and len(tiles) == 1,
-          "the old top row maps onto the first window only (%s)" % indices)
-    check(doc["selection"] == "0", "the mapped selection is written into the doc")
     reset = (doc.get("out") or {}).get("reset") or {}
-    check(reset.get("required") is True,
-          "switching from the uniform grid clears the old folder")
-    check("partition" in (reset.get("keys") or []),
-          "the mode change is named in the reset keys (%s)"
-          % (reset.get("keys"),))
+    check(reset.get("required") is False and reset.get("changed") is True,
+          "switching from the uniform grid reports a reset (%s)" % (reset,))
+    check("分区方式" in str(reset.get("reason") or ""),
+          "the mode change is the stated reason (%s)" % (reset.get("reason"),))
+    check(indices == ["0", "1", "2"],
+          "the cleared folder runs every window (%s)" % indices)
+    check(not os.path.isfile(os.path.join(old_dir, "manifest.json")),
+          "the old uniform manifest is cleared")
 
     # An old bottom tile barely touches the windows: mapping is empty, so the
     # literal index is kept -- still a subset, never the whole layout.
@@ -265,8 +346,11 @@ def main():
         doc = test_custom_run()
         plan_id = doc["partition_plan"]["plan_id"]
         test_subset_does_not_clear(doc, plan_id)
-        test_size_change_resets(doc, plan_id)
+        test_size_change_resets(doc, plan_id, tmp)
         test_order_change()
+        test_append_window_is_incremental(tmp)
+        test_reorder_keeps_tiles(tmp)
+        test_box_remap()
         test_mapping_from_uniform(tmp)
         test_empty_layout_raises()
     print()

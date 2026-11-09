@@ -18,14 +18,14 @@ Nodes and panels speak Chinese by default; an English localization file ships in
 - **Sequential guided backfill**: before each tile is generated, pixels from already
   finished neighbouring tiles are filled into the overlap and fed to the model
   (`STLU_GuidedLayers` / `STLU_SeqTileLoop`), softening seams.
-- **Fixed output directory + parameter fingerprint**: the directory is only cleared
-  when generation parameters change; changing merge options only re-merges.
+- **Fixed output directory + parameter fingerprint**: changed parameters are only
+  reported, results are never deleted automatically; clearing is always manual.
 - **Layered PSD + per-tile manifests**: each tile is saved as its own layered PSD;
   when all tiles finish, `manifest.json` / `images.json` / `generation.json` are
   written and the whole image is merged into one layered PSD.
-- **Two workflows**: a four-step pipeline (fewest nodes) and a "transparent"
-  variant that expands every stage into a subgraph where each inner step is a
-  visible node. Both share the same implementation.
+- **One tile workflow**: a single six-node pipeline where planning, sequential
+  layer generation, saving, merging and preview are each a separate visible node.
+  Every node keeps a single responsibility.
 - **Bilingual panels**: Chinese by default; when `Comfy.Locale` is English,
   `locales/en` and `web/stlu_i18n.js` provide the English UI (saved values are
   never rewritten).
@@ -57,11 +57,7 @@ nodes under **SeeThrough/LayerUpscale/Legacy**.
 
 | File | Description |
 |---|---|
-| `workflow/seethrough-tile-flow-simple.json` | Four-step pipeline: `STLU_SimpleInput` → SeeThrough automatic layer generation → `STLU_TilePSD` / `STLU_WaveIndex` → `STLU_TileMerge` → `STLU_PSDPreview`. Fewest nodes, good for direct use. |
-| `workflow/seethrough-tile-flow.json` | Transparent variant: ① plan & crop, ② sequential layer generation, ③ save, ④ merge are each a subgraph; ⑤ preview is separate. Every inner step is a visible node. |
-
-Both workflows read the same `settings` parameters and write the same output
-layout, so results can be picked up by either of them.
+| `workflow/seethrough-tile-flow.json` | The tile pipeline: ① `STLU_PipelineInput` plans, crops and fingerprints the tiles → ② `STLU_GuidedLayers` generates layers block by block with cross-tile guidance → ③ per-tile PSD + manifest → ④ `STLU_TileMerge` merges → ⑤ `STLU_PSDPreview`. Only the checked tiles are (re)run; existing tiles are reused. |
 
 ## Quick start
 
@@ -81,16 +77,20 @@ layout, so results can be picked up by either of them.
 
 ## Pipeline
 
-| Stage | What it does | Simple nodes | Transparent nodes |
+| Stage | What it does | Pipeline nodes | Optional split-step nodes |
 |---|---|---|---|
-| ① plan & crop | Plan the grid, pick tiles, expand context, write the parameter fingerprint, crop | `STLU_SimpleInput` / `STLU_PipelineInput` | `STLU_PipelineSettings` → `STLU_PlanGrid` → `STLU_PickTiles` → `STLU_PlanContext` → `STLU_PrepareRun` → `STLU_CropTiles` |
+| ① plan & crop | Plan the grid, pick tiles, expand context, write the parameter fingerprint, crop | `STLU_PipelineInput` | `STLU_PipelineSettings` → `STLU_PlanGrid` → `STLU_PickTiles` → `STLU_PlanContext` → `STLU_PrepareRun` → `STLU_CropTiles` |
 | ② sequential layer generation | Run LayerDiff → Depth → PostProcess per tile, guided backfill in the overlap | `STLU_GuidedLayers` | `STLU_SeqTileLoop` (the only loop that must stay in Python); `STLU_GuideTile` / `STLU_CropBack` are single-tile versions for debugging |
-| ③ save | Restore locked parts, write per-tile layered PSD and layered PNG, save the source, summarize manifests | `STLU_TilePSD` + `STLU_WaveIndex` | `STLU_RestoreLocks` → `STLU_WriteTilePSD` / `STLU_WriteTileImages` → `STLU_SaveOriginal` → `STLU_WriteManifest` |
+| ③ save | Write per-tile layered PSD and layered PNG, save the source, summarize manifests | `STLU_TilePSD` + `STLU_WaveIndex` | `STLU_WriteTilePSD` / `STLU_WriteTileImages` → `STLU_SaveOriginal` → `STLU_WriteManifest` |
 | ④ merge | Seam ownership, scaling, whole-part exceptions, layered assembly | `STLU_TileMerge` | `STLU_MergeTiles` (whole-tile algorithm, kept as one node) |
-| ⑤ preview | Merged PSD overview, per-tile / per-part grouping | `STLU_PSDPreview` | Same, plus ②'s `guided_inputs` and `indices` to show what each tile actually fed the model |
+| ⑤ preview | Merged PSD overview, per-tile / per-part grouping | `STLU_PSDPreview` | Same, driven by ④'s `psd_path` |
 
 Only edit **①**; the parameter widgets of ②③④ are locked and only show progress
 and results.
+
+The shipped workflow uses the *Pipeline nodes* column. The split-step column is
+the same implementation exposed as single-purpose nodes — handy for debugging or
+building a custom graph, but no example workflow ships for it.
 
 ## Common parameters
 
@@ -125,46 +125,43 @@ and results.
 
 - If a parameter that changes pixels (source image, tile size / overlap,
   resolution, steps, depth resolution, seed, left/right split, LaMa, alpha
-  threshold, layer / depth model) changes, Queue clears that output directory and
-  re-runs every tile; `generation.json` records why.
+  threshold, layer / depth model) changes, `generation.json` records it and the
+  UI reports it, but **nothing is ever deleted**: Queue re-runs only the ticked
+  tiles and overwrites them, keeping every other tile and the merged image. Click
+  "Clear this folder" to start over.
 - Changing only merge options (group same-named layers, export depth, include the
   original, seam feathering) never re-runs tiles, only re-merges.
 - Tiles already generated in the same directory are reused automatically: tick
   only the tiles you want re-run; unticked tiles still take part in the merge.
 - Switching the source image (even at the same size) never reuses stale tiles —
-  the manifest carries a source fingerprint.
+  the manifest carries a source fingerprint; the old tiles stay on disk until you
+  clear the folder manually.
 
 ## Other nodes
 
 Outside the main pipeline, the package also provides nodes for other workflows
 (category **SeeThrough/LayerUpscale**):
 
-- `STLU_Plan` / `STLU_UpscaleBatch`: batch-upscale SeeThrough layers according to
-  a plan and assemble the PSD.
 - `STLU_Mask4K` / `STLU_Mask4KBatch`: pure-CPU 4K part masks (guided filter + edge
   snapping).
 - `STLU_EditPartsBatch`: batch-extract Live2D parts with an image-editing model.
 - `STLU_RebuildPSD`: rebuild a merged PSD from exported layer images (CPU).
 - Legacy nodes under the Legacy category (`STLU_LoadLayer`,
   `STLU_ContextBackdrop`, `STLU_FocusCrop`, `STLU_PasteBack`,
-  `STLU_DetailBatch`, `STLU_AssemblePSD`, `STLU_ChromaToAlpha`,
-  `STLU_PartsPSD`, `STLU_TileGrid`, …) remain usable but no longer appear in the
-  new pipeline.
+  `STLU_DetailBatch`, `STLU_ChromaToAlpha`, `STLU_PartsPSD`, `STLU_TileGrid`, …)
+  remain usable but no longer appear in the new pipeline.
 
 ## Tools
 
 ```bash
-# Build / repair the transparent workflow (keeps widget values you changed, re-runnable)
+# Build / repair an optional split-step variant (every inner step a visible
+# node; not shipped as a default example). Keeps widget values you changed.
 python tools/build_transparent_workflow.py <workflow_dir>
 python tools/build_transparent_workflow.py <workflow_dir> --force
 python tools/build_transparent_workflow.py <workflow_dir> --validate
 
 # Other workflow builders
-python tools/build_batch_workflow.py
-python tools/build_detail_workflow.py
 python tools/build_edit_workflow.py
-python tools/build_mask4k_workflow.py
-python tools/validate_batch_workflow.py <workflow.json>
 ```
 
 ## Tests
@@ -180,11 +177,11 @@ load no models.
 ## Frontend and HTTP endpoints
 
 - `web/stlu.js`: the ① input panel, tile picking, ③ progress, ⑤ PSD preview,
-  locked-parts panel, etc.
+  etc.
 - `web/stlu_i18n.js` + `locales/en/`: English UI.
 - `routes.py` registers `/stlu/*` endpoints on ComfyUI's prompt server: `ls`,
   `layers`, `thumb`, `preview`, `reveal`, `open`, `wf`, `imgsize`, `psd_preview`,
-  `locks`, `tiles/*` (grids, grid, images, from_images, dirs, manifest, clear,
+  `tiles/*` (grids, grid, images, from_images, dirs, manifest, clear,
   merge, merge-mixed, strips), `edit_parts`.
 
 ## License

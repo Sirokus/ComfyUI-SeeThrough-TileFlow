@@ -24,7 +24,7 @@ import folder_paths
 if __package__:  # ComfyUI loads the folder as a package
     from . import (core_compose, core_geometry, core_io, core_mask4k, core_plan,
                    core_reference, edit_expand, edit_parts, psd_reader,
-                   psd_writer, subgraph_clone, tile_psd, tile_strips)
+                   psd_writer, tile_psd, tile_strips)
     from .stlu import json_io, limits as stlu_limits
 else:  # standalone import used by the tests and tools
     import core_compose
@@ -37,7 +37,6 @@ else:  # standalone import used by the tests and tools
     import edit_parts
     import psd_reader
     import psd_writer
-    import subgraph_clone
     import tile_psd
     import tile_strips
     from stlu import json_io, limits as stlu_limits
