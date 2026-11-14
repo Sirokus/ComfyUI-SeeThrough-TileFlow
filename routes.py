@@ -6,22 +6,25 @@ Everything is sandboxed to one of three roots:
 * ``input``     -- ComfyUI input dir (reference images)
 * ``workflows`` -- user/default/workflows (the subgraph template)
 
-The frontend uses ``/stlu/ls`` for the pickers, ``/stlu/layers`` for the Plan
-list, ``/stlu/thumb`` for cached thumbnails and ``/stlu/preview`` for the
-pre-flight composite preview.
+The frontend uses ``/stlu/browse`` for every browse button, ``/stlu/layers``
+for the Plan list, ``/stlu/thumb`` for cached
+thumbnails and ``/stlu/preview`` for the pre-flight composite preview.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import urllib.parse
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,13 +34,15 @@ from PIL import Image
 import folder_paths
 
 if __package__:  # ComfyUI loads the folder as a package
-    from . import (core_compose, core_plan, edit_parts, psd_reader, psd_writer,
-                   tile_psd, tile_strips)
+    from . import (core_compose, core_plan, edit_parts, edit_plan,
+                   psd_reader, psd_upscale, psd_writer, tile_psd, tile_strips)
 else:  # standalone import used by the tests
     import core_compose
     import core_plan
     import edit_parts
+    import edit_plan
     import psd_reader
+    import psd_upscale
     import psd_writer
     import tile_psd
     import tile_strips
@@ -263,151 +268,118 @@ async def thumb(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# /stlu/ls  -- folder / file browser
+# /stlu/local_thumb + /stlu/local_info -- preview a file picked anywhere on disk
 # ---------------------------------------------------------------------------
+#
+# ``/stlu/thumb`` only serves the workspace scopes, so a reference image picked
+# from a UNC share (or a PSD stored next to the artwork) got no preview at all
+# and the edit panel could only show a text line.  These accept any absolute
+# path the user chose in the file browser.  Thumbnails are rendered in memory
+# and kept in a small LRU: writing another pixel copy next to someone else's
+# artwork is exactly what we stopped doing.
 
-async def list_directory(request: web.Request) -> web.Response:
-    scope = request.query.get("scope") or "output"
-    if scope not in SCOPES:
-        scope = "output"
+_LOCAL_THUMB_CACHE: "OrderedDict[Tuple[Any, ...], bytes]" = OrderedDict()
+_LOCAL_THUMB_CACHE_MAX = 32
+_LOCAL_THUMB_LOCK = threading.Lock()
+
+
+def _open_preview_rgba(full: str) -> Optional["Image.Image"]:
+    """RGBA preview source for a plain image, or a composited PSD."""
+    if os.path.splitext(full)[1].lower() == ".psd":
+        canvas = tile_psd.composite_psd(full)
+        if canvas is None:
+            return None
+        return Image.fromarray(np.ascontiguousarray(canvas), "RGBA")
+    with Image.open(full) as im:
+        return im.convert("RGBA")
+
+
+def _render_local_thumb(full: str, size: int) -> bytes:
+    im = _open_preview_rgba(full)
+    if im is None:
+        raise ValueError("无法读取图像")
+    buf = io.BytesIO()
+    _resize_rgba(im, size).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _local_thumb_bytes(full: str, size: int) -> bytes:
     try:
-        path = _resolve(scope, request.query.get("path", ""))
+        st = os.stat(full)
+        stamp = "%d|%d" % (int(st.st_mtime), int(st.st_size))
+    except OSError:
+        stamp = "0|0"
+    key = (full, stamp, size)
+    with _LOCAL_THUMB_LOCK:
+        hit = _LOCAL_THUMB_CACHE.get(key)
+        if hit is not None:
+            _LOCAL_THUMB_CACHE.move_to_end(key)
+            return hit
+    data = _render_local_thumb(full, size)
+    with _LOCAL_THUMB_LOCK:
+        _LOCAL_THUMB_CACHE[key] = data
+        while len(_LOCAL_THUMB_CACHE) > _LOCAL_THUMB_CACHE_MAX:
+            _LOCAL_THUMB_CACHE.popitem(last=False)
+    return data
+
+
+async def local_thumb(request: web.Request) -> web.Response:
+    try:
+        full = _resolve_local(request.query.get("path", ""))
     except web.HTTPException as exc:
         return _json_error(exc.text or "invalid path", exc.status)
-    if not os.path.isdir(path):
-        return _json_error("not a directory: %s" % request.query.get("path", ""), 404)
-
-    dirs: List[Dict[str, Any]] = []
-    files: List[Dict[str, Any]] = []
     try:
-        names = sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
-    except OSError as exc:
-        return _json_error(str(exc), 500)
+        size = int(request.query.get("size", "96"))
+    except ValueError:
+        size = 96
+    size = max(32, min(1024, size))
+    if not os.path.isfile(full):
+        return _json_error("文件不存在", 404)
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(
+            None, _local_thumb_bytes, full, size)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("无法生成缩略图: %s" % exc, 500)
+    return web.Response(body=data, content_type="image/png",
+                        headers={"Cache-Control": "private, max-age=300"})
 
-    for name in names:
-        if name.startswith("."):
-            continue
-        full = os.path.join(path, name)
-        if os.path.isdir(full):
-            dirs.append({"name": name, "rel": _relative(scope, full) or name})
-            continue
-        lower = name.lower()
-        if scope == "input":
-            if not lower.endswith(IMAGE_EXTS):
-                continue
-        elif scope == "workflows":
-            if not lower.endswith(".json"):
-                continue
-        elif not lower.endswith((".json", ".png", ".psd", ".txt")):
-            continue
+
+def _local_info_build(full: str) -> Dict[str, Any]:
+    try:
+        size = int(os.path.getsize(full))
+    except OSError:
+        size = 0
+    width = height = 0
+    # PSD dimensions come from /stlu/psd_layers (needs the layer pass anyway);
+    # reading a 4K PSD just to learn its size would be wasteful.
+    if os.path.splitext(full)[1].lower() != ".psd":
         try:
-            size = os.path.getsize(full)
-        except OSError:
-            size = 0
-        entry = {
-            "name": name,
-            "rel": _relative(scope, full) or name,
-            "abs": full,
-            "size": size,
-            "is_image": lower.endswith(IMAGE_EXTS),
-            "is_json": lower.endswith(".json"),
-            "is_layers": lower.endswith("_layers.json") and not lower.endswith("_psdinfo.json"),
-            "is_workflow": scope == "workflows" and lower.endswith(".json"),
-        }
-        if entry["is_image"]:
-            entry["thumb"] = _thumb_url(full, 64)
-        files.append(entry)
-
-    rel = _relative(scope, path) or ""
-    if rel == ".":
-        rel = ""
-    parent = ""
-    if rel:
-        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
-    return web.json_response({
-        "scope": scope,
-        "root": rel,
-        "path": rel,
-        "parent": parent,
-        "at_root": not rel,
-        "dirs": dirs,
-        "files": files,
-    })
+            with Image.open(full) as im:
+                width, height = im.size
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "name": os.path.basename(full),
+        "path": full,
+        "size": size,
+        "width": int(width),
+        "height": int(height),
+    }
 
 
-# ---------------------------------------------------------------------------
-# /stlu/fs_ls -- browser for the whole machine (PSD source picking)
-# ---------------------------------------------------------------------------
-
-def _drive_roots() -> List[Dict[str, str]]:
-    if os.name != "nt":
-        return [{"name": "/", "rel": "/"}]
-    return [{"name": letter + ":\\", "rel": letter + ":\\"}
-            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            if os.path.isdir(letter + ":\\")]
-
-
-async def fs_list(request: web.Request) -> web.Response:
-    """List drives / folders / files at an absolute path.
-
-    The scope-based ``/stlu/ls`` cannot reach the user's artwork folder, so
-    this endpoint takes a raw absolute path.  It only ever reads names and
-    sizes; nothing is written here.  ``ext=image`` lists editable image types
-    (the PSD crop picker) instead of the default ``.psd``.
-    """
-    raw = (request.query.get("path") or "").strip().strip('"')
-    want_image = (request.query.get("ext") or "").strip().lower() == "image"
-    if not raw:
-        return web.json_response({
-            "path": "", "parent": "", "at_root": True,
-            "dirs": _drive_roots(), "files": [],
-        })
+async def local_info(request: web.Request) -> web.Response:
     try:
-        path = _resolve_local(raw)
+        full = _resolve_local(request.query.get("path", ""))
     except web.HTTPException as exc:
         return _json_error(exc.text or "invalid path", exc.status)
-    if not os.path.isdir(path):
-        return _json_error("not a directory: %s" % raw, 404)
-
-    allowed = IMAGE_EXTS if want_image else (".psd",)
-    dirs: List[Dict[str, str]] = []
-    files: List[Dict[str, Any]] = []
+    if not os.path.isfile(full):
+        return _json_error("文件不存在", 404)
+    loop = asyncio.get_running_loop()
     try:
-        names = sorted(os.listdir(path),
-                       key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
-    except OSError as exc:
-        return _json_error(str(exc), 500)
-
-    for name in names:
-        if name.startswith(".") or name.startswith("$") or name.startswith("~"):
-            continue
-        full = os.path.join(path, name)
-        if os.path.isdir(full):
-            dirs.append({"name": name, "rel": full})
-            continue
-        lower = name.lower()
-        if not lower.endswith(allowed):
-            continue
-        try:
-            size = os.path.getsize(full)
-        except OSError:
-            size = 0
-        files.append({"name": name, "rel": full, "abs": full, "size": size,
-                      "is_psd": lower.endswith(".psd"),
-                      "is_image": lower.endswith(IMAGE_EXTS)})
-
-    parent = os.path.dirname(path.rstrip("\\/"))
-    # ``dirname('C:')`` is ``'C:'`` on Windows: a drive root has no parent
-    # above it, so the picker falls back to the drive list.
-    if not parent or len(parent.rstrip("\\/")) <= 2 or not os.path.isdir(parent):
-        parent = ""
-    return web.json_response({
-        "path": path,
-        "parent": parent,
-        "at_root": False,
-        "dirs": dirs,
-        "files": files,
-    })
+        payload = await loop.run_in_executor(None, _local_info_build, full)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("读取文件信息失败: %s" % exc, 500)
+    return web.json_response(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -708,13 +680,18 @@ def _tile_run_info(manifest: Dict[str, Any], run_dir: str, output_root: str) -> 
         "grid": manifest.get("grid"),
     }
     merged = manifest.get("merged") or {}
+    # The merged PSD can live in <run>/<sub>/<name>/; the run folder still
+    # holds the blocks and the manifest.
+    merged_dir = _merged_dir(run_dir, merged.get("out_dir"))
+    mrel = os.path.relpath(merged_dir, output_root).replace(os.sep, "/")
+    info["out_dir"] = mrel
     if merged.get("file"):
-        merged_path = os.path.join(run_dir, merged["file"])
+        merged_path = os.path.join(merged_dir, merged["file"])
         if os.path.isfile(merged_path):
             merged_layers = merged.get("layers")
             info["merged_psd"] = {
                 "filename": merged["file"],
-                "subfolder": rel,
+                "subfolder": mrel,
                 "canvas": merged.get("canvas"),
                 # Older manifests store the merged layer count, newer ones the
                 # list of layer names; both have to read back.
@@ -724,23 +701,23 @@ def _tile_run_info(manifest: Dict[str, Any], run_dir: str, output_root: str) -> 
                 "size": os.path.getsize(merged_path),
             }
         if merged.get("preview"):
-            preview_path = os.path.join(run_dir, merged["preview"])
+            preview_path = os.path.join(merged_dir, merged["preview"])
             if os.path.isfile(preview_path):
                 info["preview"] = {
                     "filename": merged["preview"],
-                    "subfolder": rel,
+                    "subfolder": mrel,
                     "type": "output",
                     "v": int(os.path.getmtime(preview_path) * 1000),
                 }
     if merged.get("depth"):
-        depth_path = os.path.join(run_dir, merged["depth"])
+        depth_path = os.path.join(merged_dir, merged["depth"])
         if os.path.isfile(depth_path):
-            info["depth"] = {"filename": merged["depth"], "subfolder": rel,
+            info["depth"] = {"filename": merged["depth"], "subfolder": mrel,
                              "v": int(os.path.getmtime(depth_path) * 1000)}
     if merged.get("depth_psd"):
-        depth_psd_path = os.path.join(run_dir, merged["depth_psd"])
+        depth_psd_path = os.path.join(merged_dir, merged["depth_psd"])
         if os.path.isfile(depth_psd_path):
-            info["depth_psd"] = {"filename": merged["depth_psd"], "subfolder": rel,
+            info["depth_psd"] = {"filename": merged["depth_psd"], "subfolder": mrel,
                                  "v": int(os.path.getmtime(depth_psd_path) * 1000)}
     if info["preview"] is None:
         # Newer waves store no aggregate preview: ``preview`` names the richest
@@ -1020,7 +997,8 @@ async def tiles_from_images(request: web.Request) -> web.Response:
             return _json_error("cannot read grid: %s" % exc, 400)
 
     out_dir = str(body.get("out_dir") or "SeeThrough").strip() or "SeeThrough"
-    group = str(body.get("group") or "").strip()
+    # 「分类」已并入子目录：运行/缓存目录只由 out_dir 决定，忽略请求里的 group。
+    group = ""
     name = str(body.get("name") or "tile").strip() or "tile"
     try:
         alpha = int(body.get("alpha_threshold", 8))
@@ -1207,6 +1185,11 @@ async def tiles_merge(request: web.Request) -> web.Response:
 
     name = str(body.get("name") or "merged").strip() or "merged"
     name = os.path.basename(name.replace("\\", "/"))
+    # <run>/<sub_dir>/<name>/<name>.psd -- blocks stay in the run folder, only
+    # the merged PSD (and its preview) drop into the named sub folder.
+    sub_dir = core_plan.safe_sub_dir(str(body.get("sub_dir") or ""))
+    merge_folder = core_plan.safe_name(os.path.splitext(name)[0]) or "merged"
+    out_subdir = "/".join(p for p in (sub_dir, merge_folder) if p)
 
     loop = asyncio.get_running_loop()
     try:
@@ -1222,20 +1205,24 @@ async def tiles_merge(request: web.Request) -> web.Response:
             include_depth=bool(body.get("include_depth", False)),
             include_original=bool(body.get("include_original", False)),
             seam_feather=body.get("seam_feather"),
+            out_subdir=out_subdir,
         ))
     except Exception as exc:  # noqa: BLE001
         return _json_error("merge failed: %s" % exc, 500)
 
     info["dir"] = _relative("output", path)
+    out_rel = (_relative("output", os.path.join(path, *out_subdir.split("/")))
+               if out_subdir else info["dir"])
+    info["out_dir"] = out_rel
     if info.get("preview"):
-        info["preview"] = _tile_view_url(info["dir"], info["preview"])
+        info["preview"] = _tile_view_url(out_rel, info["preview"])
     if info.get("depth"):
-        info["depth"] = _tile_view_url(info["dir"], info["depth"])
+        info["depth"] = _tile_view_url(out_rel, info["depth"])
     if info.get("depth_psd"):
-        info["depth_psd"] = _tile_view_url(info["dir"], info["depth_psd"])
+        info["depth_psd"] = _tile_view_url(out_rel, info["depth_psd"])
     if info.get("original"):
-        info["original"] = _tile_view_url(info["dir"], info["original"])
-    info["psd"] = _tile_view_url(info["dir"], info["file"])
+        info["original"] = _tile_view_url(out_rel, info["original"])
+    info["psd"] = _tile_view_url(out_rel, info["file"])
 
     return web.json_response({"ok": True, **info})
 
@@ -1281,6 +1268,9 @@ async def tiles_merge_mixed(request: web.Request) -> web.Response:
         name += ".psd"
 
     out_dir = entries[0]["dir"]
+    sub_dir = core_plan.safe_sub_dir(str(body.get("sub_dir") or ""))
+    merge_folder = core_plan.safe_name(os.path.splitext(name)[0]) or "merged_mixed"
+    out_subdir = "/".join(p for p in (sub_dir, merge_folder) if p)
     loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(None, lambda: tile_psd.merge_mixed(
@@ -1294,15 +1284,19 @@ async def tiles_merge_mixed(request: web.Request) -> web.Response:
             include_depth=bool(body.get("include_depth", False)),
             include_original=bool(body.get("include_original", False)),
             seam_feather=int(body.get("seam_feather", tile_psd.DEFAULT_SEAM_FEATHER)),
+            out_subdir=out_subdir,
         ))
     except Exception as exc:  # noqa: BLE001
         return _json_error("merge failed: %s" % exc, 500)
 
     info["dir"] = _relative("output", out_dir)
+    out_rel = (_relative("output", os.path.join(out_dir, *out_subdir.split("/")))
+               if out_subdir else info["dir"])
+    info["out_dir"] = out_rel
     for key in ("preview", "depth", "depth_psd", "original"):
         if info.get(key):
-            info[key] = _tile_view_url(info["dir"], info[key])
-    info["psd"] = _tile_view_url(info["dir"], info["file"])
+            info[key] = _tile_view_url(out_rel, info[key])
+    info["psd"] = _tile_view_url(out_rel, info["file"])
     return web.json_response({"ok": True, **info})
 
 
@@ -1592,27 +1586,59 @@ def _layer_tile(layer: Dict[str, Any], raw_name: str, tile_indices: set,
     return hits[0] if len(hits) == 1 else None
 
 
-def _psd_target(path: str) -> Tuple[str, Optional[Dict[str, Any]], str]:
-    """(merged PSD, manifest, run folder) for a PSD file or a run folder."""
-    full = _resolve_any(path)
+def _psd_target(path: str, allow_local: bool = False) -> Tuple[str, Optional[Dict[str, Any]], str]:
+    """(merged PSD, manifest, run folder) for a PSD file or a run folder.
+
+    ``allow_local`` widens the lookup to any absolute path: the edit panel
+    starts from a finished PSD that lives wherever the user keeps it.
+    """
+    full = _resolve_local(path) if allow_local else _resolve_any(path)
     if os.path.isdir(full):
         run_dir = full
         manifest = tile_psd.read_manifest(run_dir)
-        merged = str(((manifest or {}).get("merged") or {}).get("file") or "")
-        candidate = os.path.join(run_dir, merged) if merged else ""
+        merged = (manifest or {}).get("merged") or {}
+        merged_file = str(merged.get("file") or "")
+        # The merged PSD (and its preview) may live in <run>/<sub>/<name>/;
+        # the blocks and the manifest always stay in the run folder.
+        search_dir = _merged_dir(run_dir, merged.get("out_dir"))
+        candidate = os.path.join(search_dir, merged_file) if merged_file else ""
         if not (candidate and os.path.isfile(candidate)):
             names = sorted(
-                name for name in os.listdir(run_dir)
+                name for name in os.listdir(search_dir)
                 if name.lower().endswith(".psd")
                 and not name.lower().endswith("_depth.psd"))
             if not names:
                 raise FileNotFoundError("no PSD in %s" % path)
-            candidate = os.path.join(run_dir, names[0])
+            candidate = os.path.join(search_dir, names[0])
         return candidate, manifest, run_dir
     if not os.path.isfile(full):
         raise FileNotFoundError("not found: %s" % path)
     run_dir = os.path.dirname(full)
-    return full, tile_psd.read_manifest(run_dir), run_dir
+    manifest = tile_psd.read_manifest(run_dir)
+    # A PSD inside the merged sub folder still belongs to the run above it.
+    probe = run_dir
+    for _ in range(4):
+        if manifest is not None:
+            break
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+        manifest = tile_psd.read_manifest(probe)
+        if manifest is not None:
+            run_dir = probe
+            break
+    return full, manifest, run_dir
+
+
+def _merged_dir(run_dir: str, out_subdir: Any) -> str:
+    """<run>/<out_subdir> when it is a safe relative path, else ``run_dir``."""
+    sub = str(out_subdir or "").strip().replace("\\", "/")
+    if sub and not os.path.isabs(sub):
+        segs = [s for s in sub.split("/") if s and s not in (".", "..")]
+        if segs:
+            return os.path.join(run_dir, *segs)
+    return run_dir
 
 
 def _psd_tile_groups(run_dir: str, manifest: Optional[Dict[str, Any]],
@@ -1796,7 +1822,8 @@ def _psd_preview_build(path: str, max_side: int, mode: str) -> Dict[str, Any]:
     # The merge writes a white-backed preview next to its PSD; reuse that file
     # instead of reading the PSD again just to show the whole picture.
     stem = os.path.splitext(os.path.basename(psd_path))[0]
-    own_preview = os.path.join(run_dir, stem + "_preview.png")
+    own_preview = os.path.join(os.path.dirname(psd_path),
+                               stem + "_preview.png")
     if os.path.isfile(own_preview):
         payload["main"] = _image_ref(own_preview)
         payload["main_thumb"] = _thumb_url(own_preview, 640)
@@ -1867,14 +1894,53 @@ async def psd_preview(request: web.Request) -> web.Response:
 # /stlu/psd_layers -- the raw layer names of a finished PSD, for the edit table
 # ---------------------------------------------------------------------------
 
-def _psd_layers_build(path: str) -> Dict[str, Any]:
+def _psd_layer_thumb(psd_path: str, label: str, index: int,
+                     pixels, size: int = 96) -> str:
+    """Cache a small RGBA thumbnail of one PSD layer; return its abs path.
+
+    The layer list previews every part before any run, so the pixels come
+    straight from the reader (no re-open / re-decode per layer).  The file is
+    served by ``/stlu/local_thumb`` from an absolute path.  ``size`` is part
+    of the cache key: the upscale table wants the 96px default while the
+    preview node's grid asks for something bigger.
+    """
+    if pixels is None:
+        return ""
+    try:
+        arr = np.asarray(pixels)
+        if arr.ndim != 3 or arr.shape[0] < 1 or arr.shape[1] < 1:
+            return ""
+        if arr.shape[2] < 4:
+            alpha = np.full(arr.shape[:2] + (1,), 255, np.uint8)
+            arr = np.concatenate([arr[..., :3], alpha], axis=2)
+        cache_dir = os.path.join(_scope_root("output"), THUMB_DIR)
+        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            stamp = int(os.path.getmtime(psd_path))
+        except OSError:
+            stamp = 0
+        key = hashlib.sha1(
+            ("%s|%d|%s|%d|%d" % (psd_path, stamp, label, index, size)).encode(
+                "utf-8", "replace")).hexdigest()
+        cache = os.path.join(cache_dir, "psd_" + key + ".png")
+        if not os.path.isfile(cache):
+            im = Image.fromarray(np.ascontiguousarray(arr[..., :4]).astype(np.uint8), "RGBA")
+            _resize_rgba(im, size).save(cache, format="PNG", compress_level=6)
+            _prune_thumbs(cache_dir)
+        return cache
+    except Exception:  # noqa: BLE001 - a thumbnail must never break the list
+        return ""
+
+
+def _psd_layers_build(path: str, local: bool = False,
+                      thumb_size: int = 96) -> Dict[str, Any]:
     """Layer names the edit planner can target.
 
     Same filter as ``_tile_split``: only real, visible, non-suppressed, named,
     non-empty layers -- exactly the set ``prepare_edit_plan`` can match, so
     the panel's dropdown never offers a name the backend would reject.
     """
-    psd_path, _manifest, _run_dir = _psd_target(path)
+    psd_path, _manifest, _run_dir = _psd_target(path, allow_local=local)
     data = psd_reader.read_psd(psd_path)
     layers = data.get("layers") or []
     suppressed = psd_writer.hidden_record_mask(layers)
@@ -1893,9 +1959,13 @@ def _psd_layers_build(path: str) -> Dict[str, Any]:
             continue
         rows.append({
             "name": label,
+            "index": pos,
             "bounds": [left, top, right, bottom],
+            "size": [right - left, bottom - top],
             "opacity": int(layer.get("opacity", 255) or 255),
             "blend": str(layer.get("blend") or "norm"),
+            "thumb": _psd_layer_thumb(psd_path, label, pos,
+                                      layer.get("pixels"), thumb_size),
         })
     return {
         "file": os.path.basename(psd_path),
@@ -1909,8 +1979,15 @@ async def psd_layers(request: web.Request) -> web.Response:
     if not raw:
         return _json_error("缺少 path", 400)
     loop = asyncio.get_running_loop()
+    local = (request.query.get("local") or "").strip().lower() in ("1", "true", "yes")
     try:
-        payload = await loop.run_in_executor(None, _psd_layers_build, raw)
+        thumb_size = int(request.query.get("thumbs", "96"))
+    except ValueError:
+        thumb_size = 96
+    thumb_size = max(32, min(512, thumb_size))
+    try:
+        payload = await loop.run_in_executor(
+            None, _psd_layers_build, raw, local, thumb_size)
     except web.HTTPException as exc:
         return _json_error(exc.text or "invalid path", exc.status)
     except (OSError, FileNotFoundError) as exc:
@@ -1918,6 +1995,356 @@ async def psd_layers(request: web.Request) -> web.Response:
     except Exception as exc:  # noqa: BLE001
         return _json_error("读取 PSD 图层失败: %s" % exc, 500)
     return web.json_response(payload)
+
+
+
+
+# ---------------------------------------------------------------------------
+# /stlu/psd_state -- which layers already have a usable upscaled PNG on disk
+# ---------------------------------------------------------------------------
+#
+# ① writes psd_plan.json under (out_dir, PSD stem); ③ writes one PNG plus a
+# sidecar fingerprint per layer.  Reopening a saved workflow does not re-run
+# either, so the panel asks this route to replay the same naming and report,
+# per layer, whether the saved PNG still matches the *current* factor /
+# max_side / source PSD.  ``hit`` = will join the merge, ``stale`` = exists
+# but was made for different geometry (falls back to the original layer).
+# Nothing is created or deleted here.
+
+def _psd_state_build(psd: str, out_dir: str, factor: str = "",
+                     max_side: str = "", sub_dir: str = "") -> Dict[str, Any]:
+    raw = str(psd or "").strip().strip('"')
+    result: Dict[str, Any] = {"out_dir": "", "plan": "", "found": False,
+                              "layers": {}, "psd_changed": False,
+                              # Whether the run folder itself is on disk.  The
+                              # panel enables its "open output folder" button
+                              # from this instead of waiting for a run event, so
+                              # reopening a saved workflow shows the truth.
+                              "dir_exists": False}
+    if not raw:
+        return result
+    path = os.path.abspath(os.path.expanduser(raw))
+    out_dir_rel = core_plan.normalize_out_dir(out_dir) or "SeeThrough/PsdUpscale"
+    stem = core_plan.safe_name(os.path.splitext(os.path.basename(path))[0])
+    # Same naming as STLU_PsdUpscalePrepare: <root>/<sub_dir>/<stem>.
+    parts = [p for p in (out_dir_rel, core_plan.safe_sub_dir(sub_dir), stem) if p]
+    run_rel = "/".join(parts)
+    run_abs = os.path.abspath(os.path.join(folder_paths.get_output_directory(),
+                                           run_rel.replace("/", os.sep)))
+    plan_file = psd_upscale.plan_path(run_abs)
+    result.update(out_dir=run_rel, plan=plan_file,
+                  dir_exists=os.path.isdir(run_abs))
+    if not os.path.isfile(plan_file):
+        return result
+    plan = psd_upscale.load_plan(plan_file)
+    try:
+        psd_upscale.retarget(plan,
+                             factor=float(factor) if str(factor).strip() else None,
+                             max_side=int(float(max_side)) if str(max_side).strip() else None)
+    except (TypeError, ValueError):
+        pass
+    stored = plan.get("psd_sig") or {}
+    current = psd_upscale.psd_signature(path)
+    result["psd_changed"] = bool(stored) and any(
+        stored.get(key) != current.get(key) for key in ("path", "mtime", "size"))
+    plan["psd_sig"] = current
+    layers: Dict[str, Any] = {}
+    for layer in plan.get("layers") or []:
+        if layer.get("kind") != "layer":
+            continue
+        name = str(layer.get("name") or "")
+        if not name:
+            continue
+        state = psd_upscale.layer_cache_state(plan, layer)
+        layers[name] = {
+            "status": state["status"],
+            "reused": bool(state["reused"]),
+            "detail": state["detail"],
+            "selected": bool(layer.get("selected")),
+            "target": [int(v) for v in layer.get("target") or [0, 0]],
+        }
+    result.update(found=True, layers=layers, canvas=plan.get("canvas"),
+                  factor=plan.get("factor"), max_side=plan.get("max_side"))
+    return result
+
+
+async def psd_state(request: web.Request) -> web.Response:
+    psd = (request.query.get("psd") or "").strip()
+    out_dir = (request.query.get("out_dir") or "").strip()
+    factor = (request.query.get("factor") or "").strip()
+    max_side = (request.query.get("max_side") or "").strip()
+    sub_dir = (request.query.get("sub_dir") or "").strip()
+    loop = asyncio.get_running_loop()
+    try:
+        payload = await loop.run_in_executor(
+            None, _psd_state_build, psd, out_dir, factor, max_side, sub_dir)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("读取图层缓存状态失败: %s" % exc, 500)
+    return web.json_response(payload)
+
+
+async def psd_clear(request: web.Request) -> web.Response:
+    """Delete a whole run folder on the user's explicit request (panel button).
+
+    Unlike ``tiles/clear`` this removes EVERYTHING under the folder, including
+    files the user dropped there -- the frontend spells that out in its
+    confirm dialog.  Guards: the path must be inside ``output``, at least two
+    segments deep, and not the output root itself.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_error("invalid JSON body", 400)
+    if not isinstance(body, dict):
+        return _json_error("invalid JSON body", 400)
+
+    rel = str(body.get("dir") or "").replace("\\", "/").strip().strip("/")
+    segments = [s for s in rel.split("/") if s]
+    if len(segments) < 2:
+        return _json_error("拒绝删除：需要具体的运行目录（至少两级）", 400)
+    try:
+        path = _resolve("output", rel)
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    root = _scope_root("output")
+    if not _inside(root, path) or path == root:
+        return _json_error("拒绝删除：路径不在输出目录内", 403)
+    if not os.path.isdir(path):
+        return _json_error("directory not found: %s" % rel, 404)
+
+    def _run() -> int:
+        files = 0
+        for _dirpath, _dirnames, filenames in os.walk(path):
+            files += len(filenames)
+        shutil.rmtree(path)
+        return files
+
+    loop = asyncio.get_running_loop()
+    try:
+        removed = await loop.run_in_executor(None, _run)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("clear failed: %s" % exc, 500)
+    return web.json_response({
+        "ok": True,
+        "dir": _relative("output", path) or rel,
+        "removed": int(removed),
+    })
+
+
+# ---------------------------------------------------------------------------
+# /stlu/edit_state -- which edit tasks already have their PNG on disk
+# ---------------------------------------------------------------------------
+#
+# ① builds its run folder from (root, 分类, PSD stem) and writes edit_plan.json
+# there.  Reopening a saved workflow does not re-run ①, so the panel asks this
+# route to mirror the same naming and read that plan: one 已生成 / 未生成 flag
+# per task, good enough to say "this layer will be skipped".
+# Nothing is created here -- a run folder that does not exist yet just reports
+# found=false.
+
+def _edit_state_build(psd: str, out_dir: str, group: str,
+                      sub_dir: str = "", psd_name: str = "") -> Dict[str, Any]:
+    raw = str(psd or "").strip().strip('"')
+    if not raw:
+        return {"out_dir": "", "plan": "", "found": False, "exists": {},
+                "dir_exists": False}
+    out_dir_rel = core_plan.normalize_out_dir(out_dir) or "SeeThrough/PsdEdit"
+    stem = core_plan.safe_name(os.path.splitext(os.path.basename(raw))[0])
+    # ① now names its run folder after the final PSD: <out>[/<group>][/<sub>]/<name>.
+    # Same default as nodes_edit: empty psd_name -> <stem>_edited.
+    name = core_plan.safe_name(str(psd_name or "").strip() or (stem + "_edited"))
+    sub_rel = core_plan.safe_sub_dir(str(sub_dir or ""))
+    parts = [p for p in (out_dir_rel,
+                         core_plan.safe_name(str(group or "").strip())
+                         if str(group or "").strip() else "",
+                         sub_rel, name) if p]
+    run_rel = "/".join(parts)
+    run_abs = os.path.join(folder_paths.get_output_directory(),
+                           run_rel.replace("/", os.sep))
+    plan_path = edit_plan.edit_plan_path(run_abs)
+    dir_exists = os.path.isdir(run_abs)
+    if not os.path.isfile(plan_path):
+        return {"out_dir": run_rel, "plan": "", "found": False, "exists": {},
+                "dir_exists": dir_exists}
+    plan = edit_plan.load_edit_plan(plan_path)
+    pending_ids = {id(layer) for layer in edit_plan.split_pending(
+        edit_plan.edit_layers(plan))[0]}
+    exists: Dict[str, bool] = {}
+    for layer in edit_plan.edit_layers(plan):
+        name = str(layer.get("name") or "")
+        if name:
+            exists[name] = id(layer) not in pending_ids
+    return {"out_dir": run_rel, "plan": plan_path, "found": True, "exists": exists,
+            "dir_exists": dir_exists}
+
+
+async def edit_state(request: web.Request) -> web.Response:
+    psd = (request.query.get("psd") or "").strip()
+    out_dir = (request.query.get("out_dir") or "").strip()
+    group = (request.query.get("group") or "").strip()
+    sub_dir = (request.query.get("sub_dir") or "").strip()
+    psd_name = (request.query.get("psd_name") or "").strip()
+    loop = asyncio.get_running_loop()
+    try:
+        payload = await loop.run_in_executor(
+            None, _edit_state_build, psd, out_dir, group, sub_dir, psd_name)
+    except Exception as exc:  # noqa: BLE001
+        return _json_error("读取编辑状态失败: %s" % exc, 500)
+    return web.json_response(payload)
+
+
+# ---------------------------------------------------------------------------
+# /stlu/locks -- per-tile, per-part locks from the ⑤ preview panel
+# ---------------------------------------------------------------------------
+#
+# A lock lives in ``<run>/locks.json`` and only says "when this tile is written
+# again, copy this layer back from the tile PSD that is already there".  It is
+# stored inside the run folder on purpose: a structural clear (another source
+# image / partition) empties the folder and the locks go with it.
+
+def _preview_tile_layers(run_dir: str, manifest: Optional[Dict[str, Any]],
+                         tile: int, cache: Dict[int, Any]
+                         ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Visible layers of one tile PSD, read at most once per request."""
+    if tile in cache:
+        return cache[tile]
+    prefix = str((manifest or {}).get("prefix") or "tile")
+    tile_path = tile_psd.find_tile_psd(run_dir, prefix, tile)
+    if not tile_path:
+        result = (None, "找不到块 %02d 的 PSD；先在「按块」里确认这一块已经生成"
+                  " / PSD for tile %02d not found; first confirm this tile has"
+                  " been generated in the \"By tile\" view." % (tile, tile))
+    else:
+        try:
+            data = psd_reader.read_psd(tile_path)
+        except Exception as exc:  # noqa: BLE001
+            result = (None, "无法读取 %s：%s"
+                      " / cannot read %s: %s"
+                      % (os.path.basename(tile_path), exc,
+                         os.path.basename(tile_path), exc))
+        else:
+            result = ([layer for layer in data.get("layers") or []
+                       if str(layer.get("kind") or "layer") == "layer"
+                       and not layer.get("hidden")], None)
+    cache[tile] = result
+    return result
+
+
+def _find_tile_layer(layers: List[Dict[str, Any]], name: str,
+                     tile_index: int) -> Optional[Dict[str, Any]]:
+    """The layer a preview thumbnail names, inside that tile's own PSD."""
+    wanted = str(name or "").strip().lower()
+    if not wanted:
+        return None
+    # A per-tile PSD stores plain part names; a merged copy may carry the
+    # tile suffix (face_3).  Both identify the same layer for this tile.
+    candidates = {wanted, "%s_%d" % (wanted, int(tile_index))}
+    for layer in layers:
+        label = str(layer.get("name") or "").strip().lower()
+        if label in candidates:
+            return layer
+    return None
+
+
+def _locks_apply_many(run_dir: str, manifest: Optional[Dict[str, Any]],
+                      items: List[Any]) -> web.Response:
+    """Lock/unlock many layers in one request (row / page buttons).
+
+    Locking checks the layer really exists in that tile's PSD; unlocking is
+    always accepted (the layer may be gone, the lock must not stay behind).
+    Each tile's PSD is parsed once and reused.
+    """
+    cache: Dict[int, Any] = {}
+    accepted: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            failed.append({"tile": None, "name": "", "error": "invalid item"})
+            continue
+        try:
+            tile = int(item.get("tile"))
+        except (TypeError, ValueError):
+            failed.append({"tile": None,
+                           "name": str(item.get("name") or ""),
+                           "error": "tile must be an integer"})
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            failed.append({"tile": tile, "name": "",
+                           "error": "name is required"})
+            continue
+        locked = bool(item.get("locked", True))
+        if locked:
+            layers, error = _preview_tile_layers(
+                run_dir, manifest, tile, cache)
+            if error:
+                failed.append({"tile": tile, "name": name, "error": error})
+                continue
+            if _find_tile_layer(layers or [], name, tile) is None:
+                failed.append({
+                    "tile": tile, "name": name,
+                    "error": ("块 %02d 的 PSD 里没有名为 %s 的图层"
+                              " / the PSD of tile %02d has no layer named %s"
+                              % (tile, name, tile, name))})
+                continue
+        accepted.append({"tile": tile, "name": name, "locked": locked})
+    if accepted:
+        tile_psd.update_locks(run_dir, accepted)
+        for item in accepted:
+            print("[STLU] %s tile %d part %s" % (
+                "locked" if item["locked"] else "unlocked",
+                item["tile"], item["name"]), flush=True)
+    return web.json_response({
+        "ok": True,
+        "dir": _relative("output", run_dir) or "",
+        "tiles": tile_psd.lock_summary(run_dir),
+        "count": sum(len(names) for names in tile_psd.lock_summary(run_dir).values()),
+        "done": len(accepted),
+        "failed": failed,
+    })
+
+
+async def locks_list(request: web.Request) -> web.Response:
+    """GET /stlu/locks?path=<merged PSD or run folder>."""
+    raw = (request.query.get("path") or "").strip()
+    if not raw:
+        return _json_error("缺少 path / path is required", 400)
+    try:
+        _psd_path, _manifest, run_dir = _psd_target(raw)
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    except (OSError, FileNotFoundError) as exc:
+        return _json_error(str(exc), 404)
+    tiles_doc = tile_psd.lock_summary(run_dir)
+    return web.json_response({
+        "ok": True,
+        "dir": _relative("output", run_dir) or "",
+        "tiles": tiles_doc,
+        "count": sum(len(names) for names in tiles_doc.values()),
+    })
+
+
+async def locks_update(request: web.Request) -> web.Response:
+    """POST /stlu/locks {path, items: [{tile, name, locked}]}."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_error("invalid JSON body", 400)
+    if not isinstance(body, dict):
+        return _json_error("invalid JSON body", 400)
+    raw = str(body.get("path") or "").strip()
+    if not raw:
+        return _json_error("缺少 path / path is required", 400)
+    items = body.get("items")
+    if not isinstance(items, list):
+        return _json_error("items must be a list", 400)
+    try:
+        _psd_path, manifest, run_dir = _psd_target(raw)
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    except (OSError, FileNotFoundError) as exc:
+        return _json_error(str(exc), 404)
+    return _locks_apply_many(run_dir, manifest, items)
 
 
 # ---------------------------------------------------------------------------
@@ -2004,19 +2431,117 @@ async def preset_read_file(request: web.Request) -> web.Response:
     })
 
 
+def _browse_rel(path: str) -> str:
+    rel = _relative("output", path)
+    return "" if rel in (None, ".") else rel
+
+
+BROWSE_EXTS = {
+    "psd": (".psd",),
+    "json": (".json",),
+    "image": IMAGE_EXTS,
+}
+
+
+def _browse_roots() -> List[Dict[str, str]]:
+    roots = [{"name": "output", "path": _scope_root("output")}]
+    if os.name == "nt":
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if mask & (1 << i):
+                roots.append({"name": "%s:" % chr(65 + i),
+                              "path": "%s:\\" % chr(65 + i)})
+    else:
+        roots.append({"name": "/", "path": "/"})
+    return roots
+
+
+def _browse_list(path: str, mode: str, exts: Tuple[str, ...]):
+    dirs, files = [], []
+    with os.scandir(path) as it:
+        for entry in it:
+            try:
+                if entry.is_dir():
+                    dirs.append({"name": entry.name, "path": entry.path,
+                                 "rel": _browse_rel(entry.path)})
+                elif mode == "file" and entry.is_file() \
+                        and entry.name.lower().endswith(exts):
+                    files.append({"name": entry.name, "path": entry.path,
+                                  "rel": _browse_rel(entry.path),
+                                  "size": entry.stat().st_size})
+            except OSError:
+                continue
+    dirs.sort(key=lambda d: d["name"].lower())
+    files.sort(key=lambda f: f["name"].lower())
+    return dirs, files
+
+
+async def browse_local(request: web.Request) -> web.Response:
+    """Read-only directory listing for the in-app file/folder browser.
+
+    ComfyUI has no auth, so an endpoint that lists arbitrary paths must never
+    answer anything but the local machine's own browser.
+    """
+    host = (request.remote or "").strip()
+    if host not in ("127.0.0.1", "::1") and not host.startswith("::ffff:127."):
+        return _json_error("只能在运行 ComfyUI 的本机浏览文件", 403)
+    mode = "file" if (request.query.get("mode") or "file") == "file" else "dir"
+    kind = (request.query.get("kind") or "image").strip().lower()
+    raw = (request.query.get("path") or "").strip().strip('"')
+    out_root = _scope_root("output")
+    try:
+        if raw and os.path.isabs(raw):
+            path = os.path.realpath(os.path.expanduser(raw))
+            if mode == "dir" and not _inside(out_root, path):
+                return _json_error("文件夹只能选 output 目录里面的", 400)
+        else:
+            path = _resolve("output", raw)
+    except web.HTTPException as exc:
+        return _json_error(exc.text or "invalid path", exc.status)
+    select = ""
+    if os.path.isfile(path):
+        select = os.path.basename(path)
+        path = os.path.dirname(path)
+    if not os.path.isdir(path):
+        return _json_error("找不到目录：%s" % path, 404)
+    try:
+        dirs, files = await asyncio.wait_for(
+            asyncio.to_thread(_browse_list, path, mode,
+                              BROWSE_EXTS.get(kind, IMAGE_EXTS)), timeout=8)
+    except asyncio.TimeoutError:
+        return _json_error("目录读取超时，网络盘可能太慢", 504)
+    except OSError as exc:
+        return _json_error("无法读取目录：%s" % exc, 400)
+    parent = os.path.dirname(path)
+    if parent == path:  # drive root, UNC share root, filesystem root
+        parent = ""
+    return web.json_response({
+        "path": path, "parent": parent, "select": select,
+        "rel": _browse_rel(path), "roots": _browse_roots(),
+        "dirs": dirs, "files": files,
+    })
+
+
 if _ROUTES is not None:
-    _ROUTES.get("/stlu/ls")(list_directory)
-    _ROUTES.get("/stlu/fs_ls")(fs_list)
+    _ROUTES.get("/stlu/browse")(browse_local)
     _ROUTES.get("/stlu/reveal_local")(reveal_local)
     _ROUTES.get("/stlu/open_local")(open_local)
     _ROUTES.get("/stlu/layers")(list_layers)
     _ROUTES.get("/stlu/thumb")(thumb)
+    _ROUTES.get("/stlu/local_thumb")(local_thumb)
+    _ROUTES.get("/stlu/local_info")(local_info)
     _ROUTES.get("/stlu/preview")(preview_plan)
     _ROUTES.get("/stlu/reveal")(reveal_path)
     _ROUTES.get("/stlu/open")(open_path)
     _ROUTES.get("/stlu/imgsize")(image_size)
     _ROUTES.get("/stlu/psd_preview")(psd_preview)
     _ROUTES.get("/stlu/psd_layers")(psd_layers)
+    _ROUTES.get("/stlu/psd_state")(psd_state)
+    _ROUTES.post("/stlu/psd/clear")(psd_clear)
+    _ROUTES.get("/stlu/edit_state")(edit_state)
+    _ROUTES.get("/stlu/locks")(locks_list)
+    _ROUTES.post("/stlu/locks")(locks_update)
     _ROUTES.get("/stlu/tiles/strips")(tiles_strips)
     _ROUTES.get("/stlu/edit_parts")(edit_parts_catalogue)
     _ROUTES.get("/stlu/tiles/dirs")(tiles_dirs)

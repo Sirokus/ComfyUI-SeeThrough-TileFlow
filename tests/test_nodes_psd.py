@@ -1,7 +1,7 @@
 """CPU-only checks for the PSD-upscale nodes (no model, no GPU).
 
-Runs the five nodes the way ComfyUI would call them, with the output root
-pointed at a temp dir instead of ``output/``:
+Builds the plan the way ``STLU_PsdUpscaleMin`` does, then runs the per-part
+nodes with the output root pointed at a temp dir instead of ``output/``:
 
     python custom_nodes/ComfyUI-SeeThrough-TileFlow/tests/test_nodes_psd.py
 """
@@ -24,6 +24,7 @@ for path in (TESTS_DIR, PKG_DIR, COMFY_ROOT):
 
 import core_io  # noqa: E402
 import nodes_psd  # noqa: E402
+import psd_upscale  # noqa: E402
 import psd_writer  # noqa: E402
 
 _failures = []
@@ -58,19 +59,29 @@ def build_psd(path):
     return path
 
 
+def build_plan(tmp, psd_name, out_dir, ref_path=None):
+    """Run the same prepare sequence as ``STLU_PsdUpscaleMin.execute``."""
+    psd_path = build_psd(os.path.join(tmp, psd_name))
+    run_abs = core_io.out_dir_abs(tmp, out_dir)
+    plan = psd_upscale.prepare_plan(psd_path, run_abs, factor=2.0,
+                                    max_side=4096, select="all")
+    jobs = psd_upscale.write_crops(plan, margin_ratio=0.15)
+    plan["crops"] = jobs
+    if ref_path:
+        psd_upscale.write_references(plan, ref_path)
+    psd_upscale.write_plan(run_abs, plan)
+    return psd_upscale.plan_path(run_abs), plan
+
+
 def test_prepare(tmp):
-    print("[nodes_psd: prepare writes crops, plan and preview]")
-    psd_path = build_psd(os.path.join(tmp, "piece.psd"))
-    plan_json, preview, info = nodes_psd.STLU_PsdPrepare().execute(
-        psd_path, factor=2.0, max_side=4096, select="all",
-        out_dir="PsdUpscaleTest", margin=0.15)
+    print("[nodes_psd: prepare writes crops and plan]")
+    plan_json, plan = build_plan(tmp, "piece.psd", "PsdUpscaleTest")
     check(os.path.isfile(plan_json), "a plan.json path is returned (%s)" % plan_json)
-    check(tuple(preview.shape) == (1, 64, 64, 3),
-          "the preview tensor is a 64 px canvas (%s)" % (tuple(preview.shape),))
-    data = json.loads(info)
-    check(data["canvas"] == [64, 64] and data["count"] == 3,
-          "the info reports the 2x canvas and the layer count (%s)" % data)
-    check(isinstance(data["capped"], str), "the info carries the cap report")
+    check(plan["canvas"] == [64, 64] and plan["count"] == 3,
+          "the plan reports the 2x canvas and the layer count "
+          "(%s / %s)" % (plan["canvas"], plan["count"]))
+    check(isinstance(psd_upscale.capped_report(plan), str),
+          "the plan carries the cap report")
 
     plan = json.loads(open(plan_json, encoding="utf-8").read())
     check(len(plan.get("crops") or []) == 3,
@@ -83,17 +94,16 @@ def test_prepare(tmp):
 
 def test_prepare_reference(tmp):
     print("[nodes_psd: prepare cuts a reference block per layer]")
-    psd_path = build_psd(os.path.join(tmp, "piece_ref.psd"))
     # Same frame as the PSD (32x32), drawn at 4x: 128x128 solid blue.
     ref_path = os.path.join(tmp, "ref4x.png")
     core_io.write_rgba(ref_path, solid(128, 128, (0, 0, 255, 255)))
-    plan_json, _preview, info = nodes_psd.STLU_PsdPrepare().execute(
-        psd_path, factor=2.0, max_side=4096, select="all",
-        out_dir="PsdUpscaleRef", margin=0.15, reference_path=ref_path)
-    data = json.loads(info)
-    ref = data.get("reference") or {}
-    check(ref.get("size") == [128, 128], "the reference size is reported (%s)" % ref)
-    check(ref.get("scale") == [4.0, 4.0], "the axis scale is reported (%s)" % ref)
+    plan_json, _plan = build_plan(tmp, "piece_ref.psd", "PsdUpscaleRef",
+                                  ref_path=ref_path)
+
+    plan = json.loads(open(plan_json, encoding="utf-8").read())
+    ref = plan.get("reference") or {}
+    check(ref.get("size") == [128, 128], "the reference size is recorded (%s)" % ref)
+    check(ref.get("scale") == [4.0, 4.0], "the axis scale is recorded (%s)" % ref)
     check(ref.get("count") == 3, "every crop got a reference block (%s)" % ref.get("count"))
 
     plan = json.loads(open(plan_json, encoding="utf-8").read())
@@ -113,9 +123,7 @@ def test_prepare_reference(tmp):
         check(got == (0, 0, 255, 255),
               "the reference colour survives the white flatten (%s)" % (got,))
     # No reference selected: the plan must not gain ref files.
-    plan_json, _preview, info = nodes_psd.STLU_PsdPrepare().execute(
-        psd_path, factor=2.0, max_side=4096, select="all",
-        out_dir="PsdUpscaleNoRef", margin=0.15)
+    plan_json, _plan = build_plan(tmp, "piece_ref.psd", "PsdUpscaleNoRef")
     plan = json.loads(open(plan_json, encoding="utf-8").read())
     check("reference" not in plan, "a run without a reference records none")
     check(all(not j.get("ref_file") for j in plan["crops"]),
@@ -214,20 +222,6 @@ def test_assemble(plan_json, plan):
           % (report["upscaled"], report["fallback"]))
 
 
-def test_upscale_guard(plan_json):
-    print("[nodes_psd: the batch node refuses to run without dynprompt]")
-    try:
-        nodes_psd.STLU_PsdUpscale().execute(
-            plan_json, model=None, clip=None, vae=None)
-    except RuntimeError as exc:
-        check("dynprompt" in str(exc) or "link" in str(exc),
-              "the error explains the missing wiring (%s)" % exc)
-    except Exception as exc:  # noqa: BLE001 - any clear error is fine here
-        check(True, "a clear error is raised (%s: %s)" % (type(exc).__name__, exc))
-    else:
-        check(False, "the node must not run without hidden inputs")
-
-
 def main():
     with tempfile.TemporaryDirectory(prefix="stlu_nodespsd_") as tmp:
         original = nodes_psd._output_root
@@ -239,7 +233,6 @@ def main():
             test_cut(tmp, plan, job, image, mask)
             test_missing_geometry(image, mask)
             test_assemble(plan_json, plan)
-            test_upscale_guard(plan_json)
         finally:
             nodes_psd._output_root = original
     print()

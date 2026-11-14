@@ -590,62 +590,6 @@ class STLU_Barrier:
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
 
-class STLU_ChromaToAlpha:
-    """Key a flat chroma background out of an edit-model result.
-
-    Qwen-Image-Edit can only return RGB.  The extraction prompt asks for the
-    part on a solid key colour; this node turns that colour into alpha on the
-    CPU, despills the edge, and protects pixels the model left identical to
-    the reference (a green eye must survive a green screen).
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "key_color": (list(edit_parts.KEY_COLORS.keys()),
-                              {"default": "green"}),
-                "tolerance": ("FLOAT", {"default": 12.0, "min": 2.0, "max": 60.0,
-                                        "step": 1.0}),
-                "softness": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 40.0,
-                                       "step": 1.0}),
-            },
-            "optional": {
-                "reference": ("IMAGE",),
-                "protect": ("BOOLEAN", {"default": True}),
-                "despill": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0,
-                                      "step": 0.05}),
-                "alpha_floor": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("rgba", "mask")
-    FUNCTION = "execute"
-    CATEGORY = CATEGORY
-
-    def execute(self, image, key_color, tolerance, softness, reference=None,
-                protect=True, despill=0.65, alpha_floor=8):
-        rgba = core_io.tensor_to_rgba(image)
-        ref = core_io.tensor_to_rgba(reference) if reference is not None else None
-        out = edit_parts.key_out(
-            rgba[..., :3], key_color, float(tolerance), float(softness),
-            reference_rgb=ref[..., :3] if ref is not None else None,
-            protect=bool(protect), despill_strength=float(despill),
-            alpha_floor=int(alpha_floor),
-        )
-        tensor = torch.from_numpy(out.astype(np.float32) / 255.0)[None]
-        # ComfyUI MASK must be a torch tensor ([B,H,W]); a bare ndarray here
-        # reaches STLU_SaveLayer and blows up on ``mask[0].detach()``.
-        mask = torch.from_numpy(
-            (1.0 - out[..., 3].astype(np.float32) / 255.0)[None])
-        return (tensor, mask)
-
-    @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
-        return float("nan")
-
 class STLU_PartsPSD:
     """Assemble the extracted part PNGs into a SeeThrough-compatible PSD.
 
@@ -1420,7 +1364,6 @@ NODE_CLASS_MAPPINGS = {
     "STLU_DetailBatch": STLU_DetailBatch,
     "STLU_Gate": STLU_Gate,
     "STLU_Barrier": STLU_Barrier,
-    "STLU_ChromaToAlpha": STLU_ChromaToAlpha,
     "STLU_PartsPSD": STLU_PartsPSD,
     "STLU_TileGrid": STLU_TileGrid,
     "STLU_SelectTiles": STLU_SelectTiles,
@@ -1439,7 +1382,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "STLU_DetailBatch": "SeeThrough Detail Rebuild (CPU)",
     "STLU_Gate": "SeeThrough Pipeline Gate",
     "STLU_Barrier": "SeeThrough Pipeline Barrier",
-    "STLU_ChromaToAlpha": "Live2D Key Background to Alpha",
     "STLU_PartsPSD": "Live2D Parts to PSD",
     "STLU_TilesPSD": "SeeThrough · 旧版 ③ 图片 → 分格 PSD",
     "STLU_TileSelect": "SeeThrough · 旧版选格",
@@ -1458,7 +1400,6 @@ __all__ = [
     "STLU_DetailBatch",
     "STLU_Gate",
     "STLU_Barrier",
-    "STLU_ChromaToAlpha",
     "STLU_PartsPSD",
     "STLU_TileGrid",
     "STLU_SelectTiles",

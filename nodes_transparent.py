@@ -104,7 +104,7 @@ class STLU_PipelineSettings:
                 strip_max_side=2048, strip_max_resolution=768, strip_margin=32,
                 select_plan="", context_pad=0, custom_regions="[]",
                 head_scope=HEAD_SCOPE_TOP_ROW, tile_tags="{}",
-                depth_random_seed=-1):
+                depth_random_seed=-1, sub_dir=""):
         settings = normalize_settings(
             tile_width=tile_width, tile_height=tile_height, overlap=overlap,
             select=select, resolution=resolution,
@@ -123,7 +123,7 @@ class STLU_PipelineSettings:
             strip_margin=strip_margin, select_plan=select_plan,
             context_pad=context_pad, custom_regions=custom_regions,
             head_scope=head_scope, tile_tags=tile_tags,
-            depth_random_seed=depth_random_seed)
+            depth_random_seed=depth_random_seed, sub_dir=sub_dir)
         return (settings,)
 
 

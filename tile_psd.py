@@ -884,6 +884,250 @@ def read_manifest(run_dir: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Part locks: keep chosen layers of a tile when the tile is regenerated
+# ---------------------------------------------------------------------------
+# ``<run>/locks.json`` = ``{"version": 1, "tiles": {"3": ["eyes", "hair"]}}``.
+# A lock only means "when this tile is written again, put this layer back from
+# the previous tile PSD first".  It is deliberately not a snapshot store: the
+# structural clear (new source image / another partition type) wipes the run
+# folder, takes ``locks.json`` with it, and the locks are gone.
+
+LOCKS_FILE = "locks.json"
+
+
+def locks_path(run_dir: str) -> str:
+    return os.path.join(str(run_dir or ""), LOCKS_FILE)
+
+
+def read_locks(run_dir: str) -> Dict[str, Any]:
+    """The lock document of a run folder; never raises, defaults to empty."""
+    empty: Dict[str, Any] = {"version": 1, "tiles": {}}
+    path = locks_path(run_dir)
+    if not run_dir or not os.path.isfile(path):
+        return empty
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except Exception:  # noqa: BLE001 - an unreadable lock file means "no locks"
+        return empty
+    tiles: Dict[str, List[str]] = {}
+    if isinstance(doc, dict):
+        for raw, names in (doc.get("tiles") or {}).items():
+            try:
+                index = int(raw)
+            except (TypeError, ValueError):
+                continue
+            keep: List[str] = []
+            seen = set()
+            for name in names or []:
+                name = str(name).strip()
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    keep.append(name)
+            if keep:
+                tiles[str(index)] = keep
+    return {"version": 1, "tiles": tiles}
+
+
+def write_locks(run_dir: str, doc: Dict[str, Any]) -> str:
+    os.makedirs(str(run_dir), exist_ok=True)
+    path = locks_path(run_dir)
+    json_io.write_json_atomic(path, {
+        "version": 1,
+        "tiles": dict((doc or {}).get("tiles") or {}),
+    })
+    return path
+
+
+def tile_locks(run_dir: str) -> Dict[int, List[str]]:
+    """``{tile index: [locked layer names]}`` for the writing stages."""
+    out: Dict[int, List[str]] = {}
+    for raw, names in read_locks(run_dir)["tiles"].items():
+        try:
+            out[int(raw)] = list(names)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def lock_summary(run_dir: str) -> Dict[str, List[str]]:
+    """JSON-friendly ``{"3": ["face", "hair"]}`` for the preview panel."""
+    return dict(read_locks(run_dir)["tiles"])
+
+
+def update_locks(run_dir: str, items: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Apply batch ``[{tile, name, locked}]`` changes and persist once.
+
+    Names keep the casing the caller sent; a case-insensitive duplicate
+    replaces the stored spelling instead of being added twice.
+    """
+    doc = read_locks(run_dir)
+    tiles: Dict[str, List[str]] = doc["tiles"]
+    done = 0
+    for item in items or []:
+        try:
+            index = int(item.get("tile"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        key = str(index)
+        names = tiles.get(key) or []
+        low = name.lower()
+        if item.get("locked", True):
+            if any(str(existing).lower() == low for existing in names):
+                names = [name if str(existing).lower() == low else existing
+                         for existing in names]
+            else:
+                names.append(name)
+        else:
+            names = [existing for existing in names if str(existing).lower() != low]
+        if names:
+            tiles[key] = names
+        else:
+            tiles.pop(key, None)
+        done += 1
+    write_locks(run_dir, doc)
+    return {"tiles": lock_summary(run_dir), "done": done}
+
+
+def find_tile_psd(run_dir: str, prefix: str, index: int) -> Optional[str]:
+    """The tile PSD an earlier run left for ``index`` (newest file wins)."""
+    directory = str(run_dir or "")
+    if not directory or not os.path.isdir(directory):
+        return None
+    exact: List[str] = []
+    loose: List[str] = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for name in names:
+        if not name.lower().endswith(".psd"):
+            continue
+        match = TILE_FILE_RE.match(name)
+        if not match:
+            continue
+        try:
+            if int(match.group("index")) != int(index):
+                continue
+        except (TypeError, ValueError):
+            continue
+        path = os.path.join(directory, name)
+        loose.append(path)
+        if str(match.group("prefix") or "").lower() == str(prefix or "").lower():
+            exact.append(path)
+    candidates = exact or loose
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=os.path.getmtime)
+    except OSError:
+        return candidates[0]
+
+
+def _load_part_depth(images_dir: str, name: str) -> Optional[np.ndarray]:
+    """The per-part depth PNG an earlier run saved for ``name`` (if any)."""
+    if not images_dir:
+        return None
+    path = os.path.join(str(images_dir), _safe_stem(name) + "_depth.png")
+    if not os.path.isfile(path):
+        return None
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            return np.array(image.convert("L"), dtype=np.uint8)
+    except Exception:  # noqa: BLE001 - depth is a bonus, never a failure
+        return None
+
+
+def replace_locked_parts(
+    parts: Dict[str, Any],
+    old_psd_path: str,
+    locks: Sequence[str],
+    old_entry: Optional[Dict[str, Any]] = None,
+    images_dir: str = "",
+) -> List[str]:
+    """Swap freshly generated parts for the copies saved in an earlier PSD.
+
+    ``parts["tag2pinfo"]`` is edited in place: every locked tag is removed and
+    the earlier layer with the same name takes its place.  The tile PSD, the
+    per-part PNGs and the depth PNGs are all written from ``tag2pinfo``, so
+    they stay consistent with each other.
+    """
+    wanted = {str(n).strip().lower() for n in (locks or []) if str(n).strip()}
+    if not wanted or not os.path.isfile(old_psd_path):
+        return []
+    try:
+        data = psd_reader.read_psd(old_psd_path)
+    except Exception as exc:  # noqa: BLE001 - a broken old PSD is not fatal
+        print("[STLU] locked parts: cannot read %s: %s" % (old_psd_path, exc), flush=True)
+        return []
+
+    old_layers = []
+    for layer in data.get("layers") or []:
+        if str(layer.get("kind") or "layer") != "layer" or layer.get("hidden"):
+            continue
+        if (int(layer.get("right", 0)) <= int(layer.get("left", 0))
+                or int(layer.get("bottom", 0)) <= int(layer.get("top", 0))):
+            continue
+        old_layers.append(layer)
+
+    depths: Dict[str, float] = {}
+    for entry in (old_entry or {}).get("layers") or []:
+        try:
+            depths[str(entry.get("name") or "").lower()] = float(
+                entry.get("depth_median", 1.0))
+        except (TypeError, ValueError):
+            continue
+
+    tag2pinfo = dict(parts.get("tag2pinfo") or {})
+    parts["tag2pinfo"] = tag2pinfo
+    kept: List[str] = []
+    order_total = max(1, len(old_layers) - 1)
+    seen_locked = set()
+    for order, layer in enumerate(old_layers):
+        name = str(layer.get("name") or "")
+        key = name.lower()
+        if key not in wanted:
+            continue
+        seen_locked.add(key)
+        for tag in [t for t in tag2pinfo if str(t).lower() == key]:
+            tag2pinfo.pop(tag, None)
+        px = layer.get("pixels")
+        if px is None:
+            continue
+        px = np.ascontiguousarray(px)
+        if px.ndim != 3 or px.shape[-1] != 4:
+            continue
+        height, width = int(px.shape[0]), int(px.shape[1])
+        left, top = int(layer.get("left", 0)), int(layer.get("top", 0))
+        depth = depths.get(key)
+        if depth is None:
+            # PSD layers run bottom -> top, which is far -> near.
+            depth = 1.0 - (order / float(order_total))
+        pinfo: Dict[str, Any] = {
+            "img": px,
+            "xyxy": [left, top, left + width, top + height],
+            "depth_median": float(depth),
+        }
+        saved_depth = _load_part_depth(images_dir, name)
+        if saved_depth is not None and saved_depth.shape[:2] == px.shape[:2]:
+            pinfo["depth"] = saved_depth
+        tag2pinfo[name] = pinfo
+        kept.append(name)
+
+    # A locked part the earlier tile did not have still means "keep the old
+    # state": drop the freshly generated copy instead of reviving it.
+    for key in sorted(wanted - seen_locked):
+        for tag in [t for t in tag2pinfo if str(t).lower() == key]:
+            tag2pinfo.pop(tag, None)
+        kept.append(key)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Generation record: the settings that produced the tiles, kept for reference
 # ---------------------------------------------------------------------------
 # Nothing compares it automatically.  The tiles in a folder are always reused
@@ -979,10 +1223,10 @@ def clear_run_outputs(run_dir: str,
     """Delete the files this pipeline wrote into ``run_dir``.
 
     Called only when a result-affecting parameter changed.  Every PSD,
-    ``*_preview.png`` / ``*_depth.png``, the wave documents and ``images/``
-    are removed; unrelated files the user put in the folder are left alone.
-    A ``_locks/`` store left by an older version is removed as well; the lock
-    feature no longer exists.
+    ``*_preview.png`` / ``*_depth.png``, the wave documents, ``images/`` and
+    ``locks.json`` (part locks only survive while their tiles do) are removed;
+    unrelated files the user put in the folder are left alone.  A ``_locks/``
+    store left by an older version is removed as well.
 
     Any file that cannot be removed raises :class:`ClearFailed` instead of
     printing and continuing: a partial reset must never let old tiles look
@@ -1018,6 +1262,23 @@ def clear_run_outputs(run_dir: str,
         for key in ("file", "preview", "depth", "depth_psd"):
             drop(merged.get(key))
 
+    # The merge may have written into a sub folder; remove that whole folder so
+    # a reset never leaves a stale <name>.psd behind for the next run to reuse.
+    merged_sub = str((merged or {}).get("out_dir") or "").strip()
+    if merged_sub:
+        segs = [s for s in merged_sub.replace("\\", "/").split("/")
+                if s and s not in (".", "..")]
+        if segs and not os.path.isabs(merged_sub):
+            sub_path = os.path.join(run_dir, *segs)
+            if os.path.isdir(sub_path):
+                try:
+                    shutil.rmtree(sub_path)
+                    removed.append("/".join(segs) + "/")
+                except OSError as exc:  # noqa: BLE001
+                    failures.append((sub_path, str(exc)))
+                    print("[STLU] cannot remove %s: %s" % (sub_path, exc),
+                          flush=True)
+
     # Sweep the managed naming patterns, so leftovers from older manifests
     # or interrupted runs cannot survive a reset either.
     try:
@@ -1025,7 +1286,8 @@ def clear_run_outputs(run_dir: str,
             low = name.lower()
             if (low.endswith(".psd") or low.endswith("_preview.png")
                     or low.endswith("_depth.png")
-                    or low in ("manifest.json", GENERATION_FILE, "original.png")):
+                    or low in ("manifest.json", GENERATION_FILE, LOCKS_FILE,
+                               "original.png")):
                 drop(name)
     except OSError as exc:
         failures.append((run_dir, "cannot list directory: %s" % exc))
@@ -1041,6 +1303,10 @@ def clear_run_outputs(run_dir: str,
 
     if discard_legacy_locks(run_dir):
         removed.append("_locks/")
+
+    if LOCKS_FILE in removed:
+        print("[STLU] run folder cleared: locks.json discarded (part locks reset)",
+              flush=True)
 
     if failures:
         raise ClearFailed(run_dir, failures)
@@ -2136,6 +2402,7 @@ def merge_tiles(
     include_original: bool = True,
     tile_sources: Optional[Sequence[Dict[str, Any]]] = None,
     seam_feather: int = DEFAULT_SEAM_FEATHER,
+    out_subdir: str = "",
 ) -> Dict[str, Any]:
     """Merge the selected tile PSDs into one full-size layered PSD.
 
@@ -2176,6 +2443,13 @@ def merge_tiles(
     """
     if not out_name.lower().endswith(".psd"):
         out_name += ".psd"
+
+    # Outputs land in ``<run_dir>/<out_subdir>/`` when a sub folder was asked
+    # for; tile sources and the original are still read from ``run_dir``.
+    dest_dir = run_dir
+    if out_subdir:
+        dest_dir = os.path.join(run_dir, *str(out_subdir).replace("\\", "/").split("/"))
+        os.makedirs(dest_dir, exist_ok=True)
 
     tiles = manifest.get("tiles") or []
     wanted = set(int(i) for i in indices) if indices is not None else None
@@ -2489,7 +2763,7 @@ def merge_tiles(
                 depth_name = out_name[:-4] + "_depth.png"
                 Image.fromarray(
                     np.clip(np.rint(dmap * 255.0), 0, 255).astype(np.uint8), "L"
-                ).save(os.path.join(run_dir, depth_name), compress_level=6)
+                ).save(os.path.join(dest_dir, depth_name), compress_level=6)
             except Exception:  # noqa: BLE001
                 depth_name = ""
             ys, xs = np.where(valid)
@@ -2502,7 +2776,7 @@ def merge_tiles(
             depth_psd_name = out_name[:-4] + "_depth.psd"
             try:
                 psd_writer.write_psd(
-                    os.path.join(run_dir, depth_psd_name),
+                    os.path.join(dest_dir, depth_psd_name),
                     [{
                         "name": "depth",
                         "pixels": np.ascontiguousarray(depth_rgba),
@@ -2538,11 +2812,11 @@ def merge_tiles(
     # depth layer here: it has its own PSD file.
     psd_layers = original_layers + colour_layers
 
-    psd_path = os.path.join(run_dir, out_name)
+    psd_path = os.path.join(dest_dir, out_name)
     psd_writer.write_psd(psd_path, psd_layers, canvas_w, canvas_h, "rle")
 
     preview_name = out_name[:-4] + "_preview.png"
-    preview_path = os.path.join(run_dir, preview_name)
+    preview_path = os.path.join(dest_dir, preview_name)
     try:
         from PIL import Image
         preview_layers: List[Dict[str, Any]] = []
@@ -2566,6 +2840,7 @@ def merge_tiles(
 
     return {
         "file": out_name,
+        "out_subdir": str(out_subdir or ""),
         "preview": preview_name,
         "depth": depth_name,
         "depth_psd": depth_psd_name,
@@ -2590,6 +2865,7 @@ def merge_run(
     include_depth: Optional[bool] = None,
     include_original: Optional[bool] = None,
     seam_feather: Optional[int] = None,
+    out_subdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Merge one run folder and record the result in its manifest.
 
@@ -2622,9 +2898,11 @@ def merge_run(
         seam_feather=max(0, int(
             manifest.get("seam_feather", DEFAULT_SEAM_FEATHER)
             if seam_feather is None else seam_feather)),
+        out_subdir=str(out_subdir or ""),
     )
     manifest["merged"] = {
         "file": info.get("file"),
+        "out_dir": str(out_subdir or ""),
         "preview": info.get("preview"),
         "depth": info.get("depth"),
         "depth_psd": info.get("depth_psd"),
@@ -2651,6 +2929,7 @@ def merge_mixed(
     include_depth: bool = True,
     include_original: bool = True,
     seam_feather: int = DEFAULT_SEAM_FEATHER,
+    out_subdir: str = "",
 ) -> Dict[str, Any]:
     """Merge tiles taken from several runs (per-tile source override).
 
@@ -2705,6 +2984,7 @@ def merge_mixed(
         include_original=bool(include_original),
         tile_sources=sources,
         seam_feather=int(seam_feather),
+        out_subdir=str(out_subdir or ""),
     )
     info["mixed"] = True
     info["sources"] = [{

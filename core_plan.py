@@ -104,6 +104,25 @@ def normalize_out_dir(out_dir: str) -> str:
     return "/".join(parts)
 
 
+def safe_sub_dir(sub_dir: str) -> str:
+    """User-entered relative sub folder -> Windows-safe forward-slash path.
+
+    Unlike :func:`normalize_out_dir` this never raises: the value comes from a
+    plain text widget, so each segment is sanitised like a layer name and
+    traversal segments are dropped.  Empty stays empty.
+    """
+    raw = (sub_dir or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    parts = []
+    for part in raw.split("/"):
+        part = part.strip()
+        if not part or part in (".", ".."):
+            continue
+        parts.append(safe_name(part))
+    return "/".join(parts)
+
+
 def auto_out_dir(source_dir: Optional[str], output_root: str) -> str:
     """``<拆层文件夹>/UpScale`` as a path relative to the output root.
 

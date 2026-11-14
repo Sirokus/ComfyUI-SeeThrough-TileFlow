@@ -35,30 +35,6 @@ def body(resp):
 
 
 def main():
-    print("[/stlu/ls]")
-    resp = asyncio.run(routes.list_directory(Req(path="SeeThrough")))
-    data = body(resp)
-    check(resp.status == 200, "status 200")
-    check(data["path"] == "SeeThrough", "path echoed")
-    layers_files = [f for f in data["files"] if f["is_layers"]]
-    found = data
-    if not layers_files:
-        # The source doc may live one folder down (one per character).
-        for sub in data["dirs"]:
-            listing = body(asyncio.run(routes.list_directory(
-                Req(path="SeeThrough/" + sub["name"]))))
-            if any(f["is_layers"] for f in listing.get("files", [])):
-                layers_files = [f for f in listing["files"] if f["is_layers"]]
-                found = listing
-                break
-    check(len(layers_files) >= 1, "layers.json listed")
-    # UpScale sits next to the layers.json, which may be one folder down.
-    check(any(d["name"] == "UpScale" for d in found["dirs"]), "subfolder listed")
-
-    print("[/stlu/ls traversal]")
-    resp = asyncio.run(routes.list_directory(Req(path="../../")))
-    check(resp.status in (400, 403), "traversal rejected (%d)" % resp.status)
-
     print("[/stlu/layers @2048]")
     resp = asyncio.run(routes.list_layers(Req(dir="SeeThrough", canvas="2048")))
     data = body(resp)
@@ -106,19 +82,6 @@ def main():
     print("[/stlu/layers missing]")
     resp = asyncio.run(routes.list_layers(Req(dir="DoesNotExist", canvas="2048")))
     check(resp.status == 404, "missing source reported (%d)" % resp.status)
-
-    print("[/stlu/ls scopes]")
-    resp = asyncio.run(routes.list_directory(Req(scope="input")))
-    data = body(resp)
-    check(resp.status == 200, "input scope status 200")
-    check(all(f["is_image"] for f in data["files"]), "input scope lists only images")
-    check(all(f["thumb"] for f in data["files"]), "input images have thumbnails")
-    resp = asyncio.run(routes.list_directory(Req(scope="workflows")))
-    data = body(resp)
-    check(resp.status == 200, "workflow scope status 200")
-    check(any(d["name"] for d in data["dirs"]) or data["files"], "workflow scope has content")
-    resp = asyncio.run(routes.list_directory(Req(scope="input", path="../../")))
-    check(resp.status in (400, 403), "input traversal rejected (%d)" % resp.status)
 
     print("[/stlu/thumb]")
     layer = body(asyncio.run(routes.list_layers(Req(dir="SeeThrough", canvas="2048"))))["layers"][5]
@@ -180,23 +143,6 @@ def main():
         scope="input", path="../escape.png", overlap="256",
         max_side="2048", max_resolution="768", margin="32")))
     check(resp.status in (400, 403, 404), "strip plan traversal rejected (%d)" % resp.status)
-
-    print("[/stlu/fs_ls]")
-    resp = asyncio.run(routes.fs_list(Req()))
-    data = body(resp)
-    check(resp.status == 200 and data["at_root"] and data["dirs"],
-          "no path lists the drive roots (%d)" % len(data.get("dirs") or []))
-    out_abs = routes._scope_root("output")
-    resp = asyncio.run(routes.fs_list(Req(path=out_abs)))
-    data = body(resp)
-    check(resp.status == 200 and data["path"] == out_abs,
-          "an absolute folder lists (%s)" % data.get("path"))
-    check(all(f["name"].lower().endswith(".psd") for f in data["files"]),
-          "only .psd files are listed")
-    resp = asyncio.run(routes.fs_list(Req(path="SeeThrough")))
-    check(resp.status == 400, "a relative path is rejected (%d)" % resp.status)
-    resp = asyncio.run(routes.fs_list(Req(path=os.path.join(out_abs, "nope.psd"))))
-    check(resp.status == 404, "a missing folder is reported (%d)" % resp.status)
 
     print()
     if _failures:

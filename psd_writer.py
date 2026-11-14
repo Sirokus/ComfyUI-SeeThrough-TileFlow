@@ -29,7 +29,9 @@ BLEND_NORMAL = b"norm"
 # PackBits (PSD "RLE")
 # ---------------------------------------------------------------------------
 
-def packbits_encode(data: bytes) -> bytes:
+def _packbits_py(data: bytes) -> bytes:
+    """Reference PackBits encoder (byte-at-a-time); the fallback when numba is
+    unavailable and the exact spec both fast paths must reproduce."""
     out = bytearray()
     n = len(data)
     i = 0
@@ -61,6 +63,73 @@ def packbits_encode(data: bytes) -> bytes:
             out.append(count - 1)  # literal count - 1 (0..127)
             out.extend(data[start:i])
     return bytes(out)
+
+
+# The RLE encoder dominates PSD-writing time (~30 s per 4K layer channel in pure
+# Python).  JIT the identical algorithm with numba when present: same greedy
+# decisions, so the bytes are unchanged, but ~50x faster.  numba is optional --
+# we fall back to the reference encoder if it is missing or fails to import.
+try:  # noqa: SIM105
+    import numba as _numba
+except Exception:  # noqa: BLE001 - a missing numba must not break the pack
+    _numba = None
+
+
+if _numba is not None:
+
+    # cache=False on purpose: with cache=True numba pickles the module
+    # environment under the bare name ``psd_writer`` and replays
+    # ``importlib.import_module('psd_writer')`` when loading the cache.  Under
+    # ComfyUI this pack is imported as a package
+    # (``ComfyUI-SeeThrough-TileFlow.psd_writer``), so no top-level
+    # ``psd_writer`` exists and the cache load dies with ModuleNotFoundError.
+    # Recompiling once per process (~0.6 s) is the safe trade.
+    @_numba.njit(cache=False)
+    def _packbits_nb(data):  # data: uint8 ndarray
+        n = data.shape[0]
+        # Upper bound: n literal bytes plus one header per 128-byte chunk; the
+        # 64-byte guard absorbs the few boundary literals.
+        out = np.empty(n + n // 128 + 64, np.uint8)
+        o = 0
+        i = 0
+        while i < n:
+            run = 1
+            while i + run < n and data[i + run] == data[i] and run < 128:
+                run += 1
+            if run >= 3:
+                out[o] = (257 - run) & 0xFF
+                o += 1
+                out[o] = data[i]
+                o += 1
+                i += run
+            else:
+                start = i
+                i += run
+                while i < n and (i - start) < 128:
+                    r = 1
+                    while i + r < n and data[i + r] == data[i] and r < 128:
+                        r += 1
+                    if r >= 3:
+                        break
+                    if (i - start) + r > 128:
+                        break
+                    i += r
+                count = i - start
+                out[o] = count - 1
+                o += 1
+                for k in range(start, i):
+                    out[o] = data[k]
+                    o += 1
+        return out[:o]
+
+    def packbits_encode(data: bytes) -> bytes:
+        if not data:
+            return b""
+        return _packbits_nb(np.frombuffer(data, np.uint8)).tobytes()
+
+else:
+
+    packbits_encode = _packbits_py
 
 
 def _rle_rows(channel: np.ndarray) -> tuple[bytes, bytes]:

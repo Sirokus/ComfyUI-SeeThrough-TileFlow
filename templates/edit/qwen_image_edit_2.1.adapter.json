@@ -1,0 +1,31 @@
+{
+  "label": "Qwen Image Edit 2.1",
+  "loaders": {
+    "UNETLoader": "model",
+    "QwenImage21Cache": "model",
+    "CLIPLoader": "clip",
+    "VAELoader": "vae"
+  },
+  "prompt_enhancer": {
+    "class": "TextEncodeQwenImage21",
+    "clip_kind": "pe_clip",
+    "literals": {
+      "prompt": "prompt",
+      "negative_prompt": "negative_prompt",
+      "resolution": "resolution"
+    },
+    "gate": true,
+    "drop_switch_inputs": ["switch_1"]
+  },
+  "seed": {"class": "RandomNoise", "field": "noise_seed"},
+  "cfg": {"class": "CFGGuider", "field": "cfg"},
+  "sampler": {"class": "KSamplerSelect", "field": "sampler_name"},
+  "sigmas": {"class": "ManualSigmas", "field": "sigmas"},
+  "size": {"class": "EmptyLatentImage", "fields": ["width", "height"], "batch_field": "batch_size"},
+  "sampling": {
+    "sigmas": "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0",
+    "cfg": 1.0,
+    "scheduler": "euler",
+    "denoise": 1.0
+  }
+}

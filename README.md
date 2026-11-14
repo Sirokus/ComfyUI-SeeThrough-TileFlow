@@ -58,6 +58,13 @@ nodes under **SeeThrough/LayerUpscale/Legacy**.
 | File | Description |
 |---|---|
 | `workflow/seethrough-tile-flow.json` | The tile pipeline: ① `STLU_PipelineInput` plans, crops and fingerprints the tiles → ② `STLU_GuidedLayers` generates layers block by block with cross-tile guidance → ③ per-tile PSD + manifest → ④ `STLU_TileMerge` merges → ⑤ `STLU_PSDPreview`. Only the checked tiles are (re)run; existing tiles are reused. |
+| `workflow/seethrough-psd-edit.json` | PSD layer edit: ① `STLU_EditPrepare` picks the finished PSD, the layers to redraw and one edit instruction per layer (with optional reference images) → ② `STLU_LayerEdit` clones the Qwen edit graph per task and redraws each layer → ③ `STLU_EditAssemble` rebuilds the layered PSD in the original layer order. |
+| `workflow/seethrough-psd-upscale.json` | Compact PSD layer upscale: ① `STLU_QwenEditLoader` loads the UNET / CLIP / VAE in one node → ② `STLU_PsdUpscalePrepare` picks the PSD, the layers, the scale factor and an optional full-resolution reference → ③ `STLU_PsdUpscaleMin` upscales every layer and rebuilds the PSD. |
+
+The tile flow runs on this package plus the ComfyUI-SeeThrough nodes and their
+LayerDiff / Depth models. The two PSD flows need the Qwen-Image-2.1 stack the
+example loads in its model nodes, and `templates/edit/qwen_image_edit_2.1.json`
+as the edit subgraph.
 
 ## Quick start
 
@@ -74,6 +81,9 @@ nodes under **SeeThrough/LayerUpscale/Legacy**.
    continue automatically.
 4. Results land in `output/<output dir>/`; the ⑤ preview panel shows the full-body
    overview plus per-tile / per-part groupings.
+
+The steps above are the tile flow; each PSD example carries its own usage note
+on the canvas.
 
 ## Pipeline
 
@@ -148,7 +158,7 @@ Outside the main pipeline, the package also provides nodes for other workflows
 - `STLU_RebuildPSD`: rebuild a merged PSD from exported layer images (CPU).
 - Legacy nodes under the Legacy category (`STLU_LoadLayer`,
   `STLU_ContextBackdrop`, `STLU_FocusCrop`, `STLU_PasteBack`,
-  `STLU_DetailBatch`, `STLU_ChromaToAlpha`, `STLU_PartsPSD`, `STLU_TileGrid`, …)
+  `STLU_DetailBatch`, `STLU_PartsPSD`, `STLU_TileGrid`, …)
   remain usable but no longer appear in the new pipeline.
 
 ## Tools

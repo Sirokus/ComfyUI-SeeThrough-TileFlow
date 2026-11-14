@@ -106,6 +106,19 @@ def test_capped(tmp):
           "the report names the capped layers (%s)" % psd_upscale.capped_report(plan))
 
 
+def test_work_cap():
+    print("[psd upscale: the work canvas never exceeds work_max_side]")
+    check(psd_upscale.cap_work_size((3827, 4719), 2048) == (1661, 2048),
+          "the longest side is clamped and the aspect kept (%s)"
+          % (psd_upscale.cap_work_size((3827, 4719), 2048),))
+    check(psd_upscale.cap_work_size((600, 400), 2048) == (600, 400),
+          "a small crop is left alone")
+    check(psd_upscale.cap_work_size((4000, 2000), 0) == (4000, 2000),
+          "0 disables the cap")
+    check(psd_upscale.cap_work_size((2048, 300), 2048) == (2048, 300),
+          "a crop exactly at the limit is kept")
+
+
 def test_selection():
     print("[psd upscale: layer selection syntax]")
     names = ["body", "inner", "outer", "eyes"]
@@ -123,7 +136,7 @@ def test_selection():
 
 
 def test_crops(tmp, plan):
-    print("[psd upscale: crops are white composites that keep the real alpha]")
+    print("[psd upscale: crops are straight RGBA with a colour-extended context]")
     jobs = psd_upscale.write_crops(plan, margin_ratio=0.1)
     check(len(jobs) == 4, "one crop per selected layer (%s)" % len(jobs))
     by_name = {job["name"]: job for job in jobs}
@@ -135,8 +148,10 @@ def test_crops(tmp, plan):
     check(tuple(crop.shape[:2]) == (y1 - y0, x1 - x0), "the crop PNG has the crop size")
     check(crop[..., 3].max() == 255, "the part itself is opaque")
     corner = crop[0, 0]
-    check(tuple(int(v) for v in corner[:3]) == (255, 255, 255) and corner[3] == 0,
-          "the context is white with zero alpha (%s)" % (tuple(int(v) for v in corner),))
+    check(corner[3] == 0, "the context is transparent (%s)" % (tuple(int(v) for v in corner),))
+    check(tuple(int(v) for v in corner[:3]) == (250, 250, 10),
+          "the context colour is the layer's own, not white (%s)"
+          % (tuple(int(v) for v in corner),))
     check(eyes["target"] == [16, 16], "the crop job carries the target size")
     return jobs, by_name
 
@@ -212,17 +227,15 @@ def test_restore():
           % (tuple(int(v) for v in layer[20, 20]),))
     check(layer[0, 0, 3] == 0, "the crop context is transparent again")
 
-    # A half-transparent edge pixel was composited on white; un-mixing gets
-    # the colour back without the white lift.
+    # Straight alpha: a semi-transparent source pixel keeps the model colour
+    # exactly as it came; there is nothing to un-composite.
     alpha[20, 20] = 128
-    a = 128.0 / 255.0
-    edited[20, 20] = tuple(int(round(255.0 * (1.0 - a) + c * a))
-                           for c in (10, 20, 30))
+    edited[20, 20] = (10, 20, 30)
     layer = psd_upscale.restore_layer(edited, alpha, (48, 48), crop_box, box,
                                       size, size)
     got = tuple(int(v) for v in layer[20, 20, :3])
-    check(all(abs(g - e) <= 2 for g, e in zip(got, (10, 20, 30))),
-          "the semi-transparent edge is un-composited (%s)" % (got,))
+    check(got == (10, 20, 30),
+          "the crop colour passes straight through (%s)" % (got,))
     check(layer[20, 20, 3] == 128, "the edge keeps its alpha")
 
     # The layer sits at an offset inside a cropped region.
@@ -241,16 +254,40 @@ def test_sigmas():
     check(psd_upscale.scale_sigmas("junk", 0.45) == "junk", "garbage is returned unchanged")
 
 
+def test_name(plan):
+    print("[psd upscale: the merged PSD name falls back widget -> plan -> stem]")
+    base = dict(plan)
+    base["psd"] = "/somewhere/1024_3_Tiles_edited.psd"
+    base["settings"] = dict(plan.get("settings") or {})
+    base["settings"].pop("psd_name", None)
+    check(psd_upscale.resolve_psd_name(base) == "1024_3_Tiles_edited_upscaled",
+          "the stem plus _upscaled is the last resort")
+
+    with_plan = dict(base, settings={"psd_name": "我的角色"})
+    check(psd_upscale.resolve_psd_name(with_plan) == "我的角色",
+          "①'s psd_name is used when the widget is empty")
+    check(psd_upscale.resolve_psd_name(with_plan, "  ") == "我的角色",
+          "a blank widget still falls through to the plan")
+
+    check(psd_upscale.resolve_psd_name(with_plan, "final") == "final",
+          "the ③ widget wins over the plan")
+    check(psd_upscale.resolve_psd_name(with_plan, "a/b:c") == "a_b_c",
+          "illegal filename characters are sanitised (%s)"
+          % psd_upscale.resolve_psd_name(with_plan, "a/b:c"))
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="stlu_psdup_") as tmp:
         _psd, plan = test_plan(tmp)
         test_capped(tmp)
+        test_work_cap()
         test_selection()
         jobs, _by_name = test_crops(tmp, plan)
         test_assemble(tmp, plan, jobs)
         test_preview(plan)
         test_restore()
         test_sigmas()
+        test_name(plan)
     print()
     if _failures:
         print("FAILED %d check(s):" % len(_failures))

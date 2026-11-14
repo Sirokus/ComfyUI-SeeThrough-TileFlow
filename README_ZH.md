@@ -49,6 +49,12 @@ git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
 | 文件 | 说明 |
 |---|---|
 | `workflow/seethrough-tile-flow.json` | 分块流水线：① `STLU_PipelineInput` 规划、切块、算指纹 → ② `STLU_GuidedLayers` 逐块带跨块引导拆层 → ③ 每块存 PSD 与清单 → ④ `STLU_TileMerge` 合并 → ⑤ `STLU_PSDPreview` 预览。只跑勾选的块，已生成的块自动复用。 |
+| `workflow/seethrough-psd-edit.json` | PSD 图层编辑：① `STLU_EditPrepare` 选成品 PSD、选要重画的图层并给每层写编辑指令（可附参考图）→ ② `STLU_LayerEdit` 按任务克隆 Qwen 编辑图逐层重画 → ③ `STLU_EditAssemble` 按原图层顺序拼回分层 PSD。 |
+| `workflow/seethrough-psd-upscale.json` | PSD 逐层放大（精简版）：① `STLU_QwenEditLoader` 一个节点加载 UNET / CLIP / VAE → ② `STLU_PsdUpscalePrepare` 选 PSD、圈定图层、设置放大倍数与可选的高分辨率参考图 → ③ `STLU_PsdUpscaleMin` 逐层放大并重建 PSD。 |
+
+分块工作流依赖本包 + ComfyUI-SeeThrough 节点及其 LayerDiff / Depth 模型；两个
+PSD 工作流依赖示例里模型节点加载的 Qwen-Image-2.1，以及作为编辑子图的
+`templates/edit/qwen_image_edit_2.1.json`。
 
 ## 快速开始
 
@@ -60,6 +66,8 @@ git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
    - 选择合并选项（合并名、同名图层是否单独成组、是否导出 depth、是否放入原图）。
 3. 按 **Queue**，② 拆层 → ③ 存 PSD / 写清单 → ④ 合并自动接力。
 4. 结果在 `output/<输出目录>/`；⑤ 预览面板给出全身总览，以及按块 / 按部位的分组。
+
+以上步骤是分块工作流；两个 PSD 工作流的用法见各自画布上的说明节点。
 
 ## 流水线
 
@@ -126,7 +134,7 @@ git clone https://github.com/Sirokus/ComfyUI-SeeThrough-TileFlow.git
 - `STLU_RebuildPSD`：从已导出的分层图片重建合并 PSD（CPU）。
 - Legacy 分类下的旧节点（`STLU_LoadLayer`、`STLU_ContextBackdrop`、
   `STLU_FocusCrop`、`STLU_PasteBack`、`STLU_DetailBatch`、
-  `STLU_ChromaToAlpha`、`STLU_PartsPSD`、`STLU_TileGrid` 等）保持可用，
+  `STLU_PartsPSD`、`STLU_TileGrid` 等）保持可用，
   但不再出现在新流水线里。
 
 ## 工具

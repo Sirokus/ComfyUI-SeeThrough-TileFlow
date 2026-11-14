@@ -26,10 +26,7 @@ import edit_expand  # noqa: E402
 import edit_parts  # noqa: E402
 import psd_reader  # noqa: E402
 
-TEMPLATE = os.path.join(
-    COMFY_ROOT, "user", "default", "workflows", "Comfy-My-Workflow", "图片",
-    "Live2D拆层", edit_parts.TEMPLATE_NAME,
-)
+TEMPLATE = edit_parts.default_template_path()
 
 
 def _ok(cond, msg):
@@ -83,61 +80,15 @@ def test_catalogue_rows():
 
 
 def test_prompt():
-    prompt = edit_parts.build_prompt("irides-l", "magenta")
+    prompt = edit_parts.build_prompt("irides-l")
     _ok("left eye" in prompt, "part description missing")
-    _ok("#FF00FF" in prompt, "key colour missing")
     _ok("<image1>" in prompt, "image reference missing")
-    _ok("magenta" in prompt, "key name missing")
+    _ok("real alpha channel" in prompt and "transparent" in prompt,
+        "prompt must ask for a native alpha channel")
+    _ok("solid colour" in prompt, "prompt must forbid a painted backdrop")
+    _ok("#FF00FF" not in prompt and "green" not in prompt.lower(),
+        "no key colour may leak into the prompt")
     print("prompt ok")
-
-
-# ---------------------------------------------------------------------------
-# chroma key
-# ---------------------------------------------------------------------------
-
-def test_chroma_basic():
-    h = w = 64
-    img = np.zeros((h, w, 3), np.uint8)
-    img[:, :] = (0, 255, 0)
-    img[16:48, 16:48] = (200, 40, 40)
-
-    rgba = edit_parts.key_out(img, "green")
-    _ok(rgba[0, 0, 3] == 0, "background must be transparent")
-    _ok(rgba[32, 32, 3] == 255, "part must be opaque")
-    _ok(abs(int(rgba[32, 32, 0]) - 200) <= 4, "part colour must survive")
-
-    # Shaded key background (dark green) is still keyed out.
-    shaded = img.copy()
-    shaded[0:8, :] = (0, 150, 0)
-    a = edit_parts.key_out(shaded, "green")[..., 3]
-    _ok(a[2, 2] == 0, "shaded background must be transparent")
-
-    coverage = edit_parts.coverage(rgba)
-    _ok(0.2 < coverage < 0.4, "coverage wrong: %.3f" % coverage)
-    print("chroma ok")
-
-
-def test_chroma_protect():
-    """A green part present in the reference must survive a green screen."""
-    h = w = 48
-    img = np.zeros((h, w, 3), np.uint8)
-    img[:, :] = (0, 255, 0)
-    # Nearly the same hue as the screen -- only the reference tells us it is
-    # really part of the character.
-    green_part = (0, 255, 10)
-    img[12:36, 12:36] = green_part
-
-    ref = np.zeros((h, w, 3), np.uint8)
-    ref[:, :] = (250, 250, 250)          # original background is white
-    ref[12:36, 12:36] = green_part       # original part is green
-
-    plain = edit_parts.key_out(img, "green", protect=False)
-    _ok(plain[24, 24, 3] == 0, "without protect the green part is eaten")
-
-    protected = edit_parts.key_out(img, "green", reference_rgb=ref, protect=True)
-    _ok(protected[24, 24, 3] == 255, "protection failed for a green part")
-    _ok(protected[2, 2, 3] == 0, "protection must not keep the background")
-    print("protect ok")
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +158,8 @@ def test_layers_and_psd():
 def test_expand():
     _ok(os.path.isfile(TEMPLATE), "template missing: %s" % TEMPLATE)
     parts = [
-        {"name": "face", "prompt": edit_parts.build_prompt("face", "green")},
-        {"name": "front hair", "prompt": edit_parts.build_prompt("front hair", "green")},
+        {"name": "face", "prompt": edit_parts.build_prompt("face")},
+        {"name": "front hair", "prompt": edit_parts.build_prompt("front hair")},
     ]
     external = {
         "reference": ["10", 0],
@@ -224,23 +175,26 @@ def test_expand():
         out_dir_rel="SeeThrough/_test_edit",
         layers_json_path=os.path.join(COMFY_ROOT, "output", "_test_layers.json"),
         psd_name="test",
-        key="green", tolerance=12.0, softness=6.0, protect=True, despill=0.65,
         negative_prompt="", cfg=1.0, resolution=0, scheduler="euler",
         sigmas="1.0, 0.5, 0", width=512, height=512,
     )
 
     classes = [n["class_type"] for n in expand.values()]
-    for cls in ("STLU_ChromaToAlpha", "STLU_SaveLayer", "STLU_PartsPSD",
+    for cls in ("STLU_SaveLayer", "STLU_PartsPSD",
                 "STLU_Gate", "STLU_Barrier", "TextEncodeQwenImage21",
-                "SamplerCustomAdvanced"):
+                "SamplerCustomAdvanced", "ImageToMask", "InvertMask"):
         _ok(cls in classes, "expansion lost %s" % cls)
     for banned in ("TextGenerate", "BatchImagesNode", "PreviewAny",
-                   "UNETLoader", "CLIPLoader", "VAELoader"):
+                   "UNETLoader", "CLIPLoader", "VAELoader",
+                   "STLU_ChromaToAlpha", "STLU_KeyCut"):
         _ok(banned not in classes, "expansion must drop %s" % banned)
 
-    _ok(classes.count("STLU_ChromaToAlpha") == 2, "one key per part")
     _ok(classes.count("STLU_SaveLayer") == 2, "one save per part")
     _ok(classes.count("STLU_PartsPSD") == 1, "one PSD at the end")
+    _ok(all(n["inputs"].get("keep_input_alpha") is True
+            for n in expand.values()
+            if n["class_type"] == "STLU_SaveLayer"),
+        "the layer keeps the model's own alpha")
 
     encoders = [n for n in expand.values()
                 if n["class_type"] == "TextEncodeQwenImage21"]
@@ -299,10 +253,16 @@ def test_expand_crop_reference():
         workflow_path=TEMPLATE, parts=parts, external=external, seed=7,
         out_dir_rel="SeeThrough/_test_crop", layers_json_path="",
         psd_name="", psd_plan="plan.json", crop_mode=True,
-        key="green", tolerance=12.0, softness=6.0, protect=True, despill=0.65,
         negative_prompt="", cfg=1.0, resolution=0, scheduler="euler",
         sigmas="1.0, 0.5, 0", width=0, height=0,
     )
+
+    classes = [n["class_type"] for n in expand.values()]
+    _ok(classes.count("STLU_CutToLayer") == 2, "one cut per crop part")
+    _ok("STLU_AlphaCut" not in classes,
+        "the model's own alpha is used, no post cut")
+    _ok("STLU_ChromaToAlpha" not in classes and "STLU_KeyCut" not in classes,
+        "crop mode must not key anything")
 
     loads = [n for n in expand.values() if n["class_type"] == "STLU_LoadCrop"]
     _ok(len(loads) == 3, "two crops + one reference expected, got %d" % len(loads))
@@ -334,8 +294,6 @@ if __name__ == "__main__":
     test_catalogue_rows()
     test_select()
     test_prompt()
-    test_chroma_basic()
-    test_chroma_protect()
     test_layers_and_psd()
     test_expand()
     test_expand_crop_reference()

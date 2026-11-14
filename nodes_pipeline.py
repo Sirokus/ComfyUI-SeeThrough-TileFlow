@@ -218,7 +218,7 @@ class STLU_PipelineInput:
                                        "tooltip": "相对 output/ 的输出根目录，结果直接写进这个文件夹（不再每次新建波次子目录）。"
                                                   "同一个文件夹里已经生成的块会被复用：只勾选几块重跑，未勾选的块仍会参与引导和合并。"}),
                 "group": ("STRING", {"default": "",
-                                     "tooltip": "可选的二级分类目录，结果写到 <根目录>/<分类>/。"}),
+                                     "tooltip": "已废弃（分类已并入子目录，恒为空）；保留仅为兼容旧工作流。"}),
                 "filename_prefix": ("STRING", {"default": "tile",
                                                "tooltip": "每块 PSD 的文件名前缀，例如 tile_00_r0_c0.psd。"}),
                 "merge_name": ("STRING", {"default": "merged",
@@ -314,6 +314,13 @@ class STLU_PipelineInput:
                     "max": stlu_limits.SEED_MAX,
                     "tooltip": "深度随机种子。深度是在拆层结果上估的，换种子只影响"
                                "遮挡/前后关系，不影响拆出的部件；-1 = 跟随拆层种子。"}),
+                # Appended LAST for the same reason.  Relative to out_dir; the
+                # blocks cache directly in out_dir, only the final merged PSD
+                # goes to out_dir/sub_dir/<merge_name>/.
+                "sub_dir": ("STRING", {"default": "",
+                    "tooltip": "最终 PSD 的子目录（可空）：合并结果写到 "
+                               "<输出目录>/<子目录>/<合并名>/<合并名>.psd。"
+                               "分块缓存仍在 <输出目录>/。"}),
             },
         }
 
@@ -641,7 +648,8 @@ class STLU_RebuildPSD:
                 "out_dir": ("STRING", {"default": "SeeThrough"}),
             },
             "optional": {
-                "group": ("STRING", {"default": ""}),
+                "group": ("STRING", {"default": "",
+                                     "tooltip": "已废弃（忽略）；运行目录只由 out_dir 决定。"}),
                 "filename_prefix": ("STRING", {"default": "tile"}),
                 "tiles": ("STRING", {"default": "",
                                      "tooltip": "只重建这些块，如 0-2,5；留空 = 来源里的全部块"}),
@@ -664,7 +672,8 @@ class STLU_RebuildPSD:
         if not os.path.exists(source_path):
             raise FileNotFoundError("image source not found: %s" % source_path)
 
-        group_name = str(group or "").strip()
+        # 「分类」已并入子目录：运行/缓存目录只由 out_dir 决定，group 恒空。
+        group_name = ""
         wave_dir = tile_psd.flat_directory(_output_root(), out_dir, group_name)
         wave = os.path.basename(wave_dir.rstrip("/\\")) or "run"
         stamp = "%s_%s" % (datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),

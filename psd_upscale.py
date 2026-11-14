@@ -8,8 +8,8 @@ opacity).  This module does everything that does not need a model:
 * ``prepare_plan``  write every layer out as its own PNG, compute each
                     layer's upscale size (global factor, per-layer pixel cap)
                     and store the whole thing as ``psd_plan.json``;
-* ``write_crops``   white-composited crops (plus the original alpha) that the
-                    edit model will see;
+* ``write_crops``   straight-RGBA crops (transparent, colour-extended) that
+                    the edit model will see;
 * ``assemble_psd``  put the saved layer PNGs back on an upscaled canvas,
                     keeping folder markers / blend / opacity / hidden flags;
 * ``preview_rgba``  a small merged preview for the node's output image.
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -44,6 +45,11 @@ PREVIEW_NAME = "preview.png"
 
 DEFAULT_FACTOR = 2.0
 DEFAULT_MAX_SIDE = 4096
+# The canvas the edit model *samples* on.  It is independent of the layer's
+# target size: a 4K layer still gets edited on a 2K canvas and is resampled
+# back by restore_crop.  Without this the biggest layer would be denoised at
+# 18 MP, which is 4x the model's native 2K resolution and 10x slower.
+DEFAULT_WORK_MAX_SIDE = 2048
 # Context around a part that the edit model gets to see.  It keeps a limb from
 # being cut at its silhouette, which is what makes the model invent a new edge.
 DEFAULT_MARGIN_RATIO = 0.08
@@ -174,6 +180,155 @@ def plan_layer_paths(out_dir_abs: str, stem: str) -> Dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# per-layer cache: upscaled/<stem>.json beside every generated layer PNG
+# ---------------------------------------------------------------------------
+#
+# A layer PNG from an earlier run is reused in the final merge when its
+# *geometry* still matches: same target size, same source box, same PSD file
+# (path/mtime/size) and the same factor / max_side / canvas.  Sampling knobs
+# (denoise, seed, prompt, work_max_side) are deliberately NOT part of the
+# fingerprint -- "the part I already ran" stays usable when only those change.
+# A failed check is not a deletion: the PNG stays on disk, the merge just falls
+# back to the original layer until that layer is selected again.
+
+CACHE_VERSION = 1
+
+
+def psd_signature(psd_path: str) -> Dict[str, Any]:
+    """``{path, mtime, size}`` -- changes whenever the source PSD is rewritten."""
+    path = os.path.abspath(psd_path)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {"path": path}
+    return {"path": path, "mtime": round(float(st.st_mtime), 3),
+            "size": int(st.st_size)}
+
+
+def layer_cache_path(out_file: str) -> str:
+    return os.path.splitext(os.path.abspath(out_file))[0] + ".json"
+
+
+def _png_size(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        with Image.open(path) as im:
+            return (int(im.width), int(im.height))
+    except Exception:  # noqa: BLE001 - truncated PNG counts as missing
+        return None
+
+
+def write_layer_cache(plan: Dict[str, Any], layer: Dict[str, Any]) -> str:
+    """Record the geometry a layer PNG was generated for (called by ③)."""
+    doc = {
+        "version": CACHE_VERSION,
+        "stem": layer.get("stem"),
+        "name": layer.get("name"),
+        "target": [int(v) for v in layer["target"]],
+        "size": [int(v) for v in layer["size"]],
+        "box": [int(v) for v in layer["box"]],
+        "factor": round(float(plan.get("factor") or 0), 6),
+        "max_side": int(plan.get("max_side") or 0),
+        "canvas": [int(v) for v in plan.get("canvas") or [0, 0]],
+        "psd": plan.get("psd_sig") or {},
+        "time": time.time(),
+    }
+    path = layer_cache_path(str(layer["out_file"]))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+    return path
+
+
+def record_layer_cache(plan_ref: Any, out_file: str) -> Optional[str]:
+    """Write the sidecar for whichever plan layer owns ``out_file``.
+
+    Called right after a layer PNG is written.  Never raises -- a missing or
+    unreadable plan only means the next run sees "旧版本生成" instead of a
+    verified hit, which still reuses the PNG by dimension check.
+    """
+    try:
+        plan = load_plan(plan_ref) if plan_ref else {}
+    except Exception:  # noqa: BLE001
+        plan = {}
+    target_path = os.path.abspath(str(out_file))
+    for item in plan.get("layers") or []:
+        if os.path.abspath(str(item.get("out_file") or "")) == target_path:
+            try:
+                return write_layer_cache(plan, item)
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
+def _cache_matches(doc: Dict[str, Any], plan: Dict[str, Any],
+                   layer: Dict[str, Any]) -> bool:
+    if int(doc.get("version") or 0) != CACHE_VERSION:
+        return False
+    if [int(v) for v in doc.get("target") or []] != [int(v) for v in layer["target"]]:
+        return False
+    if [int(v) for v in doc.get("size") or []] != [int(v) for v in layer["size"]]:
+        return False
+    if [int(v) for v in doc.get("box") or []] != [int(v) for v in layer["box"]]:
+        return False
+    if round(float(doc.get("factor") or 0), 6) != round(float(plan.get("factor") or 0), 6):
+        return False
+    if int(doc.get("max_side") or 0) != int(plan.get("max_side") or 0):
+        return False
+    if [int(v) for v in doc.get("canvas") or []] != [int(v) for v in plan.get("canvas") or []]:
+        return False
+    current = plan.get("psd_sig") or {}
+    stored = doc.get("psd") or {}
+    for key in ("path", "mtime", "size"):
+        if key in current and key in stored and current[key] != stored[key]:
+            return False
+    return True
+
+
+def layer_cache_state(plan: Dict[str, Any], layer: Dict[str, Any]) -> Dict[str, Any]:
+    """Can this layer's saved PNG join the merge as-is?
+
+    Returns ``{ok, status, reused, detail}`` with status one of
+    ``hit`` / ``stale`` (file exists but geometry/PSD changed) / ``missing``.
+    ``reused`` is True when the PNG was generated by an *earlier* run
+    (file mtime before the plan's ``prepared_at``).
+    """
+    result: Dict[str, Any] = {"ok": False, "status": "missing",
+                              "reused": False, "detail": ""}
+    out_file = str(layer.get("out_file") or "")
+    if not out_file or not os.path.isfile(out_file):
+        return result
+    target = [int(v) for v in (layer.get("target") or [0, 0])]
+    size = _png_size(out_file)
+    if size is None:
+        result.update(status="stale", detail="文件损坏")
+        return result
+    if list(size) != target:
+        result.update(status="stale", detail="尺寸已变")
+        return result
+    doc: Dict[str, Any] = {}
+    side = layer_cache_path(out_file)
+    try:
+        with open(side, "r", encoding="utf-8") as f:
+            doc = json.load(f) or {}
+    except (OSError, ValueError):
+        doc = {}
+    if doc and not _cache_matches(doc, plan, layer):
+        result.update(status="stale", detail="参数或 PSD 已变")
+        return result
+    prepared = float(plan.get("prepared_at") or 0)
+    try:
+        written = float(os.stat(out_file).st_mtime)
+    except OSError:
+        written = 0.0
+    result.update(ok=True, status="hit",
+                  reused=bool(prepared and written and written < prepared),
+                  detail="" if doc else "旧版本生成")
+    return result
+
+
 def _targets(width: int, height: int, factor: float, max_side: int) -> Tuple[Tuple[int, int], float, bool]:
     """Per-layer upscale size: global factor, clamped by ``max_side``."""
     factor = max(0.1, float(factor))
@@ -255,11 +410,57 @@ def prepare_plan(
         "factor": float(factor),
         "max_side": int(max_side),
         "select": str(select or "all"),
+        "psd_sig": psd_signature(psd_path),
+        "prepared_at": time.time(),
         "layers": layers,
         "count": len([L for L in layers if L.get("selected")]),
     }
     write_plan(out_dir_abs, plan)
     return plan
+
+
+def retarget(plan: Dict[str, Any], factor: Optional[float] = None,
+             max_side: Optional[int] = None) -> Dict[str, Any]:
+    """Re-derive canvas and every layer's target for a new factor / max_side.
+
+    The web panel calls this against an on-disk plan to answer "would a cached
+    PNG still fit the current widgets?" without re-scanning the PSD.
+    """
+    factor = float(plan.get("factor") if factor is None else factor)
+    max_side = int(plan.get("max_side") if max_side is None else max_side)
+    src = plan.get("source") or {}
+    width = max(1, int(src.get("width") or 1))
+    height = max(1, int(src.get("height") or 1))
+    plan["factor"] = factor
+    plan["max_side"] = max_side
+    plan["canvas"] = [max(1, int(round(width * max(0.1, factor)))),
+                      max(1, int(round(height * max(0.1, factor))))]
+    for layer in plan.get("layers") or []:
+        if layer.get("kind") != LAYER or "size" not in layer:
+            continue
+        target, scale, capped = _targets(int(layer["size"][0]), int(layer["size"][1]),
+                                         factor, max_side)
+        layer["target"] = [int(target[0]), int(target[1])]
+        layer["scale"] = round(float(scale), 6)
+        layer["capped"] = bool(capped)
+    return plan
+
+
+def resolve_psd_name(plan: Dict[str, Any], psd_filename: str = "") -> str:
+    """Final merged-PSD name: node widget -> ①'s psd_name -> <stem>_upscaled.
+
+    ③'s expanded tail and the standalone assembler both use this so the
+    subgraph's PSD name and the copied-back file can never disagree.
+    """
+    raw = str(psd_filename or "").strip()
+    if not raw:
+        raw = str((plan.get("settings") or {}).get("psd_name") or "").strip()
+    name = core_plan.safe_name(raw) if raw else ""
+    if not name:
+        stem = core_plan.safe_name(
+            os.path.splitext(os.path.basename(plan.get("psd") or "psd"))[0])
+        name = "%s_upscaled" % stem
+    return name
 
 
 def plan_path(out_dir_abs: str) -> str:
@@ -326,10 +527,12 @@ def write_crops(
     plan: Dict[str, Any],
     margin_ratio: float = DEFAULT_MARGIN_RATIO,
 ) -> List[Dict[str, Any]]:
-    """White-composited crop PNG per selected layer; returns crop jobs.
+    """One crop PNG per selected layer; returns crop jobs.
 
-    The PNG keeps the source alpha inside the crop, so the tail of the edit
-    chain can restore the exact silhouette after the model returns.
+    The crop is written as straight RGBA exactly as the layer stores it (alpha
+    included, RGB untouched): the Qwen 2.1 VAE is a transparent VAE, so the
+    model reads the real alpha instead of an opaque card, and the alpha it
+    decodes is the silhouette the tail writes back.
     """
     width = int(plan["source"]["width"])
     height = int(plan["source"]["height"])
@@ -342,14 +545,9 @@ def write_crops(
         crop_w, crop_h = x1 - x0, y1 - y0
 
         crop = np.zeros((crop_h, crop_w, 4), np.uint8)
-        crop[..., :3] = 255
         left, top = int(layer["box"][0]), int(layer["box"][1])
         px, py = left - x0, top - y0
-        alpha = pixels[..., 3:4].astype(np.float32) / 255.0
-        colour = (pixels[..., :3].astype(np.float32) * alpha +
-                  255.0 * (1.0 - alpha))
-        crop[py:py + h, px:px + w, :3] = np.clip(np.rint(colour), 0, 255).astype(np.uint8)
-        crop[py:py + h, px:px + w, 3] = pixels[..., 3]
+        crop[py:py + h, px:px + w] = pixels
         core_io.write_rgba(layer["crop_file"], crop)
         jobs.append({
             "name": layer["name"],
@@ -430,6 +628,36 @@ def work_size(crop_size: Sequence[int], size: Sequence[int],
             max(1, int(round(ch * th / float(h)))))
 
 
+def cap_work_size(size: Sequence[int], max_side: int) -> Tuple[int, int]:
+    """Shrink a work size so its longest side is at most ``max_side``.
+
+    ``max_side <= 0`` means "no cap" and returns the size unchanged.
+    """
+    w = max(1, int(size[0]))
+    h = max(1, int(size[1]))
+    limit = int(max_side or 0)
+    longest = max(w, h)
+    if limit <= 0 or longest <= limit:
+        return (w, h)
+    scale = limit / float(longest)
+    return (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+
+
+def input_work_size(crop_size: Sequence[int], size: Sequence[int],
+                    factor: float, work_max_side: int) -> Tuple[int, int]:
+    """The canvas the edit model actually samples on.
+
+    Derived from the *natural* scale (``factor``), not the clamped ``target``:
+    the output side cap (``max_side``) must not change how big a part enters
+    the model.  ``work_max_side`` is the only knob that shrinks the input.
+    """
+    factor = float(factor or 1.0)
+    natural = (max(1, int(round(int(size[0]) * factor))),
+               max(1, int(round(int(size[1]) * factor))))
+    work = work_size(crop_size, size, natural)
+    return cap_work_size(work, int(work_max_side or 0))
+
+
 def restore_layer(
     edited: np.ndarray,
     alpha: np.ndarray,
@@ -443,8 +671,8 @@ def restore_layer(
 
     ``edited`` is the model's crop result (RGB or RGBA), ``alpha`` the source
     crop's alpha at ``crop_size``.  The crop is resampled to the layer's
-    upscaled scale, clipped by the real silhouette and the white context is
-    un-composited, so the layer keeps straight alpha without a white halo.
+    upscaled scale and clipped by the real silhouette.  The crop is straight
+    RGBA, so its colours are the layer's own: nothing is un-composited here.
 
     When ``alpha`` already has the target size it is used as-is: it is then
     the layer's own silhouette resampled once, instead of the crop alpha
@@ -484,14 +712,10 @@ def restore_layer(
         a = a_up[dy:dy + (cy1 - cy0), dx:dx + (cx1 - cx0)] / 255.0
     else:
         a = a_up[cy0:cy1, cx0:cx1] / 255.0
-    # Undo the white compositing the crop went through: rgb = white*(1-a) +
-    # layer*a, so layer = (rgb - white*(1-a)) / a.
-    vis = a > 1e-3
-    unmixed = np.zeros_like(src)
-    unmixed[vis] = ((src[vis] - 255.0 * (1.0 - a[vis][:, None]))
-                    / a[vis][:, None])
+    # The crop already went straight through the model: its colours are the
+    # layer's own, so only the silhouette has to be restored.
     out[dy:dy + (cy1 - cy0), dx:dx + (cx1 - cx0), :3] = np.clip(
-        np.rint(unmixed), 0, 255).astype(np.uint8)
+        np.rint(src), 0, 255).astype(np.uint8)
     out[dy:dy + (cy1 - cy0), dx:dx + (cx1 - cx0), 3] = np.clip(
         np.rint(a * 255.0), 0, 255).astype(np.uint8)
     return out
@@ -523,6 +747,8 @@ def assemble_psd(plan: Dict[str, Any], out_psd: str, compression: str = "rle") -
 
     records: List[Dict[str, Any]] = []
     used: List[str] = []
+    cached: List[str] = []
+    stale: List[str] = []
     fallback: List[str] = []
     for layer in plan["layers"]:
         kind = layer.get("kind")
@@ -545,11 +771,17 @@ def assemble_psd(plan: Dict[str, Any], out_psd: str, compression: str = "rle") -
         width = max(1, x1 - x0)
         height = max(1, y1 - y0)
 
-        source = layer.get("out_file") if os.path.isfile(layer.get("out_file") or "") else layer["file"]
-        if source == layer.get("out_file"):
+        state = layer_cache_state(plan, layer)
+        if state["ok"]:
+            source = layer["out_file"]
             used.append(layer["name"])
+            if state["reused"]:
+                cached.append(layer["name"])
         else:
+            source = layer["file"]
             fallback.append(layer["name"])
+            if state["status"] == "stale":
+                stale.append(layer["name"])
         pixels = core_io.read_rgba(source)
         pixels = _resize(pixels, width, height)
         records.append({
@@ -568,6 +800,11 @@ def assemble_psd(plan: Dict[str, Any], out_psd: str, compression: str = "rle") -
         "path": out_psd,
         "canvas": [canvas_w, canvas_h],
         "upscaled": used,
+        "upscaled_count": len(used) - len(cached),
+        "cached": cached,
+        "cached_count": len(cached),
+        "stale": stale,
+        "stale_count": len(stale),
         "fallback": fallback,
         "fallback_count": len(fallback),
     }

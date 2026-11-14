@@ -28,33 +28,103 @@ except ImportError:  # pragma: no cover - standalone import from the tests
     import edit_parts
 
 
-# Loaded once by the batch node; their outputs feed the clone from outside.
-SKIP_CLASSES = {"UNETLoader", "CLIPLoader", "VAELoader", "QwenImage21Cache"}
+# Preview-only nodes: dropped from every clone regardless of the model.
+BASE_DROP_CLASSES = {"PreviewAny", "PreviewImage", "MarkdownNote"}
 
-# Preview-only nodes plus the whole prompt-enhancer branch.  Dropping the
-# enhancer keeps the literal extraction prompt and skips a 9B text model.
-DROP_CLASSES = {
-    "PreviewAny", "PreviewImage", "MarkdownNote",
-    "TextGenerate", "BatchImagesNode", "PrimitiveStringMultiline",
+# The whole prompt-enhancer branch goes with it: dropping the enhancer keeps
+# the literal extraction prompt and skips a second ~9B text model.
+ENHANCER_DROP_CLASSES = {"TextGenerate", "BatchImagesNode", "PrimitiveStringMultiline"}
+
+# Default (Qwen Image Edit 2.1) description of the subgraph.  A template may
+# ship a sibling ``<name>.adapter.json`` that overrides any top-level section
+# here; without one, the built-in Qwen layout is assumed, so older templates
+# and the legacy nodes behave exactly as before.
+DEFAULT_ADAPTER: Dict[str, Any] = {
+    "label": "Qwen Image Edit 2.1",
+    # class name -> what it loads from outside the subgraph
+    "loaders": {
+        "UNETLoader": "model",
+        "QwenImage21Cache": "model",
+        "CLIPLoader": "clip",
+        "VAELoader": "vae",
+    },
+    # The encoder node that receives the part's literal prompt.  ``literals``
+    # maps its input names to the semantic value to write there.
+    "prompt_enhancer": {
+        "class": "TextEncodeQwenImage21",
+        "enhancer_nodes": ["TextGenerate"],
+        "literals": {
+            "prompt": "prompt",
+            "negative_prompt": "negative_prompt",
+            "resolution": "resolution",
+        },
+        "gate": True,
+        "drop_switch_inputs": ["switch_1"],
+    },
+    "seed": {"class": "RandomNoise", "field": "noise_seed"},
+    "cfg": {"class": "CFGGuider", "field": "cfg"},
+    "sampler": {"class": "KSamplerSelect", "field": "sampler_name"},
+    "sigmas": {"class": "ManualSigmas", "field": "sigmas"},
+    "size": {"class": "EmptyLatentImage", "fields": ["width", "height"],
+             "batch_field": "batch_size"},
+    # Latent-switch nodes kept (not dropped) but pinned to image_1's size.
+    "switch_classes": ["ComfySwitchNode"],
 }
 
-# Inputs of TextEncodeQwenImage21 we set directly instead of following links.
-_ENCODER_LITERALS = {"prompt", "negative_prompt", "resolution"}
-
 _MISSING = object()
+
+# The transparent-background instruction is part of the task prompt itself
+# (``edit_plan.task_prompt``): every part asks the model for a real alpha
+# channel, so no tail here has to key anything.
+
+
+def merge_adapter(adapter: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Overlay a template's adapter onto the Qwen defaults.
+
+    Dict sections (loaders / prompt_enhancer / seed / ...) merge one level
+    deep, so a new template only spells out the parts it changes and inherits
+    the rest (e.g. ``enhancer_nodes``) from the default.
+    """
+    merged = dict(DEFAULT_ADAPTER)
+    for key, value in (adapter or {}).items():
+        if value is None:
+            continue
+        base = merged.get(key)
+        if isinstance(value, dict) and isinstance(base, dict):
+            merged[key] = dict(base, **value)
+        else:
+            merged[key] = value
+    return merged
 
 
 class EditSubgraph:
     def __init__(self, doc: Dict[str, Any], subgraph: Dict[str, Any],
-                 instance: Dict[str, Any]):
+                 instance: Dict[str, Any], adapter: Optional[Dict[str, Any]] = None):
         self.doc = doc
         self.sg = subgraph
         self.instance = instance
+        self.adapter = merge_adapter(adapter)
         self.nodes = {int(n["id"]): n for n in subgraph.get("nodes", [])}
         self.links = {int(l["id"]): l for l in subgraph.get("links", [])}
         self.sg_inputs = subgraph.get("inputs", [])
         self.sg_outputs = subgraph.get("outputs", [])
         self.instance_values = self._instance_values()
+
+        enh = self.adapter.get("prompt_enhancer") or {}
+        self.enhancer_class = enh.get("class")
+        self.enhancer_classes = set(enh.get("enhancer_nodes") or [])
+        self.encoder_literals = dict(enh.get("literals") or {})
+        self.encoder_gate = bool(enh.get("gate", True))
+        self.enhancer_switch_inputs = set(enh.get("drop_switch_inputs") or [])
+        self.loader_map = dict(self.adapter.get("loaders") or {})
+        self.switch_classes = set(self.adapter.get("switch_classes") or [])
+
+        skip = set(self.loader_map)
+        self.skip_classes = skip
+        self.drop_classes = set(BASE_DROP_CLASSES)
+        if enh:
+            self.drop_classes |= ENHANCER_DROP_CLASSES
+
         self.loader_kind = self._classify_loaders()
         self.drop_ids = self._classify_dropped_switches()
         self.output_link = self._find_output_link()
@@ -78,16 +148,18 @@ class EditSubgraph:
         kinds: Dict[int, str] = {}
         for node_id, node in self.nodes.items():
             ct = node.get("type")
-            if ct in ("UNETLoader", "QwenImage21Cache"):
-                kinds[node_id] = "model"
-            elif ct == "VAELoader":
-                kinds[node_id] = "vae"
-            elif ct == "CLIPLoader":
+            kind = self.loader_map.get(ct)
+            if not kind:
+                continue
+            if kind == "clip" and self.enhancer_classes:
+                # A CLIP that only feeds the prompt enhancer must be dropped
+                # with it, not rewired to the batch node's CLIP.
                 consumers = [l["target_id"] for l in self.links.values()
                              if l["origin_id"] == node_id]
-                is_pe = any(self.nodes.get(c, {}).get("type") == "TextGenerate"
-                            for c in consumers)
-                kinds[node_id] = "pe_clip" if is_pe else "clip"
+                if any(self.nodes.get(c, {}).get("type") in self.enhancer_classes
+                       for c in consumers):
+                    kind = "pe_clip"
+            kinds[node_id] = kind
         return kinds
 
     def _sg_input_name(self, link_id: Optional[int]) -> str:
@@ -107,8 +179,11 @@ class EditSubgraph:
         The subgraph has two: one selects the sampling latent (keep it, force
         ``switch=False`` so the latent follows image_1) and one selects raw vs
         enhanced prompt (drop it -- the encoder is fed the literal prompt).
+        Which subgraph input marks the droppable one comes from the adapter.
         """
         drop = set()
+        if not self.enhancer_switch_inputs:
+            return drop
         for node_id, node in self.nodes.items():
             if node.get("type") != "ComfySwitchNode":
                 continue
@@ -116,7 +191,7 @@ class EditSubgraph:
             for inp in node.get("inputs") or []:
                 if inp.get("name") == "switch":
                     switch_link = inp.get("link")
-            if self._sg_input_name(switch_link) == "switch_1":
+            if self._sg_input_name(switch_link) in self.enhancer_switch_inputs:
                 drop.add(node_id)
         return drop
 
@@ -128,18 +203,70 @@ class EditSubgraph:
 
     # -- expansion ---------------------------------------------------------
 
+    def _overrides(self, **values) -> Dict[str, Dict[str, Any]]:
+        """Values that must never be inherited from another part, per class.
+
+        Built entirely from the adapter: which class carries the seed, the
+        cfg, the sampler name, the sigmas, the sampling size, and which inputs
+        of the encoder take the literal prompt.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+
+        def put(spec, **fields):
+            if not isinstance(spec, dict):
+                return
+            cls = spec.get("class")
+            if cls:
+                out.setdefault(cls, {}).update(fields)
+
+        put(self.adapter.get("seed"),
+            **{self.adapter["seed"].get("field", "noise_seed"):
+               int(values["seed"]) + int(values["seed_index"])})
+        put(self.adapter.get("cfg"),
+            **{self.adapter["cfg"].get("field", "cfg"): float(values["cfg"])})
+        put(self.adapter.get("sampler"),
+            **{self.adapter["sampler"].get("field", "sampler_name"):
+               str(values["scheduler"])})
+        put(self.adapter.get("sigmas"),
+            **{self.adapter["sigmas"].get("field", "sigmas"):
+               str(values["sigmas"])})
+
+        size = self.adapter.get("size") or {}
+        fields = list(size.get("fields") or ["width", "height"])
+        size_values = [int(values["width"]), int(values["height"])]
+        size_fields = {f: v for f, v in zip(fields, size_values)}
+        batch = size.get("batch_field")
+        if batch:
+            size_fields[batch] = 1
+        put(size, **size_fields)
+
+        if self.enhancer_class:
+            enc_values = {
+                "prompt": values["prompt"],
+                "negative_prompt": values["negative_prompt"],
+                "resolution": int(values["resolution"]),
+                "width": int(values["width"]),
+                "height": int(values["height"]),
+            }
+            enc_fields = {inp: enc_values[sem]
+                          for inp, sem in self.encoder_literals.items()
+                          if sem in enc_values}
+            out.setdefault(self.enhancer_class, {}).update(enc_fields)
+        return out
+
+
     def expand(self, graph: GraphBuilder, parts: List[Dict[str, Any]],
                external: Dict[str, Any], seed: int, out_dir_rel: str,
-               key: str, tolerance: float, softness: float, protect: bool,
-               despill: float, negative_prompt: str, cfg: float,
+               negative_prompt: str, cfg: float,
                resolution: int, scheduler: str, sigmas: str,
                width: int, height: int, crop_mode: bool = False):
         """Append one clone per part; return the list of save nodes.
 
         In ``crop_mode`` every part is a PSD crop: the clone is fed a
         ``STLU_LoadCrop`` instead of a shared reference image, its sampling
-        size follows the part, and the tail cuts the edited result back to
-        the layer with ``STLU_CutToLayer`` instead of chroma-keying it.
+        size follows the part, and the tail cuts the model's own RGBA back
+        to the layer with ``STLU_CutToLayer``.  Outside crop mode the model's
+        decoded RGBA is saved as it came -- no key, no mask is invented.
         """
         saves: List[Any] = []
         all_encoders: List[Any] = []
@@ -147,13 +274,15 @@ class EditSubgraph:
 
         for index, part in enumerate(parts):
             prefix = "ep%d" % index
+            # Skipped layers keep their slot so every part's seed stays put.
+            seed_index = int(part.get("seed_index", index))
             created: Dict[int, Any] = {}
             gate_by_node: Dict[int, Any] = {}
 
             # Crop mode: the clone is edited at the crop's work size, not at
             # the batch-wide sampling size.
             load_crop = None
-            load_ref = None
+            load_refs: List[Any] = []
             part_w, part_h, part_res = int(width), int(height), int(resolution)
             if crop_mode:
                 part_w = max(1, int(part["width"]))
@@ -166,15 +295,24 @@ class EditSubgraph:
                 # Optional high-resolution reference: the same frame cut out
                 # at the crop's box, read at its native size so the encoder
                 # downscales it once (it does the ~resolution^2 fit itself).
+                # It owns <image2>; the task's own pattern/style refs follow.
                 if str(part.get("ref_file") or "").strip():
-                    load_ref = graph.node(
+                    load_refs.append(graph.node(
                         "STLU_LoadCrop", id="%s_ref" % prefix,
                         file=part["ref_file"], width=0, height=0,
-                    )
+                    ))
+                for ref_i, ref_path in enumerate(part.get("ref_files") or []):
+                    ref_path = str(ref_path or "").strip()
+                    if not ref_path:
+                        continue
+                    load_refs.append(graph.node(
+                        "STLU_LoadCrop", id="%s_ref%d" % (prefix, ref_i + 1),
+                        file=ref_path, width=0, height=0,
+                    ))
 
             for node_id, node in self.nodes.items():
                 ct = node.get("type")
-                if (ct in SKIP_CLASSES or ct in DROP_CLASSES
+                if (ct in self.skip_classes or ct in self.drop_classes
                         or node_id in self.drop_ids):
                     continue
                 if int(node.get("mode", 0)) == 4:
@@ -182,7 +320,7 @@ class EditSubgraph:
                         "subgraph node %s (%s) is bypassed; bypassed nodes are not "
                         "supported" % (node_id, ct))
                 created[node_id] = graph.node(ct, id="%s_%s" % (prefix, node_id))
-                if ct == "TextEncodeQwenImage21":
+                if ct == self.enhancer_class and self.encoder_gate:
                     gate_by_node[node_id] = graph.node(
                         "STLU_Gate", id="%s_%s_gate" % (prefix, node_id),
                         positive=created[node_id].out(0),
@@ -191,6 +329,14 @@ class EditSubgraph:
                     )
                     all_encoders.append(created[node_id])
                     all_gates.append(gate_by_node[node_id])
+
+            edit_prompt = part["prompt"]
+
+            overrides = self._overrides(
+                prompt=edit_prompt, negative_prompt=negative_prompt,
+                resolution=part_res if crop_mode else int(resolution),
+                seed=seed, seed_index=seed_index, cfg=cfg, scheduler=scheduler,
+                sigmas=sigmas, width=part_w, height=part_h)
 
             for node_id, node in self.nodes.items():
                 if node_id not in created:
@@ -209,13 +355,9 @@ class EditSubgraph:
                     link_id = inp.get("link")
                     if name is None or link_id is None:
                         continue
-                    if ct == "TextEncodeQwenImage21" and name in _ENCODER_LITERALS:
-                        if name == "prompt":
-                            base[name] = part["prompt"]
-                        elif name == "negative_prompt":
-                            base[name] = negative_prompt
-                        else:
-                            base[name] = part_res if crop_mode else int(resolution)
+                    if ct == self.enhancer_class and name in self.encoder_literals:
+                        # Written as a literal further down; never inherit the
+                        # template's wiring (its prompt comes from a text node).
                         continue
                     link = self.links.get(int(link_id))
                     if link is None:
@@ -231,9 +373,18 @@ class EditSubgraph:
                                 base[name] = load_crop.out(0)
                             else:
                                 base[name] = external["reference"]
-                        elif (sname == "images.image_2" and crop_mode
-                              and load_ref is not None):
-                            base[name] = load_ref.out(0)
+                        elif (crop_mode and sname.startswith("images.image_")
+                              and sname != "images.image_1"):
+                            # <imageN> is numbered over the CONNECTED slots, so
+                            # wire the references consecutively from image_2.
+                            try:
+                                img_idx = int(sname.rsplit("_", 1)[-1])
+                            except ValueError:
+                                img_idx = 0
+                            if 2 <= img_idx <= len(load_refs) + 1:
+                                base[name] = load_refs[img_idx - 2].out(0)
+                            else:
+                                base.pop(name, None)
                         elif sname == "negative_prompt":
                             base[name] = negative_prompt
                         elif sname == "cfg":
@@ -249,7 +400,7 @@ class EditSubgraph:
                         elif sname == "scheduler":
                             base[name] = str(scheduler)
                         elif sname == "seed":
-                            base[name] = int(seed) + int(index)
+                            base[name] = int(seed) + seed_index
                         elif sname == "resolution":
                             base[name] = part_res
                         elif str(sgin.get("type")) == "IMAGE":
@@ -276,24 +427,12 @@ class EditSubgraph:
                         base.pop(name, None)
 
                 # Literal overrides that must never inherit from another part.
-                if ct == "RandomNoise":
-                    base["noise_seed"] = int(seed) + int(index)
-                if ct == "TextEncodeQwenImage21":
-                    base["prompt"] = part["prompt"]
-                    base["negative_prompt"] = negative_prompt
-                    base["resolution"] = part_res
-                if ct == "CFGGuider":
-                    base["cfg"] = float(cfg)
-                if ct == "KSamplerSelect":
-                    base["sampler_name"] = str(scheduler)
-                if ct == "ManualSigmas":
-                    base["sigmas"] = str(sigmas)
-                if ct == "ComfySwitchNode":
+                # Kept byte-identical per part except the seed, so ComfyUI's
+                # signature cache can never reuse a neighbour's result.
+                for key_name, value in overrides.get(ct, {}).items():
+                    base[key_name] = value
+                if ct in self.switch_classes:
                     base["switch"] = False
-                if ct == "EmptyLatentImage":
-                    base["width"] = part_w
-                    base["height"] = part_h
-                    base["batch_size"] = 1
 
                 for key_name, value in base.items():
                     graph_node.set_input(key_name, value)
@@ -304,50 +443,32 @@ class EditSubgraph:
             image = created[out_id].out(out_slot)
 
             if crop_mode:
-                # Two ways back: a locked edit keeps the source silhouette and
-                # is cut with the crop's own alpha; a key edit repaints the
-                # part on a flat key and is keyed out at the restore step.
-                if str(part.get("silhouette") or "lock") == "key":
-                    kwargs = {
-                        "image": image,
-                        "geometry": json.dumps(part["geometry"]),
-                        "key_color": key,
-                        "tolerance": float(tolerance),
-                        "softness": float(softness),
-                        "protect": bool(protect),
-                        "despill": float(despill),
-                    }
-                    # The crop itself is the colour guide, so a part that is
-                    # genuinely the key colour survives.  A new layer's crop is
-                    # the key canvas; there is nothing to protect.
-                    if part.get("key_reference", True):
-                        kwargs["reference"] = load_crop.out(0)
-                    save = graph.node("STLU_KeyCut", id="%s_keycut" % prefix,
-                                      **kwargs)
-                else:
-                    save = graph.node(
-                        "STLU_CutToLayer", id="%s_cut" % prefix,
-                        image=image,
-                        alpha=load_crop.out(1),
-                        geometry=json.dumps(part["geometry"]),
-                    )
+                # The model decodes straight RGBA: its own alpha channel is
+                # the silhouette, so the crop is cut back with exactly what
+                # the model drew -- no key, no source lock.
+                save = graph.node(
+                    "STLU_CutToLayer", id="%s_cut" % prefix,
+                    image=image,
+                    geometry=json.dumps(part["geometry"]),
+                )
                 saves.append(save)
                 continue
 
-            chroma = graph.node(
-                "STLU_ChromaToAlpha", id="%s_chroma" % prefix,
-                image=image,
-                reference=external["reference"],
-                key_color=key,
-                tolerance=float(tolerance),
-                softness=float(softness),
-                protect=bool(protect),
-                despill=float(despill),
+            # No crop: the model decodes straight RGBA, so the layer is that
+            # image with its own alpha -- nothing is keyed here.
+            alpha_mask = graph.node(
+                "ImageToMask", id="%s_alpha" % prefix,
+                image=image, channel="alpha",
+            )
+            transparent = graph.node(
+                "InvertMask", id="%s_alpha_inv" % prefix,
+                mask=alpha_mask.out(0),
             )
             save = graph.node(
                 "STLU_SaveLayer", id="%s_save" % prefix,
-                images=chroma.out(0),
-                mask=chroma.out(1),
+                images=image,
+                mask=transparent.out(0),
+                keep_input_alpha=True,
                 name=part["name"],
                 out_dir=out_dir_rel,
             )
@@ -367,7 +488,8 @@ class EditSubgraph:
         return saves
 
 
-def load_template(workflow_path: str) -> EditSubgraph:
+def load_template(workflow_path: str,
+                  adapter: Optional[Dict[str, Any]] = None) -> EditSubgraph:
     with open(workflow_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     subgraphs = (doc.get("definitions") or {}).get("subgraphs") or []
@@ -382,19 +504,21 @@ def load_template(workflow_path: str) -> EditSubgraph:
     if instance is None:
         raise ValueError("workflow has no instance of subgraph %r on the canvas: %s"
                          % (subgraph.get("name"), workflow_path))
-    return EditSubgraph(doc, subgraph, instance)
+    return EditSubgraph(doc, subgraph, instance, adapter=adapter)
 
 
 def build_expand(workflow_path: str, parts: List[Dict[str, Any]],
                  external: Dict[str, Any], seed: int, out_dir_rel: str,
                  layers_json_path: str, psd_name: str, psd_plan: str = "",
-                 **options):
+                 adapter: Optional[Dict[str, Any]] = None, **options):
     """Clone the edit subgraph per part and chain the output nodes.
 
-    ``psd_plan`` switches the tail from the chroma-key layer merge to the
-    PSD-upscale assembler, which rebuilds the full layered document.
+    ``psd_plan`` switches the tail from the layer merge to the PSD-upscale
+    assembler, which rebuilds the full layered document.
+    ``adapter`` describes where the template keeps its loaders / prompt / seed
+    nodes; omit it for the built-in Qwen Image Edit 2.1 layout.
     """
-    template = load_template(workflow_path)
+    template = load_template(workflow_path, adapter=adapter)
     graph = GraphBuilder()
     saves = template.expand(graph, parts, external, seed, out_dir_rel, **options)
 

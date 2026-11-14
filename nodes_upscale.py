@@ -60,9 +60,9 @@ class STLU_EditPartsBatch:
     """Extract every Live2D part with an image-edit model, in one run.
 
     The node clones the Qwen-Image-Edit subgraph once per selected part,
-    rewrites the prompt to "isolate this part on a chroma background", keys
-    the background out on the CPU, saves SeeThrough-named layer PNGs and
-    finally assembles the PSD -- all inside one prompt.
+    asks the model to isolate the part on a transparent background (its own
+    alpha channel), saves SeeThrough-named layer PNGs and finally assembles
+    the PSD -- all inside one prompt.
     """
 
     @classmethod
@@ -75,8 +75,6 @@ class STLU_EditPartsBatch:
                 "vae": ("VAE",),
                 # "all", or names separated by spaces/commas; "-name" removes.
                 "select": ("STRING", {"default": "all"}),
-                "key_color": (list(edit_parts.KEY_COLORS.keys()),
-                              {"default": "green"}),
             },
             "optional": {
                 "out_dir": ("STRING", {"default": "SeeThrough/EditParts"}),
@@ -87,13 +85,6 @@ class STLU_EditPartsBatch:
                 # The node itself ignores it: each part uses seed + index.
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xFFFFFFFF,
                                  "step": 1}),
-                "tolerance": ("FLOAT", {"default": 12.0, "min": 2.0, "max": 60.0,
-                                        "step": 1.0}),
-                "softness": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 40.0,
-                                       "step": 1.0}),
-                "protect": ("BOOLEAN", {"default": True}),
-                "despill": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0,
-                                      "step": 0.05}),
                 "negative_prompt": ("STRING", {"default": "", "multiline": True}),
                 # The Qwen 2.1 official path runs at cfg 1 (negative unused).
                 "cfg": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 20.0,
@@ -117,9 +108,8 @@ class STLU_EditPartsBatch:
     FUNCTION = "execute"
     CATEGORY = CATEGORY
 
-    def execute(self, reference, model, clip, vae, select, key_color,
+    def execute(self, reference, model, clip, vae, select,
                 out_dir="SeeThrough/EditParts", workflow_json="", seed=42,
-                tolerance=12.0, softness=6.0, protect=True, despill=0.65,
                 negative_prompt="", cfg=1.0, resolution=0,
                 scheduler="euler", sigmas=DEFAULT_EDIT_SIGMAS,
                 psd_filename="", dynprompt=None, unique_id=None):
@@ -176,8 +166,7 @@ class STLU_EditPartsBatch:
         if not os.path.isfile(wf_path):
             raise FileNotFoundError("edit workflow template not found: %s" % wf_path)
 
-        part_jobs = [{"name": name,
-                      "prompt": edit_parts.build_prompt(name, key_color)}
+        part_jobs = [{"name": name, "prompt": edit_parts.build_prompt(name)}
                      for name in parts]
 
         expand, psd_node, saves = edit_expand.build_expand(
@@ -188,11 +177,6 @@ class STLU_EditPartsBatch:
             out_dir_rel=out_dir_rel,
             layers_json_path=layers_path,
             psd_name=psd_stem,
-            key=key_color,
-            tolerance=float(tolerance),
-            softness=float(softness),
-            protect=bool(protect),
-            despill=float(despill),
             negative_prompt=str(negative_prompt or ""),
             cfg=float(cfg),
             resolution=int(resolution),
@@ -217,7 +201,6 @@ class STLU_EditPartsBatch:
             "layers_json": layers_path,
             "psd": psd_path,
             "workflow": wf_path,
-            "key_color": key_color,
         }
         return {
             "result": (layers_path, psd_path,

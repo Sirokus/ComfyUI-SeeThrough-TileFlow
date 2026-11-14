@@ -1,9 +1,10 @@
 """Live2D part extraction with an image-edit model (no SeeThrough weights).
 
-The batch node asks Qwen-Image-Edit to isolate one part per sample on a flat
-chroma background, keys that background out on the CPU, and writes layers that
-are laid out exactly like a SeeThrough run: same part names, same
-``*_layers.json`` document, same PSD layer order (far -> near, bottom -> top).
+The batch node asks Qwen-Image-Edit to isolate one part per sample and to
+return it with a real alpha channel -- no background, no chroma screen.  The
+written layers are laid out exactly like a SeeThrough run: same part names,
+same ``*_layers.json`` document, same PSD layer order (far -> near, bottom ->
+top).
 
 Nothing here loads a model, so every function is testable without CUDA.
 """
@@ -141,35 +142,19 @@ OPTIONAL_PARTS = {"tail", "wings", "objects", "eyewear", "earwear", "neckwear",
                   "headwear", "legwear", "footwear", "topwear", "bottomwear"}
 
 
-KEY_COLORS: Dict[str, Tuple[int, int, int]] = {
-    "green": (0, 255, 0),
-    "magenta": (255, 0, 255),
-    "blue": (0, 96, 255),
-    "white": (255, 255, 255),
-    "black": (0, 0, 0),
-}
-
-KEY_NAME: Dict[str, str] = {
-    "green": "pure bright green",
-    "magenta": "pure magenta",
-    "blue": "pure blue",
-    "white": "pure white",
-    "black": "pure black",
-}
-
 PROMPT_TEMPLATE = (
     "Extract only {desc} from <image1>. Keep its exact shape, position, scale, "
     "colors, shading and line art; do not redraw, move or reshape it, and do not "
-    "add or remove details. The output must show only this part on a flat solid "
-    "{key_name} background ({key_hex}). {exclude} must be completely replaced by "
-    "that flat {key_name} color. Never paint the extracted part itself with the "
-    "key color. If the character does not have this part, output a completely "
-    "{key_name} image."
+    "add or remove details. Output only this part with a real alpha channel: "
+    "everything that is not the part must be fully transparent -- do not paint "
+    "any background, backdrop, frame or solid colour behind it. {exclude} must "
+    "be removed. If the character does not have this part, output a fully "
+    "transparent image."
 )
 
 
 def _exclude_for(part: str) -> str:
-    """What must be keyed out for this part.
+    """What must be removed for this part.
 
     Without a per-part list the model tends to keep the whole face under the
     bangs (or the whole body for a tiny eye part), which lands in the layer as
@@ -199,24 +184,10 @@ def _exclude_for(part: str) -> str:
             "background")
 
 
-def resolve_key(key: str) -> Tuple[str, Tuple[int, int, int]]:
-    key = str(key or "green").strip().lower()
-    if key not in KEY_COLORS:
-        key = "green"
-    return key, KEY_COLORS[key]
-
-
-def hex_rgb(rgb: Sequence[int]) -> str:
-    return "#%02X%02X%02X" % tuple(int(v) for v in rgb[:3])
-
-
-def build_prompt(part: str, key: str = "green") -> str:
-    key_id, rgb = resolve_key(key)
+def build_prompt(part: str) -> str:
     return PROMPT_TEMPLATE.format(
         desc=PART_DESC.get(part, part),
         exclude=_exclude_for(part),
-        key_name=KEY_NAME[key_id],
-        key_hex=hex_rgb(rgb),
     )
 
 
@@ -279,115 +250,60 @@ def _match_part(token: str) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Chroma key -> alpha
-# ---------------------------------------------------------------------------
-
-def _chroma(rgb: np.ndarray) -> np.ndarray:
-    total = rgb.sum(axis=-1, keepdims=True)
-    return rgb / np.maximum(total, 1e-6)
-
-
-def chroma_alpha(
-    rgb: np.ndarray,
-    key_rgb: Sequence[int],
-    tolerance: float = 12.0,
-    softness: float = 6.0,
-    reference_rgb: Optional[np.ndarray] = None,
-    protect: bool = True,
-) -> np.ndarray:
-    """Return a float32 alpha in 0..1 for an RGB uint8 image.
-
-    Distance is a blend of chroma distance (catches shaded / gradient key
-    background) and plain RGB distance (catches desaturated key pixels).  A
-    pixel that the model kept identical to the reference *and* that was already
-    key-coloured in the reference is protected, so green eyes or a green
-    garment are not eaten by a green screen.
-    """
-    img = np.asarray(rgb, dtype=np.float32) / 255.0
-    key = np.asarray(key_rgb, dtype=np.float32) / 255.0
-
-    # Chroma decides for saturated keys: a shaded / gradient key background
-    # keeps the key's hue but not its brightness, and a plain RGB distance
-    # would leave all of it opaque.  Desaturated keys (white / black) have no
-    # useful hue, so they fall back to plain RGB distance.
-    key_saturation = float(key.max() - key.min())
-    rgb_weight = 0.3 if key_saturation > 0.35 else 1.0
-    de = np.linalg.norm(img - key, axis=-1)
-    dc = np.linalg.norm(_chroma(img) - _chroma(key), axis=-1) * 1.6
-    dist = np.maximum(dc, de * rgb_weight)
-
-    t0 = max(0.01, float(tolerance) / 100.0)
-    t1 = max(t0 + 0.01, t0 + float(softness) / 100.0)
-    alpha = np.clip((dist - t0) / (t1 - t0), 0.0, 1.0)
-    alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
-
-    if protect and reference_rgb is not None:
-        ref = np.asarray(reference_rgb, dtype=np.float32) / 255.0
-        if ref.shape[:2] == img.shape[:2]:
-            ref_dist = np.maximum(
-                np.linalg.norm(_chroma(ref) - _chroma(key), axis=-1) * 1.6,
-                np.linalg.norm(ref - key, axis=-1) * rgb_weight,
-            )
-            close_to_ref = np.linalg.norm(img - ref, axis=-1) < 0.10
-            keep = close_to_ref & (ref_dist < t0)
-            alpha = np.where(keep, 1.0, alpha)
-    return alpha.astype(np.float32)
-
-
-def despill(rgb: np.ndarray, alpha: np.ndarray, key_rgb: Sequence[int],
-            strength: float = 0.65) -> np.ndarray:
-    """Pull the key hue out of partially transparent edge pixels."""
-    img = np.asarray(rgb, dtype=np.float32) / 255.0
-    key = np.asarray(key_rgb, dtype=np.float32) / 255.0
-    key_norm = float(np.dot(key, key))
-    if key_norm <= 1e-6:
-        return np.asarray(rgb, dtype=np.uint8)
-    edge = (alpha > 0.0) & (alpha < 0.98)
-    if not np.any(edge):
-        return np.clip(np.rint(img * 255.0), 0, 255).astype(np.uint8)
-    proj = np.clip(img @ key / key_norm, 0.0, 1.0)[..., None]
-    spill = key[None, None, :] * proj
-    fixed = img - spill * (float(strength) * (1.0 - alpha[..., None]))
-    return np.clip(np.rint(fixed * 255.0), 0, 255).astype(np.uint8)
-
-
-def key_out(rgb: np.ndarray, key: str = "green", tolerance: float = 12.0,
-            softness: float = 6.0, reference_rgb: Optional[np.ndarray] = None,
-            protect: bool = True, despill_strength: float = 0.65,
-            alpha_floor: int = 8, alpha_ceiling: int = 250) -> np.ndarray:
-    """Full key: RGB uint8 -> RGBA uint8 with a cleaned alpha channel."""
-    _key_id, key_rgb = resolve_key(key)
-    alpha = chroma_alpha(rgb, key_rgb, tolerance, softness, reference_rgb, protect)
-    fixed = despill(rgb, alpha, key_rgb, despill_strength)
-    a8 = np.clip(np.rint(alpha * 255.0), 0, 255).astype(np.uint8)
-    a8[a8 <= int(alpha_floor)] = 0
-    a8[a8 >= int(alpha_ceiling)] = 255
-
-    # Second pass: the model sometimes paints key-colour streaks *inside*
-    # the part (green lines along the hair).  ``despill`` only touches the
-    # soft edge, so clamp the green channel where the reference image has no
-    # green at the same pixel -- a genuinely green eye or dyed hair stays.
-    if reference_rgb is not None:
-        ref = np.asarray(reference_rgb, dtype=np.float32) / 255.0
-        f = fixed.astype(np.float32) / 255.0
-        painted = (f[..., 1] - np.maximum(f[..., 0], f[..., 2])) > 0.06
-        ref_green = (ref[..., 1] - np.maximum(ref[..., 0], ref[..., 2])) > 0.06
-        fix = painted & ~ref_green & (a8 > 0)
-        if np.any(fix):
-            f[..., 1] = np.where(
-                fix,
-                np.minimum(f[..., 1], np.maximum(f[..., 0], f[..., 2])),
-                f[..., 1],
-            )
-            fixed = np.clip(np.rint(f * 255.0), 0, 255).astype(np.uint8)
-    return np.dstack([fixed, a8])
-
-
 def coverage(rgba: np.ndarray, threshold: int = 8) -> float:
     if rgba is None or rgba.size == 0:
         return 0.0
     return float(np.mean(rgba[..., 3] > int(threshold)))
+
+
+def alpha_stats(alpha: np.ndarray) -> Dict[str, Any]:
+    """Small report on an alpha channel, for the node log and the JSON."""
+    a = np.asarray(alpha, dtype=np.uint8)
+    if a.ndim == 3:
+        a = a[..., 0]
+    return {
+        "coverage": round(float((a > 8).mean()), 4),
+        "transparent": round(float((a <= 8).mean()), 4),
+        "opaque": round(float((a >= 247).mean()), 4),
+        "levels": int(np.unique(a).size),
+        "min": int(a.min()) if a.size else 0,
+        "max": int(a.max()) if a.size else 0,
+    }
+
+
+def clean_alpha(alpha: np.ndarray, floor: int = 8, ceiling: int = 250,
+                feather: int = 0) -> np.ndarray:
+    """Clamp the model alpha and optionally soften it by a few 3x3 passes.
+
+    VAE noise leaves a few stray opaque pixels in the transparent background;
+    ``floor`` removes them, ``ceiling`` snaps the solid interior back to 255,
+    and ``feather`` (0..4) softens the resulting edge without moving it more
+    than a pixel or two.
+    """
+    a = np.asarray(alpha, dtype=np.uint8)
+    if a.ndim == 3:
+        a = a[..., 0]
+    a = a.astype(np.float32)
+    a[a <= int(floor)] = 0.0
+    a[a >= int(ceiling)] = 255.0
+    for _ in range(max(0, int(feather))):
+        pad = np.pad(a, 1, mode="edge")
+        a = (pad[1:-1, 1:-1] * 4.0 + pad[:-2, 1:-1] + pad[2:, 1:-1]
+             + pad[1:-1, :-2] + pad[1:-1, 2:]) / 8.0
+    return np.clip(np.rint(a), 0, 255).astype(np.uint8)
+
+
+def alpha_valid(alpha: np.ndarray, min_coverage: float = 0.002,
+                min_transparent: float = 0.002) -> bool:
+    """True when the model's 4th channel looks like a drawn silhouette.
+
+    A template prompt that asks for a flat colour instead of transparency
+    paints an opaque card (or a fully empty image); neither carries both
+    visible and transparent pixels, so both must fall back to a safe placement.
+    """
+    stats = alpha_stats(alpha)
+    return (stats["coverage"] >= min_coverage
+            and stats["transparent"] >= min_transparent)
 
 
 # ---------------------------------------------------------------------------
@@ -529,18 +445,56 @@ def safe_timestamp(text: str) -> str:
 
 
 TEMPLATE_NAME = "Live2D图编辑抠层.json"
+# Selectable edit-model templates live here; each may ship a sibling
+# ``<name>.adapter.json`` telling edit_expand where its loaders / prompt /
+# seed nodes are (see edit_expand.DEFAULT_ADAPTER for the Qwen default).
+TEMPLATE_DIR = "edit"
+
+
+def _templates_dir() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "templates", TEMPLATE_DIR)
 
 
 def default_template_path() -> str:
-    """Locate the edit subgraph template next to the user's other workflows."""
+    """The edit subgraph template ships inside this node pack (templates/)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    comfy_root = os.path.dirname(os.path.dirname(here))
-    root = os.path.join(comfy_root, "user", "default", "workflows")
-    preferred = os.path.join(root, "Comfy-My-Workflow", "图片", "Live2D拆层",
-                             TEMPLATE_NAME)
-    if os.path.isfile(preferred):
-        return preferred
-    for dirpath, _dirs, files in os.walk(root):
-        if TEMPLATE_NAME in files:
-            return os.path.join(dirpath, TEMPLATE_NAME)
-    return preferred
+    return os.path.join(here, "templates", TEMPLATE_NAME)
+
+
+def list_edit_templates() -> List[str]:
+    """Template names offered in the ② / upscale ``edit_template`` dropdown."""
+    root = _templates_dir()
+    names = []
+    if os.path.isdir(root):
+        for fn in os.listdir(root):
+            low = fn.lower()
+            if low.endswith(".json") and not low.endswith(".adapter.json"):
+                names.append(fn[:-5])
+    if not names:
+        # Nothing migrated yet: keep the historical single template usable.
+        return [TEMPLATE_NAME]
+    return sorted(names)
+
+
+def edit_template_path(name: str) -> str:
+    """Resolve a dropdown value to a workflow JSON (empty -> default)."""
+    name = str(name or "").strip()
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return default_template_path()
+    cand = os.path.join(_templates_dir(), name + ".json")
+    if os.path.isfile(cand):
+        return cand
+    if name == TEMPLATE_NAME:
+        return default_template_path()
+    raise FileNotFoundError("找不到图编辑模板: %s" % cand)
+
+
+def edit_template_adapter(name: str) -> Dict[str, Any]:
+    """Read ``<template>.adapter.json``; {} means "use the Qwen defaults"."""
+    path = os.path.splitext(edit_template_path(name))[0] + ".adapter.json"
+    if not os.path.isfile(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}

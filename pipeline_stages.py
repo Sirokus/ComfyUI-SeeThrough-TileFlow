@@ -27,12 +27,13 @@ import torch
 import folder_paths
 
 if __package__:  # ComfyUI loads the folder as a package
-    from . import core_compose, core_io, region_plan, tile_psd
+    from . import core_compose, core_io, core_plan, region_plan, tile_psd
     from .stlu import limits as stlu_limits
     from . import nodes_shared as _shared
 else:  # standalone import used by the tests and tools
     import core_compose
     import core_io
+    import core_plan
     import region_plan
     import tile_psd
     from stlu import limits as stlu_limits
@@ -67,7 +68,7 @@ SETTINGS_KEYS = (
     "seam_feather", "grid_offset_x", "grid_offset_y", "partition_mode",
     "strip_max_side", "strip_max_resolution", "strip_margin", "select_plan",
     "context_pad", "custom_regions", "head_scope", "tile_tags",
-    "depth_random_seed",
+    "depth_random_seed", "sub_dir",
 )
 
 # SeeThrough v3 runs a fixed second pass over the head tags for every tile,
@@ -107,6 +108,8 @@ DEFAULT_SETTINGS = {
     # -1 keeps older folders compatible: carried-forward values mean "follow
     # the layer seed" instead of a separate depth seed.
     "depth_random_seed": -1,
+    # Empty = the merged PSD lands directly in out_dir/group, as it always did.
+    "sub_dir": "",
 }
 
 
@@ -134,10 +137,13 @@ def normalize_settings(**kwargs) -> dict:
         out[key] = bool(out[key])
     for key in ("select", "out_dir", "group", "filename_prefix", "merge_name",
                 "partition_mode", "select_plan", "custom_regions",
-                "head_scope", "tile_tags"):
+                "head_scope", "tile_tags", "sub_dir"):
         out[key] = str(out[key] if out[key] is not None else "")
     if out["head_scope"] not in HEAD_SCOPE_CHOICES:
         out["head_scope"] = HEAD_SCOPE_TOP_ROW
+    # 「分类」已并入子目录：运行/缓存目录只由 out_dir 决定，group 恒空
+    # （旧工作流存的 group 值被忽略，块目录整体上移到 <根目录>/）。
+    out["group"] = ""
     return out
 
 
@@ -647,6 +653,7 @@ def prepare_run(plan, image=None) -> dict:
         "prefix": str(settings["filename_prefix"] or "tile"),
         "alpha_threshold": int(settings["alpha_threshold"]),
         "merge_name": str(settings["merge_name"] or "merged"),
+        "sub_dir": core_plan.safe_sub_dir(str(settings["sub_dir"] or "")),
         "group_layers": bool(settings["group_layers"]),
         "include_depth": bool(settings["include_depth"]),
         "include_original": bool(settings["include_original"]),
@@ -1373,6 +1380,71 @@ def tile_context(plan, index) -> dict:
 
 
 
+def restore_locked_parts(parts, plan, index) -> dict:
+    """Put back the parts the ⑤ panel locked for this tile.
+
+    Locked parts are copied from the tile PSD the previous run left in the
+    folder, before this run overwrites it.  No locks, no previous PSD or an
+    unreadable one all mean "write the fresh result as usual".
+    """
+    ctx = tile_context(plan, index)
+    tile_index = ctx["index"]
+    doc = ctx["doc"]
+    wave_dir = ctx["wave_dir"]
+    prefix = ctx["prefix"]
+    if not isinstance(parts, dict):
+        raise ValueError(
+            "STLU ③: tile %d 没有收到部件（上游返回 %r）。请检查 ② 是否正常完成。"
+            " / STLU ③: tile %d received no parts (upstream returned %r);"
+            " check whether ② finished normally."
+            % (tile_index, parts, tile_index, parts))
+    if str(parts.get("status") or "") == "error":
+        raise RuntimeError("STLU ③ tile %d upstream error: %s"
+                           % (tile_index, parts.get("error") or "unknown"))
+    locks = []
+    seen = set()
+    for name in tile_psd.tile_locks(wave_dir).get(tile_index, []):
+        name = str(name).strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            locks.append(name)
+    if not locks:
+        return parts
+
+    old_path = tile_psd.find_tile_psd(wave_dir, prefix, tile_index)
+    if not old_path:
+        return parts
+
+    parts = dict(parts)
+    old_entry = None
+    for entry in (tile_psd.read_manifest(wave_dir) or {}).get("tiles") or []:
+        try:
+            if int(entry.get("index", -1)) == tile_index:
+                old_entry = entry
+                break
+        except (TypeError, ValueError):
+            continue
+    coords = doc.get("coords") or []
+    try:
+        if coords:
+            row, col = tile_psd.tile_rc(coords, tile_index)
+            folder = "tile_%02d_r%d_c%d" % (tile_index, row, col)
+        else:
+            folder = "tile_%02d" % tile_index
+    except Exception:  # noqa: BLE001 - depth reuse is optional
+        folder = "tile_%02d" % tile_index
+    images_dir = os.path.join(wave_dir, "images", folder)
+    kept = tile_psd.replace_locked_parts(
+        parts, old_path, locks, old_entry, images_dir=images_dir)
+    if kept:
+        print("[STLU] tile %d: kept locked parts: %s" % (
+            tile_index, ", ".join(sorted(set(kept)))), flush=True)
+    # Both ③ nodes may receive the same parts object; the second call must
+    # not restore again (the previous PSD is gone by then).
+    parts["_stlu_locks_tile"] = tile_index
+    return parts
+
+
 def tile_is_empty(parts) -> bool:
     return not isinstance(parts, dict) or not (parts.get("tag2pinfo") or {})
 
@@ -1385,6 +1457,8 @@ def write_tile_psd(parts, plan, index) -> dict:
     wave_dir = ctx["wave_dir"]
     prefix = ctx["prefix"]
     alpha_threshold = ctx["alpha_threshold"]
+    if not isinstance(parts, dict) or parts.get("_stlu_locks_tile") != tile_index:
+        parts = restore_locked_parts(parts, plan, tile_index)
     if not isinstance(parts, dict):
         raise ValueError(
             "STLU ③: tile %d 没有收到部件（上游返回 %r）。请检查 ② 是否正常完成。"
@@ -1449,6 +1523,8 @@ def write_tile_images(parts, plan, index) -> dict:
     tile_index = ctx["index"]
     doc = ctx["doc"]
     wave_dir = ctx["wave_dir"]
+    if not isinstance(parts, dict) or parts.get("_stlu_locks_tile") != tile_index:
+        parts = restore_locked_parts(parts, plan, tile_index)
     if not isinstance(parts, dict) or not (parts.get("tag2pinfo") or {}):
         return {"index": tile_index, "status": "empty"}
     src = doc.get("source") or {}
@@ -1515,7 +1591,8 @@ def write_manifest(records, image_records, original_name, plan) -> dict:
         raise ValueError("STLU ③: PLAN 里没有运行目录 / PLAN has no run directory; cannot write the manifest.")
     rel = str(out.get("rel") or "")
     prefix = str(out.get("prefix") or "tile")
-    group_name = str(out.get("group") or "")
+    # 「分类」已废弃：目录只由 out.dir（out_dir）决定，manifest 里的 group 恒空。
+    group_name = ""
     wave_id_value = str(out.get("wave") or "")
     raw_seam = out.get("seam_feather")
     if raw_seam is None:
@@ -1712,6 +1789,7 @@ def write_manifest(records, image_records, original_name, plan) -> dict:
         "merge_doc": {
             "dir": rel,
             "name": str(out.get("merge_name") or "merged"),
+            "sub_dir": core_plan.safe_sub_dir(str(out.get("sub_dir") or "")),
             "group_layers": bool(out.get("group_layers", True)),
             "include_depth": bool(out.get("include_depth", False)),
             "include_original": bool(out.get("include_original", False)),
@@ -1739,6 +1817,10 @@ def merge_run_doc(merge_doc) -> dict:
     if not os.path.isfile(os.path.join(path, "manifest.json")):
         raise FileNotFoundError("manifest.json not found in %s" % path)
     name = str(doc.get("name") or "merged")
+    sub_dir = core_plan.safe_sub_dir(str(doc.get("sub_dir") or ""))
+    # Final PSD goes to <run>/<sub_dir>/<name>/<name>.psd; blocks keep caching
+    # in the run folder itself.  Empty sub_dir lands in <run>/<name>/.
+    out_subdir = "/".join(p for p in (sub_dir, core_plan.safe_name(name)) if p)
     group_layers = bool(doc.get("group_layers", True))
     include_depth = bool(doc.get("include_depth", False))
     include_original = bool(doc.get("include_original", False))
@@ -1747,6 +1829,7 @@ def merge_run_doc(merge_doc) -> dict:
     info = tile_psd.merge_run(
         path,
         name=name,
+        out_subdir=out_subdir,
         alpha_threshold=None if raw_alpha is None else int(raw_alpha),
         group_layers=group_layers,
         include_depth=include_depth,
@@ -1754,9 +1837,12 @@ def merge_run_doc(merge_doc) -> dict:
         seam_feather=seam_feather,
     )
     info["dir"] = os.path.relpath(path, _output_root()).replace(os.sep, "/")
-    psd_path = os.path.join(path, info.get("file") or "")
+    out_path = os.path.join(path, *out_subdir.split("/"))
+    info["out_dir"] = os.path.relpath(out_path, _output_root()).replace(os.sep, "/")
+    psd_path = os.path.join(out_path, info.get("file") or "")
     payload = {
-        "dir": info["dir"], "name": name,
+        "dir": info["dir"], "out_dir": info["out_dir"], "name": name,
+        "sub_dir": sub_dir,
         "group_layers": group_layers, "include_depth": include_depth,
         "include_original": include_original,
         "file": info.get("file"), "preview": info.get("preview"),

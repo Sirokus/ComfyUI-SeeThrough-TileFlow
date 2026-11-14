@@ -64,7 +64,7 @@
   const BAND_MIN_OVERLAP = 0.12;
   // Bump whenever the tile panel changes: it is printed on the quality card so
   // "I still see the old panel" (stale JS in the browser) is unambiguous.
-  const STLU_BUILD = "build 2026-11-08k";
+  const STLU_BUILD = "build 2026-11-13e";
   const SELECT_TILES = "STLU_SelectTiles";
   const REBUILD_PSD = "STLU_RebuildPSD";
   const SAVE_TILES = "STLU_SaveTiles";
@@ -74,16 +74,16 @@
   const WAVE_INDEX = "STLU_WaveIndex";
   const PSD_PREVIEW = "STLU_PSDPreview";
   const SEQ_LOOP = "STLU_SeqTileLoop";
-  // PSD-upscale workflow: finished PSD -> per-part crops -> Qwen edit -> PSD.
-  const PSD_PREPARE = "STLU_PsdPrepare";
+  // PSD-upscale workflow: the batch node expands these helpers per crop.
   const PSD_LOAD_CROP = "STLU_LoadCrop";
   const PSD_CUT = "STLU_CutToLayer";
   const PSD_ASSEMBLE = "STLU_PsdAssemble";
-  const PSD_UPSCALE = "STLU_PsdUpscale";
+  // Minimal PSD-upscale workflow: a loader, a user-input prepare node, and an
+  // execute-only node (mirrors the PSD-edit Prepare/Execute split).
+  const PSD_UPSCALE_PREPARE = "STLU_PsdUpscalePrepare";
+  const PSD_UPSCALE_MIN = "STLU_PsdUpscaleMin";
   // PSD-edit workflow: finished PSD -> per-task crops -> Qwen image edit -> PSD.
   const EDIT_PREPARE = "STLU_EditPrepare";
-  const EDIT_LAYER = "STLU_LayerEdit";
-  const EDIT_ASSEMBLE = "STLU_EditAssemble";
   const editStates = new Set();
   // The PSD-edit panels keep their own set: stlu.psd.* and stlu.edit.* are
   // different notifications, and a shared broadcast set would cross-fire.
@@ -125,6 +125,7 @@
   .stlu-input{flex:1;min-width:0;background:#0e0e0f;color:#eee;border:1px solid #3a3a3a;border-radius:4px;
     padding:4px 7px;font-size:12px;outline:none;}
   .stlu-input:focus{border-color:#4a90e2;}
+  .stlu-input[type=number]{-webkit-appearance:none;appearance:textfield;}
   .stlu-btn{background:#2c2c2e;color:#ddd;border:1px solid #444;border-radius:4px;padding:4px 9px;cursor:pointer;
     font-size:12px;white-space:nowrap;}
   .stlu-btn:hover{background:#38383b;}
@@ -211,24 +212,22 @@
   .stlu-dialog.wide{width:min(1040px,94vw);}
   .stlu-dialog-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #333;}
   .stlu-dialog-head .grow{flex:1;}
+  .stlu-fb-bar{display:flex;gap:8px;padding:10px 12px 6px;}
+  .stlu-fb-roots{display:flex;gap:6px;padding:0 12px 8px;flex-wrap:wrap;}
+  .stlu-fb-list{flex:1;overflow:auto;border-top:1px solid #2a2a2c;background:#18181a;padding:4px 0;
+    min-height:0;}
+  .stlu-fb-row{display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .stlu-fb-row:hover{background:#26262a;}
+  .stlu-fb-row.on{background:rgba(45,108,223,.28);}
+  .stlu-fb-row .size{margin-left:auto;color:#888;font-size:12px;flex:none;}
+  .stlu-fb-foot{display:flex;align-items:center;gap:8px;padding:10px 12px;border-top:1px solid #333;}
+  .stlu-fb-empty{padding:18px;color:#888;text-align:center;}
   .stlu-close{background:none;border:none;color:#aaa;font-size:20px;cursor:pointer;line-height:1;}
-  .stlu-crumbs{padding:6px 12px;border-bottom:1px solid #2a2a2c;display:flex;flex-wrap:wrap;gap:2px;
-    font-size:12px;color:#9a9a9a;align-items:center;}
-  .stlu-crumb{background:none;border:none;color:#6cb6ff;cursor:pointer;padding:1px 2px;font-size:12px;}
   .stlu-tabs{display:flex;gap:6px;padding:6px 12px;border-bottom:1px solid #2a2a2c;}
   .stlu-tab{background:#252527;border:1px solid #3a3a3c;border-radius:4px;color:#bbb;padding:3px 10px;
     font-size:12px;cursor:pointer;}
   .stlu-tab.on{background:rgba(45,108,223,.2);border-color:#2d6cdf;color:#9cc4ff;}
-  .stlu-filelist{flex:1;overflow-y:auto;padding:4px 0;}
-  .stlu-item{display:flex;align-items:center;gap:9px;padding:5px 14px;cursor:pointer;user-select:none;}
-  .stlu-item:hover{background:#2a2a2d;}
-  .stlu-item .icon{width:18px;text-align:center;flex:none;}
-  .stlu-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .stlu-item .tag{font-size:11px;color:#7fb36a;}
-  .stlu-item img{width:34px;height:34px;object-fit:contain;border-radius:3px;
-    background:repeating-conic-gradient(#242426 0% 25%,#1a1a1c 0% 50%) 50%/10px 10px;}
-  .stlu-dialog-foot{display:flex;align-items:center;gap:10px;padding:10px 12px;border-top:1px solid #333;}
-  .stlu-dialog-foot .path{flex:1;color:#9a9a9a;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .stlu-primary{background:#2d6cdf;color:#fff;border:none;border-radius:4px;padding:6px 14px;cursor:pointer;font-size:13px;}
   .stlu-primary:hover{background:#3c7bec;}
   .stlu-prevbox{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;padding:12px;
@@ -445,9 +444,8 @@
   function wavePreview(node) {
     const outDir = String(widgetValue(node, "out_dir", "SeeThrough") || "SeeThrough")
       .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    const group = String(widgetValue(node, "group", "") || "")
-      .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim();
-    return "output/" + outDir + (group ? "/" + group : "") + "/";
+    // 块缓存直接落在根目录下（旧的「分类」层已并入子目录，group 恒空）。
+    return "output/" + outDir + "/";
   }
 
   function previewSrc(preview) {
@@ -468,6 +466,81 @@
     if (w.options) w.options.hidden = true;
     w.draw = () => {};
     for (const linked of w.linkedWidgets || []) hideWidget(linked);
+  }
+
+  // All onConfigure work goes through one chain: an instance property shadows
+  // the prototype, so a second ``node.onConfigure = ...`` would silently drop
+  // the first one.  Hooks run in the order they were added.
+  const configureHooks = new WeakMap();
+  function addConfigureHook(node, fn) {
+    let hooks = configureHooks.get(node);
+    if (!hooks) {
+      hooks = [];
+      configureHooks.set(node, hooks);
+      const old = node.onConfigure;
+      node.onConfigure = function (info) {
+        const result = old ? old.apply(this, arguments) : undefined;
+        for (const hook of hooks.slice()) {
+          try { hook(this, info); } catch (e) { console.warn("[STLU] onConfigure", e); }
+        }
+        return result;
+      };
+    }
+    hooks.push(fn);
+  }
+
+  // LiteGraph restores ``widgets_values`` BY POSITION.  A saved array that
+  // predates a widget (the seed's control_after_generate, a newly added field)
+  // shifts every later value onto the wrong widget; the workflow also carries
+  // ``widgets_values_named``, so write those back by name after configure.
+  function applyNamedWidgetValues(node, info) {
+    const named = info && info.widgets_values_named;
+    if (!named || typeof named !== "object") return;
+    const all = [];
+    for (const w of node.widgets || []) {
+      if (!w) continue;
+      all.push(w);
+      for (const linked of w.linkedWidgets || []) if (linked) all.push(linked);
+    }
+    for (const w of all) {
+      if (!Object.prototype.hasOwnProperty.call(named, w.name)) continue;
+      const raw = named[w.name];
+      const cur = w.value;
+      let value;
+      if (typeof cur === "number") {
+        value = typeof raw === "number" ? raw : parseFloat(raw);
+        if (!Number.isFinite(value)) continue;
+      } else if (typeof cur === "boolean") {
+        value = raw === true || raw === "true" || raw === 1 || raw === "1";
+      } else {
+        value = raw == null ? "" : String(raw);
+      }
+      if (w.value !== value) w.value = value;
+    }
+    if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
+  }
+
+  // ComfyUI 会在名为 seed 的控件后面自动挂一个 control_after_generate；值为
+  // randomize 时每次排队都会换种子。种子只由面板的「随机」按钮改，所以这里
+  // 统一钉成 fixed 并隐藏（值仍会序列化）。onConfigure 在 onNodeCreated 之后
+  // 才回填存档值，必须再钉一次，否则老工作流会把 randomize 写回来。
+  function pinSeedControl(node) {
+    if (!node) return;
+    const pin = () => {
+      for (const w of node.widgets || []) {
+        const ctrls = [];
+        if (w && w.name === "control_after_generate") ctrls.push(w);
+        for (const linked of (w && w.linkedWidgets) || []) {
+          if (linked && linked.name === "control_after_generate") ctrls.push(linked);
+        }
+        for (const ctrl of ctrls) {
+          if (ctrl.value !== "fixed") ctrl.value = "fixed";
+          hideWidget(ctrl);
+        }
+      }
+    };
+    pin();
+    addConfigureHook(node, pin);
   }
 
   // Locked nodes are the fixed pipeline: parameters come from the input node,
@@ -556,6 +629,17 @@
     return links[id] || null;
   }
 
+  // Used by pickFolderNative: strip a leading drive/root and a trailing
+  // filename, leaving a workspace-relative folder.
+  function cleanRel(value) {
+    let rel = String(value || "").replace(/\\/g, "/").trim();
+    if (/^[a-zA-Z]:/.test(rel) || rel.startsWith("/")) rel = "";
+    if (/\.(json|png|jpe?g|webp|psd)$/i.test(rel)) {
+      rel = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+    }
+    return rel.replace(/^\.?\/+/, "").replace(/\/+$/, "");
+  }
+
   async function openPath(path, file) {
     try {
       await getJson("/stlu/" + (file ? "open" : "reveal") + "?path=" + encodeURIComponent(path || ""));
@@ -566,16 +650,38 @@
 
   function addDOM(node, name, root, minHeight, maxHeight) {
     if (typeof node.addDOMWidget !== "function") return null;
+    // The frontend sizes a DOM widget by calling getComputedStyle(element)
+    // inside computeLayoutSize(); a non-Element there throws "parameter 1 is
+    // not of type 'Element'" and takes the whole workflow load down with it.
+    // Every caller passes a real div today, but the guard is free and turns a
+    // hard crash into a correctly sized panel.
+    if (!(root instanceof Element)) root = document.createElement("div");
+    const minHeightFn = typeof minHeight === "function" ? minHeight : () => minHeight;
+    const maxHeightFn = typeof maxHeight === "number" ? () => maxHeight : undefined;
     const dom = node.addDOMWidget(name, name, root, {
       serialize: false,
       hideOnZoom: false,
-      getMinHeight: typeof minHeight === "function" ? minHeight : () => minHeight,
-      getMaxHeight: typeof maxHeight === "number" ? () => maxHeight : undefined,
+      getMinHeight: minHeightFn,
+      getMaxHeight: maxHeightFn,
     });
     if (dom) {
       dom.serialize = false;
       dom.options = dom.options || {};
       dom.options.serialize = false;
+      // Second line of defence: element can go missing (panel removed, graph
+      // reconfigured).  Fall back to our own min/max instead of letting the
+      // frontend measure a non-element.
+      const layoutSize = dom.computeLayoutSize;
+      const fallback = () => ({
+        minHeight: Number(minHeightFn()) || 0,
+        maxHeight: maxHeightFn ? maxHeightFn() : 1e4,
+        minWidth: 0,
+      });
+      dom.computeLayoutSize = function (owner) {
+        const element = dom.element;
+        if (!element || element.nodeType !== 1) return fallback();
+        return layoutSize ? layoutSize.call(this, owner) : fallback();
+      };
     }
     const m = i18n();
     if (m && m.enabled && root) m.watch(root);
@@ -590,6 +696,15 @@
     if (!rel) return "";
     return apiUrl("/stlu/thumb?scope=output&path=" + encodeURIComponent(rel) +
       "&size=" + (size || 128) + "&v=" + SESSION_V);
+  }
+
+  // Thumbnail for a file the user picked anywhere (UNC share, another disk):
+  // /stlu/thumb only serves the workspace scopes, so those files had no
+  // preview at all.  ``stamp`` busts the browser cache when the choice changes.
+  function localThumbUrl(abs, size, stamp) {
+    if (!abs) return "";
+    return apiUrl("/stlu/local_thumb?path=" + encodeURIComponent(abs) +
+      "&size=" + (size || 128) + "&v=" + (stamp == null ? SESSION_V : stamp));
   }
 
   function fmtWhen(ms) {
@@ -675,7 +790,8 @@
       source,
       grid: gridRef,
       out_dir: String(widgetValue(node, "out_dir", "SeeThrough") || "SeeThrough"),
-      group: String(widgetValue(node, "group", "") || "").trim(),
+      // 「分类」已废弃：一律空，目录只由 out_dir 决定。
+      group: "",
       tiles: parseIndexList(widgetValue(node, "tiles", "")),
       name: String(widgetValue(node, "filename_prefix", "tile") || "tile"),
       merge_parts: !!widgetValue(node, "merge_parts", true),
@@ -716,6 +832,13 @@
     for (const fn of Array.from(mergeStates)) {
       try { fn(data); } catch (e) { console.warn("[STLU] merge panel", e); }
     }
+  }
+
+  // ① 用户输入节点上的「子目录」：合并成品写到 <运行目录>/<子目录>/<合并名>/。
+  function settingsSubDirForMerge() {
+    const settings = allNodes().find(
+      (n) => n && (n.type === PIPELINE_SETTINGS || n.type === PIPELINE));
+    return settings ? String(widgetValue(settings, "sub_dir", "") || "") : "";
   }
 
   // -------------------------------------------------------------------------
@@ -879,6 +1002,7 @@
         const data = await postJson("/stlu/tiles/merge-mixed", {
           entries,
           name: "merged_mixed",
+          sub_dir: settingsSubDirForMerge(),
           group_layers: !!widgetValue(mergeNode, "group_layers", false),
           include_depth: !!widgetValue(mergeNode, "include_depth", false),
           include_original: !!widgetValue(mergeNode, "include_original", false),
@@ -941,267 +1065,161 @@
   }
 
   /**
-   * opts = {
-   *   title, mode: "folder"|"image"|"workflow",
-   *   scopes: [{scope, label}], start,
-   *   onPick(rel, abs, file)
-   * }
+   * The in-app browser behind every browse button.  Folder picks stay inside
+   * ComfyUI's output tree (those widgets store output-relative paths); file
+   * picks may go anywhere, including network shares typed into the path bar.
    */
-  function openPicker(opts) {
-    const { dialog, close } = openOverlay();
-    const head = el("div", "stlu-dialog-head");
-    head.appendChild(el("strong", "grow", opts.title || "选择"));
-    head.appendChild(closeButton(close));
-    dialog.appendChild(head);
-
-    const scopes = opts.scopes && opts.scopes.length ? opts.scopes : [{ scope: "output", label: "输出目录" }];
-    let scope = scopes[0].scope;
-    let current = cleanRel(opts.start);
-    let tabsEl = null;
-    if (scopes.length > 1) {
-      tabsEl = el("div", "stlu-tabs");
-      for (const s of scopes) {
-        const b = el("button", "stlu-tab", s.label);
-        b.dataset.scope = s.scope;
-        b.addEventListener("click", () => {
-          scope = s.scope;
-          current = "";
-          for (const child of tabsEl.children) child.classList.toggle("on", child.dataset.scope === scope);
-          nav("");
-        });
-        tabsEl.appendChild(b);
-      }
-      tabsEl.firstChild.classList.add("on");
-      dialog.appendChild(tabsEl);
-    }
-
-    const isImageMode = opts.mode === "image";
-    const crumbsEl = el("div", "stlu-crumbs");
-    const listEl = el("div", "stlu-filelist");
-    const foot = el("div", "stlu-dialog-foot");
-    const pathEl = el("span", "path");
-    foot.appendChild(pathEl);
-    if (opts.mode === "folder") {
-      const use = el("button", "stlu-primary", "使用此文件夹");
-      use.addEventListener("click", () => {
-        const rel = current;
-        close();
-        opts.onPick(rel, null, null);
-      });
-      foot.appendChild(use);
-    }
-    dialog.appendChild(crumbsEl);
-    if (isImageMode) {
-      const note = el("div", "stlu-hint");
-      note.style.padding = "0 14px 4px";
-      note.textContent = "LoadImage 只读取 input 根目录；子文件夹里的图请先上传或移动到根目录。";
-      dialog.appendChild(note);
-    }
-    dialog.appendChild(listEl);
-    dialog.appendChild(foot);
-
-    function cleanRel(value) {
-      let rel = String(value || "").replace(/\\/g, "/").trim();
-      if (/^[a-zA-Z]:/.test(rel) || rel.startsWith("/")) rel = "";
-      if (/\.(json|png|jpe?g|webp|psd)$/i.test(rel)) {
-        rel = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
-      }
-      return rel.replace(/^\.?\/+/, "").replace(/\/+$/, "");
-    }
-
-    function pickFile(file) {
-      close();
-      opts.onPick(file.rel, file.abs || null, file);
-    }
-
-    async function nav(rel) {
-      listEl.innerHTML = "";
-      listEl.appendChild(el("div", "stlu-item", "加载中…"));
-      let data;
-      try {
-        data = await getJson(
-          "/stlu/ls?scope=" + encodeURIComponent(scope) + "&path=" + encodeURIComponent(rel || "")
-        );
-      } catch (e) {
-        listEl.innerHTML = "";
-        const err = el("div", "stlu-item");
-        err.appendChild(el("span", "icon", "⚠"));
-        err.appendChild(el("span", "name", "无法读取：" + e.message));
-        listEl.appendChild(err);
-        return;
-      }
-      current = data.path || "";
-      pathEl.textContent = (scope === "input" ? "input/" : scope === "workflows" ? "workflows/" : "output/") +
-        (current ? current + "/" : "");
-
-      crumbsEl.innerHTML = "";
-      const crumb = (label, target) => {
-        const b = el("button", "stlu-crumb", label);
-        b.addEventListener("click", () => nav(target));
-        crumbsEl.appendChild(b);
-      };
-      crumb(scope === "input" ? "input" : scope === "workflows" ? "workflows" : "output", "");
-      let acc = "";
-      for (const part of current ? current.split("/") : []) {
-        acc = acc ? acc + "/" + part : part;
-        crumbsEl.appendChild(el("span", null, "/"));
-        crumb(part, acc);
-      }
-
-      listEl.innerHTML = "";
-      if (!isImageMode && !data.at_root) {
-        const up = el("div", "stlu-item");
-        up.appendChild(el("span", "icon", "⬆"));
-        up.appendChild(el("span", "name", "上一级"));
-        up.addEventListener("click", () => nav(data.parent || ""));
-        listEl.appendChild(up);
-      }
-      if (!isImageMode) {
-        for (const dir of data.dirs || []) {
-          const item = el("div", "stlu-item");
-          item.appendChild(el("span", "icon", "📁"));
-          item.appendChild(el("span", "name", dir.name));
-          item.addEventListener("click", () => nav(dir.rel));
-          listEl.appendChild(item);
-        }
-      }
-      for (const file of data.files || []) {
-        const item = el("div", "stlu-item");
-        if (file.thumb) {
-          const img = document.createElement("img");
-          img.loading = "lazy";
-          img.src = apiUrl(file.thumb);
-          img.addEventListener("error", () => { img.style.visibility = "hidden"; });
-          item.appendChild(img);
-        } else {
-          item.appendChild(el("span", "icon", file.is_layers ? "🧩" : "📄"));
-        }
-        item.appendChild(el("span", "name", file.name));
-        const tag = el("span", "tag",
-          file.is_layers ? "layers.json" : file.is_workflow ? "工作流"
-            : file.is_json ? "输入存档" : file.is_image ? "图片" : fmtBytes(file.size));
-        item.appendChild(tag);
-        if (opts.mode === "folder") {
-          if (file.is_layers) {
-            item.addEventListener("click", () => {
-              const parent = file.rel.includes("/") ? file.rel.slice(0, file.rel.lastIndexOf("/")) : "";
-              close();
-              opts.onPick(parent, null, file);
-            });
-          }
-        } else if (opts.mode === "image" && file.is_image) {
-          item.addEventListener("click", () => pickFile(file));
-        } else if (opts.mode === "json" && file.is_json) {
-          item.addEventListener("click", () => pickFile(file));
-        } else if (opts.mode === "workflow" && file.is_workflow) {
-          item.addEventListener("click", () => pickFile(file));
-        }
-        listEl.appendChild(item);
-      }
-      if (!(data.dirs || []).length && !(data.files || []).length) {
-        const empty = el("div", "stlu-item");
-        empty.appendChild(el("span", "icon", "·"));
-        empty.appendChild(el("span", "name", "空文件夹"));
-        listEl.appendChild(empty);
-      }
-    }
-
-    nav(current);
+  function pickFolderNative(opts) {
+    openPickBrowser({
+      title: opts.title || "选择文件夹",
+      mode: "dir",
+      start: cleanRel(opts.start || ""),
+      onPick: (item) => opts.onPick(item.rel || ""),
+    });
   }
 
-  // Browser for files outside output/input/workflows: the finished PSD lives
-  // in the user's own artwork folder, which /stlu/ls cannot reach.  Talks to
-  // /stlu/fs_ls, an absolute-path listing that only reads names and sizes.
-  // opts = { title, mode: "psd" | "image", start, onPick(abs, file) }
-  function openFsPicker(opts) {
-    const { dialog, close } = openOverlay();
+  function pickFileNative(opts) {
+    openPickBrowser({
+      title: opts.title || "选择文件",
+      mode: "file",
+      kind: opts.kind || "image",
+      start: String(opts.start || "").trim(),
+      onPick: (item) => opts.onPick(item.path, item.rel || ""),
+    });
+  }
+
+  function openPickBrowser(opts) {
+    const isDir = opts.mode === "dir";
+    const { dialog, close } = openOverlay("stlu-fb");
     const head = el("div", "stlu-dialog-head");
-    head.appendChild(el("strong", "grow", opts.title || "选择文件"));
+    head.appendChild(el("strong", "grow", opts.title || "浏览"));
     head.appendChild(closeButton(close));
-    dialog.appendChild(head);
 
-    const crumbsEl = el("div", "stlu-crumbs");
-    const listEl = el("div", "stlu-filelist");
-    const foot = el("div", "stlu-dialog-foot");
-    const pathEl = el("span", "path");
-    foot.appendChild(pathEl);
-    dialog.appendChild(crumbsEl);
-    dialog.appendChild(listEl);
-    dialog.appendChild(foot);
+    const bar = el("div", "stlu-fb-bar");
+    const pathInput = el("input", "stlu-input");
+    pathInput.placeholder = isDir
+      ? "output 目录内的路径，回车前往"
+      : "路径可粘贴 \\\\NAS\\共享 或 C:\\...，回车前往";
+    const goBtn = el("button", "stlu-btn", "前往");
+    bar.append(pathInput, goBtn);
 
-    const wantImage = opts.mode === "image";
+    const rootsRow = el("div", "stlu-fb-roots");
+    const body = el("div", "stlu-fb-list");
+    const foot = el("div", "stlu-fb-foot");
+    const status = el("span", "stlu-hint");
+    status.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
+      "white-space:nowrap;";
+    const cancelBtn = el("button", "stlu-btn", "取消");
+    const okBtn = el("button", "stlu-btn primary", isDir ? "选择此文件夹" : "选择");
+    okBtn.disabled = true;
+    foot.append(status, cancelBtn, okBtn);
+    dialog.append(head, bar, rootsRow, body, foot);
 
-    function pick(file) {
-      close();
-      opts.onPick(file.abs, file);
+    let state = null;
+    let selected = null;
+
+    function setStatus(text, bad) {
+      status.textContent = text || "";
+      status.style.color = bad ? "#e06c6c" : "";
+      status.title = text || "";
     }
 
-    async function nav(path) {
-      listEl.innerHTML = "";
-      listEl.appendChild(el("div", "stlu-item", "加载中…"));
-      let data;
+    function syncOk() {
+      okBtn.disabled = isDir ? !state : !selected;
+    }
+
+    async function load(path) {
+      state = null;
+      selected = null;
+      okBtn.disabled = true;
+      body.textContent = "";
+      body.appendChild(el("div", "stlu-fb-empty", "读取中…"));
+      setStatus("");
       try {
-        data = await getJson("/stlu/fs_ls?path=" + encodeURIComponent(path || "") +
-          (wantImage ? "&ext=image" : ""));
-      } catch (e) {
-        listEl.innerHTML = "";
-        const err = el("div", "stlu-item");
-        err.appendChild(el("span", "icon", "⚠"));
-        err.appendChild(el("span", "name", "无法读取：" + e.message));
-        listEl.appendChild(err);
-        return;
-      }
-      const here = data.path || "";
-      pathEl.textContent = here || "此电脑";
-      pathEl.title = here;
-
-      crumbsEl.innerHTML = "";
-      const crumb = (label, target) => {
-        const b = el("button", "stlu-crumb", label);
-        b.addEventListener("click", () => nav(target));
-        crumbsEl.appendChild(b);
-      };
-      crumb("💻 此电脑", "");
-      const parts = here ? here.replace(/\\/g, "/").replace(/\/+$/, "").split("/") : [];
-      let acc = "";
-      for (const part of parts) {
-        acc = acc ? acc + "/" + part : (/^[A-Za-z]:$/.test(part) ? part + "/" : part);
-        crumbsEl.appendChild(el("span", null, "/"));
-        crumb(part, acc);
-      }
-
-      listEl.innerHTML = "";
-      if (here) {
-        const up = el("div", "stlu-item");
-        up.appendChild(el("span", "icon", "⬆"));
-        up.appendChild(el("span", "name", "上一级"));
-        up.addEventListener("click", () => nav(data.parent || ""));
-        listEl.appendChild(up);
-      }
-      for (const dir of data.dirs || []) {
-        const item = el("div", "stlu-item");
-        item.appendChild(el("span", "icon", "📁"));
-        item.appendChild(el("span", "name", dir.name));
-        item.addEventListener("click", () => nav(dir.rel));
-        listEl.appendChild(item);
-      }
-      for (const file of data.files || []) {
-        const item = el("div", "stlu-item");
-        item.appendChild(el("span", "icon", file.is_image ? "🖼" : "📄"));
-        item.appendChild(el("span", "name", file.name));
-        item.appendChild(el("span", "tag", file.is_psd ? "PSD" : fmtBytes(file.size)));
-        item.addEventListener("click", () => pick(file));
-        listEl.appendChild(item);
-      }
-      if (!(data.dirs || []).length && !(data.files || []).length) {
-        const empty = el("div", "stlu-item");
-        empty.appendChild(el("span", "icon", "·"));
-        empty.appendChild(el("span", "name", "空文件夹"));
-        listEl.appendChild(empty);
+        const data = await getJson("/stlu/browse?mode=" + (isDir ? "dir" : "file") +
+          "&kind=" + encodeURIComponent(opts.kind || "image") +
+          "&path=" + encodeURIComponent(path || ""));
+        state = data;
+        pathInput.value = data.path;
+        render();
+      } catch (error) {
+        body.textContent = "";
+        body.appendChild(el("div", "stlu-fb-empty", "读取失败：" +
+          (error && error.message ? error.message : error)));
+        setStatus("", true);
       }
     }
 
-    nav(opts.start ? absDirOf(opts.start) : "");
+    function addRow(icon, name, onClick, size) {
+      const row = el("div", "stlu-fb-row");
+      row.appendChild(el("span", "", icon));
+      const label = el("span", "", name);
+      label.style.cssText = "overflow:hidden;text-overflow:ellipsis;";
+      row.appendChild(label);
+      if (size != null) row.appendChild(el("span", "size", fmtBytes(size)));
+      row.title = name;
+      row.addEventListener("click", onClick);
+      body.appendChild(row);
+      return row;
+    }
+
+    function render() {
+      body.textContent = "";
+      rootsRow.textContent = "";
+      (state.roots || []).forEach((root) => {
+        const base = root.path.replace(/[\\/]+$/, "").toLowerCase();
+        const here = String(state.path || "").toLowerCase();
+        const on = base && (here === base || here.startsWith(base + "\\")
+          || here.startsWith(base + "/"));
+        const btn = el("button", "stlu-tab" + (on ? " on" : ""), root.name);
+        btn.addEventListener("click", () => load(root.path));
+        rootsRow.appendChild(btn);
+      });
+      if (state.parent) addRow("⇧", "上级目录", () => load(state.parent));
+      (state.dirs || []).forEach((dir) => addRow("📁", dir.name, () => load(dir.path)));
+      (state.files || []).forEach((file) => {
+        let rowEl = null;
+        const pick = () => {
+          selected = file;
+          Array.prototype.forEach.call(body.children, (n) => n.classList.remove("on"));
+          if (rowEl) rowEl.classList.add("on");
+          setStatus(file.path);
+          syncOk();
+        };
+        rowEl = addRow("📄", file.name, pick, file.size);
+        rowEl.addEventListener("dblclick", () => { pick(); confirm(); });
+        if (!isDir && state.select && file.name === state.select) pick();
+      });
+      if (!body.firstChild) {
+        body.appendChild(el("div", "stlu-fb-empty",
+          isDir ? "没有子文件夹" : "这里没有匹配的文件"));
+      }
+      setStatus(isDir
+        ? (state.rel ? "→ " + state.rel : "→ output 根目录")
+        : (selected ? selected.path : state.path));
+      syncOk();
+    }
+
+    function confirm() {
+      if (isDir) {
+        if (!state) return;
+        close();
+        opts.onPick({ path: state.path, rel: state.rel || "" });
+      } else {
+        if (!selected) return;
+        close();
+        opts.onPick({ path: selected.path, rel: selected.rel || "" });
+      }
+    }
+
+    goBtn.addEventListener("click", () => load(pathInput.value.trim()));
+    pathInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); load(pathInput.value.trim()); }
+    });
+    cancelBtn.addEventListener("click", close);
+    okBtn.addEventListener("click", confirm);
+
+    load(opts.start || "");
   }
 
   // Absolute-path helpers for the PSD panels.
@@ -1215,6 +1233,17 @@
     const text = String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
     const cut = text.lastIndexOf("/");
     return cut >= 0 ? text.slice(cut + 1) : text;
+  }
+
+  // ③/④ 的 assembled 事件既带 *_count 也带名字数组；优先用计数，回退到数组长度。
+  function psdCountOf(data, key) {
+    if (!data) return 0;
+    const n = Number(data[key + "_count"]);
+    if (Number.isFinite(n)) return n;
+    const list = data[key];
+    if (Array.isArray(list)) return list.length;
+    const m = Number(list);
+    return Number.isFinite(m) ? m : 0;
   }
 
   // Open / reveal an absolute path (PSD source, output folder) in the OS.
@@ -1250,7 +1279,6 @@
 
     const outWidget = widgetOf(node, "out_dir");
     const srcWidget = widgetOf(node, "source");
-    const groupWidget = widgetOf(node, "group");
     const tilesWidget = widgetOf(node, "tiles");
 
     const root = el("div", "stlu-panel");
@@ -1297,18 +1325,8 @@
     root.appendChild(el("div", "stlu-hint",
       "每块都保存 depth 数据和左右/前后子层；是否导出 depth 由 ④ 决定。"));
 
-    // --- group prefix + output root --------------------------------------
-    const groupLine = el("div", "stlu-line");
-    groupLine.appendChild(el("span", "stlu-label", "分类前缀"));
-    const groupInput = el("input", "stlu-input");
-    groupInput.placeholder = "可留空 → SeeThrough/<本次 id>/";
-    groupInput.value = groupWidget ? String(groupWidget.value || "") : "";
-    groupInput.addEventListener("change", () => {
-      if (groupWidget) setWidget(node, "group", groupInput.value.trim());
-    });
-    groupLine.appendChild(groupInput);
-    root.appendChild(groupLine);
-
+    // --- output root ------------------------------------------------------
+    // 「分类前缀」已废弃（分类并入子目录）；group widget 仍隐藏保留以兼容旧工作流。
     const dirLine = el("div", "stlu-line");
     dirLine.appendChild(el("span", "stlu-label", "输出根目录"));
     const dirText = el("span", "stlu-hint grow");
@@ -1316,19 +1334,16 @@
     dirText.title = dirText.textContent;
     dirLine.appendChild(dirText);
     const pickBtn = el("button", "stlu-btn", "选择…");
-    pickBtn.addEventListener("click", () => {
-      openPicker({
-        title: "选择输出根目录",
-        mode: "folder",
-        start: outWidget ? outWidget.value : "",
-        onPick: (rel) => {
-          if (!outWidget) return;
-          setWidget(node, "out_dir", rel || "SeeThrough");
-          dirText.textContent = outWidget.value;
-          dirText.title = outWidget.value;
-        },
-      });
-    });
+    pickBtn.addEventListener("click", () => pickFolderNative({
+      title: "选择输出根目录",
+      start: outWidget ? outWidget.value : "",
+      onPick: (rel) => {
+        if (!outWidget) return;
+        setWidget(node, "out_dir", rel || "SeeThrough");
+        dirText.textContent = outWidget.value;
+        dirText.title = outWidget.value;
+      },
+    }));
     dirLine.appendChild(pickBtn);
     root.appendChild(dirLine);
     if (outWidget) {
@@ -1460,20 +1475,16 @@
       }
     }
 
-    srcPick.addEventListener("click", () => {
-      openPicker({
-        title: "选择图片波次文件夹（③ 的图片来源）",
-        mode: "folder",
-        scopes: [{ scope: "output", label: "输出目录" }],
-        start: String(widgetValue(node, "source", "") || ""),
-        onPick: (rel) => {
-          setWidget(node, "source", rel || "");
-          setWidget(node, "tiles", "");
-          refreshTilesPanels();
-          refreshSource(true);
-        },
-      });
-    });
+    srcPick.addEventListener("click", () => pickFolderNative({
+      title: "选择图片波次文件夹（③ 的图片来源）",
+      start: String(widgetValue(node, "source", "") || ""),
+      onPick: (rel) => {
+        setWidget(node, "source", rel || "");
+        setWidget(node, "tiles", "");
+        refreshTilesPanels();
+        refreshSource(true);
+      },
+    }));
     srcLive.addEventListener("click", () => {
       setWidget(node, "source", "");
       setWidget(node, "tiles", "");
@@ -1495,14 +1506,6 @@
       tilesWidget.callback = function () {
         const r = oldCb ? oldCb.apply(this, arguments) : undefined;
         refreshSource();
-        return r;
-      };
-    }
-    if (groupWidget) {
-      const oldCb = groupWidget.callback;
-      groupWidget.callback = function () {
-        const r = oldCb ? oldCb.apply(this, arguments) : undefined;
-        groupInput.value = String(groupWidget.value || "");
         return r;
       };
     }
@@ -2328,10 +2331,12 @@
     // card and initialises those bindings.  Declaring them later put them in
     // the temporal dead zone and aborted the whole ① panel on load.
     const pipelineControls = isPipeline ? buildPipelineControls() : null;
-    if (pipelineControls && pipelineControls.modeCard) {
-      // Mode is the first decision; keep it above the preview instead of
-      // burying it below the grid and canvas.
-      root.insertBefore(pipelineControls.modeCard, infoLine);
+    if (pipelineControls && pipelineControls.topCards) {
+      // 分区方式 → 切格/自定义窗口 是决定分区结果的前置输入，放在摘要与
+      // 画布之上；网格+画布只当结果预览。
+      for (const cardEl of pipelineControls.topCards) {
+        root.insertBefore(cardEl, infoLine);
+      }
     }
 
     function isCustomMode() {
@@ -3200,11 +3205,9 @@
     }
 
     function outputDirRel() {
-      const out = String(widgetValue(node, "out_dir", "SeeThrough") || "SeeThrough")
+      // 运行/缓存目录只由 out_dir 决定（「分类」已并入子目录，group 恒空）。
+      return String(widgetValue(node, "out_dir", "SeeThrough") || "SeeThrough")
         .replace(/^[\\/]+|[\\/]+$/g, "");
-      const grp = String(widgetValue(node, "group", "") || "")
-        .replace(/^[\\/]+|[\\/]+$/g, "");
-      return grp ? out + "/" + grp : out;
     }
 
     let lastCacheKey = "";
@@ -4446,37 +4449,39 @@
       });
       outRow.appendChild(outInput);
       const browseBtn = el("button", "stlu-btn", "浏览…");
-      browseBtn.addEventListener("click", () => {
-        openPicker({
-          title: "选择输出根目录",
-          mode: "folder",
-          scopes: [{ scope: "output", label: "输出目录" }],
-          start: String(widgetValue(node, "out_dir", "") || ""),
-          onPick: (rel) => {
-            setWidget(node, "out_dir", rel || "SeeThrough");
-            if (outInput) outInput.value = String(widgetValue(node, "out_dir", "SeeThrough"));
-            updateOut();
-          },
-        });
-      });
+      browseBtn.addEventListener("click", () => pickFolderNative({
+        title: "选择输出根目录",
+        start: String(widgetValue(node, "out_dir", "") || ""),
+        onPick: (rel) => {
+          setWidget(node, "out_dir", rel || "SeeThrough");
+          if (outInput) outInput.value = String(widgetValue(node, "out_dir", "SeeThrough"));
+          updateOut();
+        },
+      }));
       outRow.appendChild(browseBtn);
       output.appendChild(outRow);
       line(output, [
-        { label: "分类（可空）", name: "group", fallback: "", kind: "text", onChange: updateOut },
+        { label: "子目录（可空）", name: "sub_dir", fallback: "", kind: "text", onChange: updateOut },
         { label: "分块前缀", name: "filename_prefix", fallback: "tile", kind: "text" },
       ]);
+      // 「分类」已并入子目录：隐藏旧 widget；值仍保留在节点里，旧工作流照常加载。
+      hideWidget(widgetOf(node, "group"));
       const outLine = el("div", "stlu-hint");
       outLine.style.wordBreak = "break-all";
       output.appendChild(outLine);
+      // 合并成品位置：<切块目录>/<子目录>/<合并名>/<合并名>.psd
+      const mergedLine = el("div", "stlu-hint");
+      mergedLine.style.wordBreak = "break-all";
+      output.appendChild(mergedLine);
 
       const clearRow = el("div", "stlu-line");
       const clearBtn = el("button", "stlu-btn", "清空此目录");
-      clearBtn.title = "删除该目录里本流水线生成的切块 PSD、预览、depth、manifest 和 images/；"
-        + "你自己放进去的其他文件会保留。";
+      clearBtn.title = "删除该目录里本流水线生成的切块 PSD、预览、depth、manifest、images/，"
+        + "以及已合并输出的子目录（子目录/合并名/）；你自己放进去的其他文件会保留。";
       clearBtn.addEventListener("click", async () => {
         const dir = outputDirRel();
         if (!dir) return;
-        if (!window.confirm(tr("清空 " + dir + " 里已生成的切块结果？此操作不可撤销。"))) return;
+        if (!window.confirm(tr("清空 " + dir + " 里已生成的切块与合并结果（含子目录里的成品）？此操作不可撤销。"))) return;
         clearBtn.disabled = true;
         try {
           const data = await postJson("/stlu/tiles/clear", { dir });
@@ -4560,9 +4565,9 @@
         let applied = 0;
         for (const name of Object.keys(widgets)) {
           if (name === "control_after_generate" || name.charAt(0) === "_") continue;
-          // 输出位置由「读的是哪个文件夹」决定：存档不覆盖 out_dir/group，
+          // 输出位置由「读的是哪个文件夹」决定：存档不覆盖 out_dir/sub_dir，
           // 否则复制过的存档会把面板带到别的目录，来回自动读取。
-          if (name === "out_dir" || name === "group") continue;
+          if (name === "out_dir" || name === "sub_dir") continue;
           if (setWidget(node, name, widgets[name])) applied++;
         }
         if (!applied) throw new Error("存档里没有能应用的参数");
@@ -4684,22 +4689,21 @@
         widgetOf(node, "out_dir") ? outputDirRel() : ""));
       loadNow.addEventListener("click", () => loadPresetFromDir(
         widgetOf(node, "out_dir") ? outputDirRel() : ""));
-      saveAs.addEventListener("click", () => {
-        openPicker({
-          title: "把输入存档存到哪个文件夹",
-          mode: "folder",
-          scopes: [{ scope: "output", label: "输出目录" }],
-          start: String(widgetValue(node, "out_dir", "") || ""),
-          onPick: (rel) => { savePresetToDir(rel || ""); },
-        });
-      });
+      saveAs.addEventListener("click", () => pickFolderNative({
+        title: "把输入存档存到哪个文件夹",
+        start: String(widgetValue(node, "out_dir", "") || ""),
+        onPick: (rel) => { savePresetToDir(rel || ""); },
+      }));
       importBtn.addEventListener("click", () => {
-        openPicker({
+        pickFileNative({
           title: "导入输入存档（JSON）",
-          mode: "json",
-          scopes: [{ scope: "output", label: "输出目录" }],
+          kind: "json",
           start: String(widgetValue(node, "out_dir", "") || ""),
-          onPick: async (rel) => {
+          onPick: async (abs, rel) => {
+            if (!rel) {
+              setPresetHint("只能导入 output 目录里面的 JSON 存档。", "error");
+              return;
+            }
             try {
               const data = await getJson(
                 "/stlu/preset_file?path=" + encodeURIComponent(rel));
@@ -4715,12 +4719,21 @@
         : "设置「输出根目录」后，参数会自动存进那个文件夹，换文件夹时自动读回。", "");
 
       function updateOut() {
-        outLine.textContent = "→ " + wavePreview(node) +
+        const base = wavePreview(node);
+        outLine.textContent = "→ 切块 " + base +
           "（直接写入所选文件夹；已有的块会复用，只重跑勾选的块）";
+        const sub = String(widgetValue(node, "sub_dir", "") || "").trim()
+          .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "") || "";
+        const mergeName = String(widgetValue(node, "merge_name", "merged") || "").trim() || "merged";
+        mergedLine.textContent = "→ 合并 " + base + (sub ? sub + "/" : "") +
+          mergeName + "/" + mergeName + ".psd";
       }
+      watchValue(node, "sub_dir", updateOut);
+      watchValue(node, "merge_name", updateOut);
 
       const mergeBox = card("合并");
-      line(mergeBox, [{ label: "合并文件名", name: "merge_name", fallback: "merged", kind: "text" }]);
+      line(mergeBox, [{ label: "合并文件名", name: "merge_name", fallback: "merged",
+                        kind: "text", onChange: updateOut }]);
       const mergeModeRow = el("div", "stlu-line");
       mergeModeRow.style.flexWrap = "wrap";
       const groupCb = check(mergeModeRow, "同名图层单独成组（不裁剪）", "group_layers", true,
@@ -4759,6 +4772,8 @@
       }
       groupCb.addEventListener("change", paintMergeHint);
       paintMergeHint();
+      // 合并和输出位置一起读：把合并卡提到输出位置之后、输入存档之前。
+      root.insertBefore(mergeBox, presetCard);
 
       // 说明文字统一收在最下面的折叠区。
       root.appendChild(detailsCard);
@@ -4813,7 +4828,7 @@
         updateOut();
       }
       sync();
-      return { sync, applyMode, modeCard, pollPreset };
+      return { sync, applyMode, topCards: [modeCard, cut, customCard], pollPreset };
     }
 
     const dom = addDOM(node, "stlu_tile_grid_card", root,
@@ -5299,19 +5314,15 @@
 
     let psdPath = "";
 
-    pickBtn.addEventListener("click", () => {
-      openPicker({
-        title: "分层 PSD 写到哪个目录",
-        mode: "folder",
-        scopes: [{ scope: "output", label: "输出目录" }],
-        start: String(widgetValue(node, "out_dir", "") || ""),
-        onPick: (rel) => {
-          setWidget(node, "out_dir", rel || "SeeThrough/MaskLayers");
-          dirLine.textContent = "输出目录：output/" +
-            String(widgetValue(node, "out_dir", "") || "");
-        },
-      });
-    });
+    pickBtn.addEventListener("click", () => pickFolderNative({
+      title: "分层 PSD 写到哪个目录",
+      start: String(widgetValue(node, "out_dir", "") || ""),
+      onPick: (rel) => {
+        setWidget(node, "out_dir", rel || "SeeThrough/MaskLayers");
+        dirLine.textContent = "输出目录：output/" +
+          String(widgetValue(node, "out_dir", "") || "");
+      },
+    }));
 
     openBtn.addEventListener("click", () => {
       if (psdPath) openPath(psdPath, true);
@@ -5365,20 +5376,16 @@
       "选一个波次文件夹或 *_layers.json；不跑 GPU。");
     root.appendChild(info);
 
-    pickBtn.addEventListener("click", () => {
-      openPicker({
-        title: "选择图片波次文件夹",
-        mode: "folder",
-        scopes: [{ scope: "output", label: "输出目录" }],
-        start: String(widgetValue(node, "source", "") || ""),
-        onPick: (rel) => {
-          setWidget(node, "source", rel || "");
-          info.textContent = rel
-            ? "来源：" + rel
-            : "选一个波次文件夹或 *_layers.json；不跑 GPU。";
-        },
-      });
-    });
+    pickBtn.addEventListener("click", () => pickFolderNative({
+      title: "选择图片波次文件夹",
+      start: String(widgetValue(node, "source", "") || ""),
+      onPick: (rel) => {
+        setWidget(node, "source", rel || "");
+        info.textContent = rel
+          ? "来源：" + rel
+          : "选一个波次文件夹或 *_layers.json；不跑 GPU。";
+      },
+    }));
 
     const dom = addDOM(node, "stlu_tile_grid_card", root, 110, 240);
     registerPanel(node, "tiles", dom, root);
@@ -5415,24 +5422,20 @@
       pathLine.textContent = "本次会写到 → " + wavePreview(node);
     }
 
-    pickBtn.addEventListener("click", () => {
-      openPicker({
-        title: "选择输出根目录",
-        mode: "folder",
-        scopes: [{ scope: "output", label: "输出目录" }],
-        start: String(widgetValue(node, "out_dir", "") || ""),
-        onPick: (rel) => {
-          setWidget(node, "out_dir", rel || "SeeThrough");
-          refresh();
-        },
-      });
-    });
+    pickBtn.addEventListener("click", () => pickFolderNative({
+      title: "选择输出根目录",
+      start: String(widgetValue(node, "out_dir", "") || ""),
+      onPick: (rel) => {
+        setWidget(node, "out_dir", rel || "SeeThrough");
+        refresh();
+      },
+    }));
 
     // These may be fed by the primitive nodes in the "用户输入" group; watchers
     // are rebound once the workflow's links exist (after load).
     function bindWatchers() {
       watchValue(node, "out_dir", refresh);
-      watchValue(node, "group", refresh);
+      watchValue(node, "sub_dir", refresh);
     }
     bindWatchers();
 
@@ -6246,19 +6249,28 @@
       openPath(rel, true);
     });
     openDir.addEventListener("click", () => {
-      if (result) openPath(result.dir || currentDir, false);
+      if (result) openPath(result.out_dir || result.dir || currentDir, false);
     });
 
     function previewRel(data, key) {
       const value = data && data[key];
       if (!value) return "";
       if (typeof value === "string") {
-        return (data.dir ? data.dir + "/" : "") + value;
+        const base = (data.out_dir || data.dir || "").replace(/\/+$/, "");
+        return (base ? base + "/" : "") + value;
       }
       if (value.filename) {
         return (value.subfolder ? value.subfolder + "/" : "") + value.filename;
       }
       return "";
+    }
+
+    // ① 用户输入节点上的「子目录」决定合并成品落在哪：
+    // <运行目录>/<子目录>/<合并名>/<合并名>.psd。
+    function settingsSubDir() {
+      const settings = allNodes().find(
+        (n) => n && (n.type === PIPELINE_SETTINGS || n.type === PIPELINE));
+      return settings ? String(widgetValue(settings, "sub_dir", "") || "") : "";
     }
 
     // Shared by the panel button and by a queued run of this node, so both
@@ -6315,6 +6327,7 @@
       try {
         const data = await postJson("/stlu/tiles/merge", {
           dir: currentDir,
+          sub_dir: settingsSubDir(),
           indices: Array.from(selected).sort((a, b) => a - b),
           name: nameInput.value || "merged",
           group_layers: !!groupCb.checked,
@@ -6734,7 +6747,7 @@
       ctx.reveal.disabled = false;
     }));
 
-    // PSD-upscale workflow (① -> ③ -> ④).
+    // PSD-upscale workflow (PSD 放大 -> 逐层裁回 -> 重组 PSD).
     listen("stlu.psd.plan", (data) => forEachPsdState((ctx) => ctx.on("plan", data)));
     listen("stlu.psd.start", (data) => forEachPsdState((ctx) => ctx.on("start", data)));
     listen("stlu.psd.layer", (data) => forEachPsdState((ctx) => ctx.on("layer", data)));
@@ -6800,6 +6813,33 @@
     }
     root.appendChild(tabs);
 
+    // Lock toolbar: the row button fills a whole block / part in one go and
+    // the two page buttons do every thumbnail on screen.  All three send a
+    // single batch request instead of one request per picture.
+    const lockBar = el("div", "stlu-line");
+    lockBar.style.gap = "4px";
+    lockBar.style.flexWrap = "wrap";
+    const lockAll = el("button", "stlu-btn", "全锁");
+    lockAll.title = "锁定当前页显示的所有拆分图";
+    const unlockAll = el("button", "stlu-btn", "全解");
+    unlockAll.title = "解除当前页显示的所有锁";
+    for (const button of [lockAll, unlockAll]) {
+      button.style.fontSize = "10px";
+      button.style.padding = "2px 7px";
+      lockBar.appendChild(button);
+    }
+    const lockHint = el("span", "stlu-hint");
+    lockHint.style.whiteSpace = "normal";
+    lockHint.style.fontSize = "9px";
+    lockHint.style.lineHeight = "1.35";
+    lockHint.style.flex = "1 1 140px";
+    lockHint.style.minWidth = "0";
+    lockHint.textContent =
+      "行尾「锁」批量锁；左上角小锁单独切换。只影响同块重跑；"
+      + "目录被结构变化清空时锁失效。";
+    lockBar.appendChild(lockHint);
+    root.appendChild(lockBar);
+
     // Whole-canvas overview on the left, always visible (no click, no fold),
     // and a wall of small cards on the right that are all expanded at once.
     // Nothing scrolls inside the panel: the wheel does not reliably scroll a
@@ -6832,6 +6872,9 @@
       // {tileIndex: {layer, depth}} from the run's manifest, so the "by part"
       // tab can label each copy with the seeds of the tile it came from.
       seeds: {},
+      // {tileIndex: Set(lowered part name)} from <run>/locks.json: a rerun of
+      // that tile keeps the locked parts and only replaces the rest.
+      locks: {},
       // Bumped whenever the target folder changes, so a slow /stlu/psd_preview
       // reply for the old folder is dropped instead of overwriting the new one.
       epoch: 0,
@@ -6892,6 +6935,122 @@
     function splitW() { return Math.round(44 * state.zoom); }
     function splitH() { return Math.round(40 * state.zoom); }
 
+    // ---- per-tile, per-part locks -----------------------------------------
+    // Stored in <run>/locks.json.  A lock only outlives the run folder itself:
+    // when a structural change clears the folder the locks go with it.
+
+    function normalizeLocks(raw) {
+      const out = {};
+      if (!raw || typeof raw !== "object") return out;
+      for (const [tile, names] of Object.entries(raw)) {
+        const index = Number(tile);
+        if (!Number.isFinite(index)) continue;
+        const set = new Set();
+        for (const name of names || []) {
+          const key = String(name || "").trim().toLowerCase();
+          if (key) set.add(key);
+        }
+        if (set.size) out[String(index)] = set;
+      }
+      return out;
+    }
+
+    function isLocked(tile, name) {
+      if (tile == null) return false;
+      const set = state.locks[String(Number(tile))];
+      return !!set && set.has(String(name || "").trim().toLowerCase());
+    }
+
+    function lockedInSplit(split) {
+      let count = 0;
+      for (const part of split || []) {
+        if (isLocked(part.tile, part.name || part.layer)) count += 1;
+      }
+      return count;
+    }
+
+    // Every lock write -- one thumbnail, one row, or the whole page -- goes
+    // through this: one optimistic DOM update, one batch POST, one render.
+    async function setLocks(pairs, locked) {
+      const path = state.path || declaredPath();
+      if (!path) return false;
+      const items = [];
+      const seen = new Set();
+      for (const pair of pairs || []) {
+        if (!pair || pair.tile == null) continue;
+        const name = String(pair.name || pair.layer || "").trim();
+        if (!name) continue;
+        const key = String(Number(pair.tile)) + "|" + name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({ tile: Number(pair.tile), name, locked });
+      }
+      if (!items.length) return false;
+      const before = {};
+      for (const key of Object.keys(state.locks)) {
+        before[key] = new Set(state.locks[key]);
+      }
+      for (const item of items) {
+        const key = String(item.tile);
+        const set = new Set(state.locks[key] || []);
+        if (locked) set.add(item.name.toLowerCase());
+        else set.delete(item.name.toLowerCase());
+        if (set.size) state.locks[key] = set;
+        else delete state.locks[key];
+      }
+      render();
+      let message = "";
+      let attention = false;
+      try {
+        const doc = await postJson("/stlu/locks", { path, items });
+        if (doc && doc.tiles) state.locks = normalizeLocks(doc.tiles);
+        const failed = (doc && doc.failed) || [];
+        attention = failed.length > 0;
+        message = failed.length
+          ? "锁 " + ((doc && doc.done) || 0) + " 张，" + failed.length
+            + " 张失败：" + ((failed[0] && failed[0].error) || "")
+          : (locked ? "已锁 " : "已解锁 ") + items.length + " 张";
+      } catch (error) {
+        state.locks = before;
+        attention = true;
+        message = "批量锁定失败：" + ((error && error.message) || error);
+      }
+      render();
+      // Written after render so the run summary does not overwrite it; the
+      // next render puts the lock total back.
+      const total = Object.values(state.locks)
+        .reduce((sum, set) => sum + set.size, 0);
+      lockHint.className = attention ? "stlu-hint attention" : "stlu-hint";
+      lockHint.textContent = message;
+      lockHint.style.color = attention || !total ? "" : "#e2b33c";
+      return true;
+    }
+
+    async function toggleLock(tile, name) {
+      const was = isLocked(tile, name);
+      const ok = await setLocks([{ tile, name }], !was);
+      if (ok) {
+        lockHint.className = "stlu-hint";
+        lockHint.style.color = "#e2b33c";
+        lockHint.textContent = (was ? "已解锁 " : "已锁定 ") + name
+          + "（块 " + String(tile).padStart(2, "0") + "）";
+      }
+    }
+
+    // Every lockable thumbnail on the current page / tab.
+    function visibleParts() {
+      const out = [];
+      for (const item of listOf(state.mode)) {
+        for (const part of item.split || []) {
+          if (part.tile != null && (part.name || part.layer)) out.push(part);
+        }
+      }
+      return out;
+    }
+
+    lockAll.addEventListener("click", () => setLocks(visibleParts(), true));
+    unlockAll.addEventListener("click", () => setLocks(visibleParts(), false));
+
     function imageUrl(meta, bust) {
       // Thumbnail filenames already hash the source mtime/size, so a stable
       // ``v`` keeps the browser cache useful; the dialog forces a fresh copy.
@@ -6933,15 +7092,10 @@
     function settingsOutDir() {
       const settings = settingsNode();
       if (!settings) return "";
-      // 后端的运行目录是 out_dir/group（空 group 就落在 out_dir 本身），
-      // 空的 out_dir 后端会落到 SeeThrough；group 会被 safe_name 换成
-      // Windows 安全的名字，这里照做才能猜中同一个文件夹。
-      const dir = String(widgetValue(settings, "out_dir", "SeeThrough") || "SeeThrough")
+      // 后端的运行目录只由 out_dir 决定（「分类」已并入子目录，group 恒空），
+      // 空的 out_dir 后端会落到 SeeThrough。
+      return String(widgetValue(settings, "out_dir", "SeeThrough") || "SeeThrough")
         .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim() || "SeeThrough";
-      const group = String(widgetValue(settings, "group", "") || "")
-        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim()
-        .replace(/[<>:"|?*\/\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "");
-      return group ? dir + "/" + group : dir;
     }
 
     function syncTabs() {
@@ -7017,6 +7171,39 @@
         "repeating-conic-gradient(#242426 0% 25%,#1a1a1c 0% 50%) 50%/10px 10px";
       cell.appendChild(img);
 
+      // Lock toggle: keep exactly this tile's copy of this part on the next
+      // run of that tile.  Merged layers (tile == null) span blocks and have
+      // no single owner, so they cannot be locked here.
+      const locked = isLocked(part.tile, title);
+      if (locked) img.style.border = "1px solid #e2b33c";
+      const lockSize = Math.max(14, Math.min(22, Math.round(14 * state.zoom)));
+      const lock = el("button", "", "锁");
+      lock.title = part.tile == null
+        ? "这一份是跨块合并出来的，不能单独锁定；请切到「按块」锁定"
+        : (locked ? "已锁定：重跑这一块时保留这一张"
+                  : "锁定：重跑这一块时保留这一张");
+      lock.disabled = part.tile == null;
+      lock.style.position = "absolute";
+      lock.style.left = "1px";
+      lock.style.top = "1px";
+      lock.style.width = lockSize + "px";
+      lock.style.height = lockSize + "px";
+      lock.style.padding = "0";
+      lock.style.fontSize = Math.max(8, Math.round(lockSize * 0.55)) + "px";
+      lock.style.lineHeight = "1";
+      lock.style.borderRadius = "3px";
+      lock.style.cursor = part.tile == null ? "default" : "pointer";
+      lock.style.border = "1px solid " + (locked ? "#e2b33c" : "#3a3a3c");
+      lock.style.background = locked ? "rgba(226,179,60,.92)" : "rgba(20,20,22,.78)";
+      lock.style.color = locked ? "#161616" : (part.tile == null ? "#777" : "#cfcfd3");
+      lock.style.opacity = part.tile == null ? ".55" : "1";
+      lock.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (part.tile == null) return;
+        toggleLock(part.tile, title);
+      });
+      cell.appendChild(lock);
+
       if (mode === "parts") {
         const badge = el("span", "",
           part.tile == null ? "合" : String(part.tile).padStart(2, "0"));
@@ -7073,11 +7260,45 @@
       // Each tile row also names the two seeds it ran with; clicking copies
       // them so they can be typed back into the settings node for a re-test.
       const rowSeeds = mode === "tiles" ? seedText(item.seeds) : "";
+      const locksHere = lockedInSplit(split);
       const sub = el("div", "stlu-hint", mode === "tiles"
         ? split.length + " 部位"
         : (item.count || 1) + " 份" + (item.size ? " · " + item.size.join("×") : ""));
+      if (locksHere) {
+        sub.textContent += " · 锁 " + locksHere;
+        sub.style.color = "#e2b33c";
+      }
       sub.style.fontSize = "9px";
       who.appendChild(sub);
+
+      // Row-level batch lock: one click fills every thumbnail in this row.
+      // A partly locked row fills the rest; a fully locked row releases all.
+      const lockable = split.filter(
+        (part) => part.tile != null && (part.name || part.layer));
+      const lockedHere = lockable.filter(
+        (part) => isLocked(part.tile, part.name || part.layer)).length;
+      const rowLock = el("button", "stlu-btn",
+        !lockable.length ? "锁整行"
+          : lockedHere === lockable.length ? "解锁整行"
+          : lockedHere ? "锁 " + lockedHere + "/" + lockable.length
+          : "锁整行");
+      rowLock.title = mode === "tiles"
+        ? "一次锁定 / 解锁这一块的所有拆分图"
+        : "一次锁定 / 解锁这个部位在所有块里的副本";
+      rowLock.disabled = !lockable.length;
+      rowLock.style.marginTop = "2px";
+      rowLock.style.fontSize = "9px";
+      rowLock.style.padding = "1px 5px";
+      rowLock.style.whiteSpace = "nowrap";
+      if (lockable.length && lockedHere === lockable.length) {
+        rowLock.style.borderColor = "#e2b33c";
+        rowLock.style.color = "#e2b33c";
+      }
+      rowLock.addEventListener("click", (event) => {
+        event.stopPropagation();
+        setLocks(lockable, lockedHere !== lockable.length);
+      });
+      who.appendChild(rowLock);
       // Both seeds get their own line so the numbers stay fully readable
       // even when they are long; clicking copies them for a re-test.
       if (rowSeeds) {
@@ -7250,6 +7471,18 @@
         hint.title = state.path || "";
       }
       syncCounts();
+      const lockTotal = Object.values(state.locks)
+        .reduce((total, set) => total + set.size, 0);
+      const lockableCount = visibleParts().length;
+      lockAll.disabled = !lockableCount;
+      unlockAll.disabled = !lockableCount;
+      lockHint.className = "stlu-hint";
+      lockHint.textContent = lockTotal
+        ? "已锁定 " + lockTotal + " 张：重跑只改没锁的部位。"
+          + "行尾「锁」可批量切换；目录被结构变化清空时锁失效。"
+        : "行尾「锁」批量锁；左上角小锁单独切换。只影响同块重跑；"
+          + "目录被结构变化清空时锁失效。";
+      lockHint.style.color = lockTotal ? "#e2b33c" : "";
       renderOverview(data);
       groups.innerHTML = "";
       if (!items.length) {
@@ -7317,12 +7550,18 @@
           mode: mode,
           max_side: String(state.maxSide || 768),
         });
-        const data = await getJson("/stlu/psd_preview?" + query.toString());
+        // A failed lock read must not blank the preview (older run folders
+        // simply have no locks.json), so it is fetched on its own.
+        const [data, lockDoc] = await Promise.all([
+          getJson("/stlu/psd_preview?" + query.toString()),
+          getJson("/stlu/locks?path=" + encodeURIComponent(path)).catch(() => null),
+        ]);
         // 输出位置在这期间又变了：这份结果属于旧目录，丢掉。
         if (epoch !== state.epoch) return;
         state.path = path;
         state.missed = false;
         state.data[mode] = data;
+        if (lockDoc) state.locks = normalizeLocks(lockDoc.tiles);
         if (mode === "parts" && data && data.seeds) state.seeds = data.seeds;
         else if (mode === "tiles") {
           // Each tile row carries its own seeds; keep the same lookup table
@@ -7360,6 +7599,7 @@
       state.path = "";
       state.data = {};
       state.seeds = {};
+      state.locks = {};
       state.loading = {};
       state.missed = false;
       state.epoch += 1;
@@ -7385,7 +7625,7 @@
       const settings = settingsNode();
       if (!settings) return;
       watchValue(settings, "out_dir", scheduleOutputFollow);
-      watchValue(settings, "group", scheduleOutputFollow);
+      watchValue(settings, "sub_dir", scheduleOutputFollow);
     }
     bindOutputWatchers();
     // 打开工作流时连线 / widget 可能晚一拍才恢复，补绑一次。
@@ -7402,6 +7642,7 @@
         state.path = declaredPath();
         state.data = {};
         state.seeds = {};
+        state.locks = {};
         state.loading = {};
         state.missed = false;
         if (state.path) ensure(state.mode, true);
@@ -7430,6 +7671,7 @@
           state.path = String(path);
           state.missed = false;
           state.data = {};
+          state.locks = {};
           state.loading = {};
           ensure(state.mode, true);
         }
@@ -7470,13 +7712,10 @@
     }
   }
 
-  function psdPreviewSrc(dirRel) {
-    if (!dirRel) return "";
-    return thumbUrl(dirRel + "/preview.png", 480) + "&t=" + Date.now();
-  }
-
-  // Shared card: title + tag on one line, a hint, a path line, a preview
-  // thumbnail that only shows once there is something to see, and buttons.
+  // Shared card: title + tag on one line, a hint, a path line, and buttons.
+  // Whole-canvas previews are intentionally absent -- a downscaled full image
+  // told the user nothing they could not see in their editor; the per-layer
+  // crops / before-after rows are the useful previews.
   function psdPanel(node, title, hintText) {
     injectCss();
     const root = el("div", "stlu-panel");
@@ -7496,23 +7735,71 @@
     line.style.wordBreak = "break-all";
     root.appendChild(line);
 
-    const wrap = el("div", "stlu-gridwrap");
-    wrap.style.display = "none";
-    const thumb = document.createElement("img");
-    thumb.style.width = "100%";
-    thumb.style.maxHeight = "150px";
-    thumb.style.objectFit = "contain";
-    thumb.style.borderRadius = "4px";
-    thumb.alt = "";
-    wrap.appendChild(thumb);
-    root.appendChild(wrap);
-
     const actions = el("div", "stlu-line");
     root.appendChild(actions);
     const actions2 = el("div", "stlu-line");
     root.appendChild(actions2);
 
-    return { root, head, tag, line, wrap, thumb, actions, actions2 };
+    return { root, head, tag, line, actions, actions2 };
+  }
+
+  // File card shared by the PSD nodes: thumbnail + name + tag, so the same
+  // "pick a file" affordance sits in the same slot in every panel.
+  let fileCardStamp = 0;
+  function psdFileCard(title, emptyNote) {
+    const box = el("div", "stlu-card");
+    box.style.flexDirection = "row";
+    box.style.alignItems = "center";
+    box.style.gap = "8px";
+    const thumbWrap = el("div");
+    thumbWrap.style.cssText = "width:64px;height:64px;flex:0 0 auto;display:flex;" +
+      "align-items:center;justify-content:center;overflow:hidden;cursor:pointer;" +
+      "border:1px dashed #3a3a3d;border-radius:4px;background:#0d0d0e;";
+    const img = document.createElement("img");
+    img.style.cssText = "max-width:100%;max-height:100%;object-fit:contain;display:none;";
+    const ph = el("span", null, "无图");
+    ph.style.cssText = "font-size:10px;color:#666;";
+    thumbWrap.append(img, ph);
+    img.addEventListener("error", () => {
+      img.style.display = "none";
+      ph.textContent = "无法预览";
+      ph.style.display = "";
+    });
+    const body = el("div");
+    body.style.cssText = "display:flex;flex-direction:column;gap:4px;flex:1;min-width:0;";
+    const head = el("div", "stlu-line");
+    head.appendChild(el("span", "stlu-cardtitle", title));
+    const tag = el("span", "stlu-tag", "未选择");
+    head.appendChild(tag);
+    head.appendChild(el("span", "grow"));
+    const nameEl = el("div");
+    nameEl.style.cssText = "font-size:11px;color:#ddd;overflow:hidden;" +
+      "text-overflow:ellipsis;white-space:nowrap;";
+    nameEl.textContent = emptyNote || "";
+    const subEl = el("div", "stlu-hint");
+    subEl.style.cssText = "word-break:break-all;font-size:10px;";
+    const btnRow = el("div", "stlu-line");
+    body.append(head, nameEl, subEl, btnRow);
+    box.append(thumbWrap, body);
+    return { box, thumbWrap, img, ph, tag, nameEl, subEl, btnRow, curAbs: null };
+  }
+
+  function psdFileCardThumb(card, abs, size) {
+    if (!abs) {
+      if (card.curAbs !== null) {
+        card.curAbs = null;
+        card.img.removeAttribute("src");
+      }
+      card.img.style.display = "none";
+      card.ph.style.display = "";
+      return;
+    }
+    if (card.curAbs === abs) return;
+    card.curAbs = abs;
+    fileCardStamp += 1;
+    card.img.src = localThumbUrl(abs, size || 160, SESSION_V + "-" + fileCardStamp);
+    card.img.style.display = "";
+    card.ph.style.display = "none";
   }
 
   function addPsdState(node, state, name, minHeight, maxHeight) {
@@ -7546,143 +7833,12 @@
     return dom;
   }
 
-  // ① reads the finished PSD, writes one crop per layer.
-  function setupPsdPrepare(node) {
-    hideWidget(widgetOf(node, "psd_path"));
-    hideWidget(widgetOf(node, "out_dir"));
-    hideWidget(widgetOf(node, "reference_path"));
-
-    const ui = psdPanel(node, "① PSD 准备（裁剪每层）",
-      "选好成品 PSD 后运行一次：整张 PSD 按「倍率」等比放大，每个图层裁一块带白边的 PNG 交给 ③。");
-    const outBtn = el("button", "stlu-btn", "输出位置：默认");
-    const pick = el("button", "stlu-btn stlu-primary", "选择成品 PSD…");
-    const openPsd = el("button", "stlu-btn", "打开 PSD");
-    const openOut = el("button", "stlu-btn", "打开输出文件夹");
-    openPsd.disabled = true;
-    openOut.disabled = true;
-    ui.actions.append(pick);
-    ui.actions.append(outBtn);
-    ui.actions2.append(openPsd);
-    ui.actions2.append(openOut);
-
-    // Optional high-resolution reference: same frame, finer pixels.  Each
-    // crop box is cut out of it again and fed to the edit model as a colour
-    // guide, so 4K sources survive the round trip into the upscale.
-    const refRow = el("div", "stlu-line");
-    const refBtn = el("button", "stlu-btn", "选择参考原图…");
-    const refOpen = el("button", "stlu-btn", "打开原图");
-    const refClear = el("button", "stlu-btn", "清除");
-    refBtn.title = "可选：与 PSD 同构图的高分辨率原图，会按同一位置为每层裁出参考块";
-    refOpen.disabled = true;
-    refClear.disabled = true;
-    refRow.append(refBtn);
-    refRow.append(refOpen);
-    refRow.append(refClear);
-    ui.line.after(refRow);
-    const refLine = el("div", "stlu-hint");
-    refLine.style.wordBreak = "break-all";
-    refRow.after(refLine);
-
-    const state = {
-      root: ui.root,
-      psd: String(widgetValue(node, "psd_path", "") || ""),
-      out: "",
-      on(kind, data) {
-        if (kind === "plan") {
-          state.out = String(data.out_dir || "");
-          ui.tag.className = "stlu-tag ok";
-          ui.tag.textContent = (Number(data.count) || 0) + " 层";
-          const canvas = data.canvas || [];
-          ui.line.textContent = (canvas.length === 2 ? "画布 " + canvas[0] + "×" + canvas[1] + " · " : "") +
-            "→ output/" + (state.out || "") + "/";
-          ui.line.title = state.out;
-          openOut.disabled = !state.out;
-          openPsd.disabled = !state.psd;
-          const ref = data.reference;
-          if (ref && ref.file) {
-            const sc = ref.scale || [];
-            refLine.textContent = "参考原图：" + baseNameOf(ref.file) +
-              " · 已裁 " + (Number(ref.count) || 0) + " 块" +
-              (sc.length === 2 ? " · 坐标比例 " + Number(sc[0]).toFixed(3) + "×" + Number(sc[1]).toFixed(3) : "");
-            refLine.title = ref.file;
-          }
-          const src = psdPreviewSrc(state.out);
-          if (src) {
-            ui.wrap.style.display = "";
-            ui.thumb.src = src;
-          }
-        } else if (kind === "error") {
-          ui.tag.className = "stlu-tag";
-          ui.tag.textContent = "未完成";
-        }
-      },
-    };
-
-    function refresh() {
-      ui.line.textContent = state.psd
-        ? "PSD：" + baseNameOf(state.psd)
-        : "还没有选择成品 PSD";
-      ui.line.title = state.psd;
-      openPsd.disabled = !state.psd;
-      const out = String(widgetValue(node, "out_dir", "") || "");
-      outBtn.textContent = "输出位置：" + (out || "默认");
-      const ref = String(widgetValue(node, "reference_path", "") || "");
-      refLine.textContent = ref
-        ? "参考原图：" + baseNameOf(ref)
-        : "参考原图：未选择（可选，选了会按层裁参考块喂给 ③）";
-      refLine.title = ref;
-      refOpen.disabled = !ref;
-      refClear.disabled = !ref;
-    }
-
-    pick.addEventListener("click", () => openFsPicker({
-      title: "选择成品 PSD",
-      mode: "psd",
-      start: state.psd,
-      onPick(abs) {
-        state.psd = abs;
-        setWidget(node, "psd_path", abs);
-        refresh();
-      },
-    }));
-    refBtn.addEventListener("click", () => openFsPicker({
-      title: "选择参考原图（与 PSD 同构图的高分辨率原图）",
-      mode: "image",
-      start: String(widgetValue(node, "reference_path", "") || ""),
-      onPick(abs) {
-        setWidget(node, "reference_path", abs);
-        refresh();
-      },
-    }));
-    refOpen.addEventListener("click", () => openLocal(
-      String(widgetValue(node, "reference_path", "") || ""), true));
-    refClear.addEventListener("click", () => {
-      setWidget(node, "reference_path", "");
-      refresh();
-    });
-    outBtn.addEventListener("click", () => openPicker({
-      title: "选择输出位置（output 内）",
-      mode: "folder",
-      scopes: [{ scope: "output", label: "输出目录" }],
-      start: String(widgetValue(node, "out_dir", "") || ""),
-      onPick(rel) {
-        setWidget(node, "out_dir", rel || "SeeThrough/PsdUpscale");
-        refresh();
-      },
-    }));
-    openPsd.addEventListener("click", () => openLocal(state.psd, true));
-    openOut.addEventListener("click", () => openPath(state.out, false));
-
-    refresh();
-    addPsdState(node, state, "stlu_psd_prepare_card", 230, 420);
-  }
-
-  // Crop reader: the batch node wires the file automatically.
+  // Crop reader: the PSD-upscale node wires the file automatically.
   function setupPsdLoadCrop(node) {
     hideWidget(widgetOf(node, "file"));
 
     const ui = psdPanel(node, "裁剪读取（裁图→工作尺寸）",
-      "按工作尺寸读入裁剪图和它的轮廓 MASK。③ 批量节点会自动连好，一般不用手选。");
+      "按工作尺寸读入裁剪图和它的轮廓 MASK。PSD 放大节点会自动连好，一般不用手选。");
     const pick = el("button", "stlu-btn", "选择裁剪图…");
     const open = el("button", "stlu-btn", "打开图片");
     open.disabled = true;
@@ -7706,9 +7862,9 @@
       open.disabled = !file;
     }
 
-    pick.addEventListener("click", () => openFsPicker({
+    pick.addEventListener("click", () => pickFileNative({
       title: "选择裁剪图",
-      mode: "image",
+      kind: "image",
       start: String(widgetValue(node, "file", "") || ""),
       onPick(abs) {
         setWidget(node, "file", abs);
@@ -7721,12 +7877,12 @@
     addPsdState(node, state, "stlu_psd_crop_card", 130, 250);
   }
 
-  // Cut the edited crop back to the layer: geometry comes from ③.
+  // Cut the edited crop back to the layer: geometry comes from the PSD-upscale node.
   function setupPsdCutToLayer(node) {
     hideWidget(widgetOf(node, "geometry"));
 
     const ui = psdPanel(node, "裁回图层（输出放大层）",
-      "把放大后的裁剪图裁回该层的目标尺寸，去掉白底、恢复原轮廓，写出一份放大层 PNG。由 ③ 自动驱动。");
+      "把放大后的裁剪图按几何直接裁回该层的目标尺寸，写出一份放大层 PNG。由 PSD 放大节点自动驱动。");
     const open = el("button", "stlu-btn", "打开图层所在文件夹");
     open.disabled = true;
     ui.actions.append(open);
@@ -7760,12 +7916,10 @@
 
     const ui = psdPanel(node, "④ 重组 PSD",
       "所有图层放大完以后运行：按计划里的分组、混合模式和透明度重新拼成一份新 PSD。");
-    const pick = el("button", "stlu-btn", "选择计划文件…");
     const openPsd = el("button", "stlu-btn", "打开 PSD");
     const openOut = el("button", "stlu-btn", "打开文件夹");
     openPsd.disabled = true;
     openOut.disabled = true;
-    ui.actions.append(pick);
     ui.actions2.append(openPsd);
     ui.actions2.append(openOut);
 
@@ -7776,7 +7930,7 @@
       psd: "",
       on(kind, data) {
         if (kind === "plan") {
-          // Follow ① until the user picks a plan by hand.
+          // Follow the PSD-upscale node until the user picks a plan by hand.
           if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
             setWidget(node, "plan_json", String(data.plan));
             state.plan = String(data.plan);
@@ -7787,20 +7941,20 @@
           state.out = String(data.dir || state.out);
           state.psd = String(data.psd || "");
           const canvas = data.canvas || [];
+          const up = psdCountOf(data, "upscaled");
+          const cachedN = psdCountOf(data, "cached");
+          const staleN = psdCountOf(data, "stale");
+          const fbN = psdCountOf(data, "fallback");
+          const bits = [up + " 层放大（其中 " + cachedN + " 层复用缓存）"];
+          if (fbN) bits.push(fbN + " 层用原图补齐" +
+            (staleN ? "（" + staleN + " 层缓存失效）" : ""));
           ui.tag.className = "stlu-tag ok";
           ui.tag.textContent = "✓ 已重组";
           ui.line.textContent = (canvas.length === 2 ? canvas[0] + "×" + canvas[1] + " · " : "") +
-            (data.upscaled || 0) + " 层放大" +
-            (Number(data.fallback) ? " · " + data.fallback + " 层回退原图" : "") +
-            " — " + (data.name || "");
+            bits.join(" · ") + " — " + (data.name || "");
           ui.line.title = state.psd;
           openPsd.disabled = !state.psd;
           openOut.disabled = !state.out;
-          const src = psdPreviewSrc(state.out);
-          if (src) {
-            ui.wrap.style.display = "";
-            ui.thumb.src = src;
-          }
         } else if (kind === "error") {
           ui.tag.className = "stlu-tag";
           ui.tag.textContent = "未完成";
@@ -7811,23 +7965,10 @@
     function refresh() {
       ui.line.textContent = state.plan
         ? "计划：" + baseNameOf(absDirOf(state.plan)) + "/psd_plan.json"
-        : "还没有计划文件：先运行 ①，或手动选择 psd_plan.json";
+        : "还没有计划文件：先运行 PSD 放大";
       ui.line.title = state.plan;
     }
 
-    pick.addEventListener("click", () => openPicker({
-      title: "选择 psd_plan.json",
-      mode: "json",
-      scopes: [{ scope: "output", label: "输出目录" }],
-      start: state.out || "",
-      onPick(rel, abs, file) {
-        const target = (file && file.abs) || abs || rel;
-        state.plan = String(target || "");
-        setWidget(node, "plan_json", state.plan);
-        if (file && file.rel) state.out = absDirOf(file.rel);
-        refresh();
-      },
-    }));
     openPsd.addEventListener("click", () => openLocal(state.psd, true));
     openOut.addEventListener("click", () => openPath(state.out, false));
 
@@ -7835,67 +7976,312 @@
     addPsdState(node, state, "stlu_psd_assemble_card", 210, 400);
   }
 
-  // ③ clones the Qwen edit subgraph once per selected layer.
-  function setupPsdUpscale(node) {
-    hideWidget(widgetOf(node, "plan_json"));
-    hideWidget(widgetOf(node, "workflow_json"));
+  // Minimal PSD upscale: pick the PSD, tick the layers to upscale, run.
+  // ``select`` stays a hidden widget written from the ticks, in exactly the
+  // syntax ``psd_upscale.parse_selection`` understands.
+  function setupPsdUpscaleMin(node) {
+    pinSeedControl(node);
+    hideWidget(widgetOf(node, "psd_path"));
+    hideWidget(widgetOf(node, "reference_path"));
+    hideWidget(widgetOf(node, "select"));
+    hideWidget(widgetOf(node, "out_dir"));
+    hideWidget(widgetOf(node, "psd_name"));
+    hideWidget(widgetOf(node, "seed"));
+    hideWidget(widgetOf(node, "sub_dir"));
+    hideWidget(widgetOf(node, "factor"));
+    hideWidget(widgetOf(node, "max_side"));
+    hideWidget(widgetOf(node, "work_max_side"));
+    hideWidget(widgetOf(node, "margin"));
+    hideWidget(widgetOf(node, "prompt"));
+    hideWidget(widgetOf(node, "negative_prompt"));
+    hideWidget(widgetOf(node, "cfg"));
 
-    const ui = psdPanel(node, "③ 逐层放大（Qwen 编辑）",
-      "为每个选中图层克隆一遍编辑工作流并依次放大。去噪越低越贴近原图；生成慢是正常的，每层跑完才会到下一层。");
-    const pick = el("button", "stlu-btn", "选择计划文件…");
-    const wf = el("button", "stlu-btn", "选择编辑工作流…");
-    const openPsd = el("button", "stlu-btn", "打开 PSD");
+    const ui = psdPanel(node, "PSD 放大准备",
+      "选择成品 PSD，勾选要放大的图层，然后直接运行。每层会被裁切、交给 Qwen 编辑放大，再合并回一个分层 PSD。放大参数、提示词都在下面的卡片里调。");
+    // The cards now run past a short panel: let the content scroll instead of
+    // clipping the last card when the node is not dragged taller.
+    ui.root.style.overflowY = "auto";
+    // Same file card as the edit panel: selection lives at the top.
+    const psdCard = psdFileCard("成品 PSD", "还没选 PSD —— 点「选择成品 PSD」");
+    const psdPick = el("button", "stlu-btn stlu-primary", "选择成品 PSD…");
+    const psdOpen = el("button", "stlu-btn", "打开");
+    psdOpen.disabled = true;
+    psdCard.btnRow.append(psdPick, psdOpen);
+    // Card above the status line, same layout as the edit panel.
+    ui.root.insertBefore(psdCard.box, ui.line);
+    psdPick.addEventListener("click", () => pickPsd());
+    psdCard.thumbWrap.addEventListener("click", () => {
+      const v = String(widgetValue(node, "psd_path", "") || "");
+      if (v) openLocal(v, true); else pickPsd();
+    });
+    psdOpen.addEventListener("click", () => openLocal(
+      String(widgetValue(node, "psd_path", "") || ""), true));
+
     const openOut = el("button", "stlu-btn", "打开输出文件夹");
-    openPsd.disabled = true;
     openOut.disabled = true;
-    ui.actions.append(pick);
-    ui.actions.append(wf);
-    ui.actions2.append(openPsd);
-    ui.actions2.append(openOut);
+
+    // ---- 放大图层（勾选表）-------------------------------------------------
+    const layerCard = el("div", "stlu-card");
+    const layerHead = el("div", "stlu-line");
+    layerHead.appendChild(el("span", "stlu-cardtitle", "放大图层"));
+    const layerCount = el("span", "stlu-tag", "0");
+    layerHead.appendChild(layerCount);
+    layerHead.appendChild(el("span", "grow"));
+    const allBtn = el("button", "stlu-btn", "全选");
+    const noneBtn = el("button", "stlu-btn", "全不选");
+    layerHead.append(allBtn, noneBtn);
+    layerCard.appendChild(layerHead);
+    const search = el("input", "stlu-input");
+    search.placeholder = "搜索图层…";
+    layerCard.appendChild(search);
+    const layerTable = el("div");
+    layerTable.style.cssText = "display:flex;flex-direction:column;gap:3px;" +
+      "max-height:200px;overflow:auto;";
+    layerCard.appendChild(layerTable);
+    const layerHint = el("div", "stlu-hint",
+      "只放大勾选的图层；没勾的层在合并时保持原样。");
+    layerCard.appendChild(layerHint);
+    ui.root.insertBefore(layerCard, ui.actions);
+
+    // ---- 种子 ---------------------------------------------------------------
+    // Same card as the edit panel: one seed, stepped by one per layer.
+    const seedCard = el("div", "stlu-card");
+    seedCard.appendChild(el("div", "stlu-cardtitle", "种子"));
+    const seedLine = el("div", "stlu-line");
+    const seedField = editNumber(node, "seed", "种子", {
+      min: 0, max: 4294967295, step: 1, def: 42,
+    });
+    seedLine.appendChild(seedField);
+    const seedBtn = el("button", "stlu-btn", "随机");
+    seedBtn.addEventListener("click", () => {
+      setWidget(node, "seed", Math.floor(Math.random() * 0x100000000));
+    });
+    seedLine.appendChild(seedBtn);
+    const seedNote = el("div", "stlu-hint",
+      "每层种子 = 这里填的种子 + 层序号，逐层递增。同一张 PSD 用同一种子结果可复现。");
+    seedNote.style.marginLeft = "70px";
+    seedCard.append(seedLine, seedNote);
+    ui.root.insertBefore(seedCard, ui.actions);
+
+    // ---- 参考原图（可选）----------------------------------------------------
+    // Same frame as the PSD at a higher resolution.  Each layer's crop box is
+    // cut out of it again and fed to the edit model as <image2>, so the hair
+    // and edge detail is copied from real pixels instead of being invented.
+    const refCard = el("div", "stlu-card");
+    refCard.appendChild(el("div", "stlu-cardtitle", "参考原图（可选）"));
+    const refRow = el("div", "stlu-line");
+    const refBtn = el("button", "stlu-btn", "选择参考原图…");
+    const refOpen = el("button", "stlu-btn", "打开原图");
+    const refClear = el("button", "stlu-btn", "清除");
+    refBtn.title = "与 PSD 同构图的高分辨率原图：按同一位置为每层裁参考块";
+    refOpen.disabled = true;
+    refClear.disabled = true;
+    refRow.append(refBtn, refOpen, refClear);
+    const refThumb = document.createElement("img");
+    refThumb.style.cssText = "width:64px;height:64px;object-fit:contain;display:none;" +
+      "border:1px solid #2a2a2c;border-radius:3px;background:#0d0d0e;cursor:zoom-in;";
+    refThumb.addEventListener("click", () => {
+      const v = String(widgetValue(node, "reference_path", "") || "");
+      if (v) openLocal(v, true);
+    });
+    const refTop = el("div", "stlu-line");
+    refTop.append(refThumb, refRow);
+    const refLine = el("div", "stlu-hint");
+    refLine.style.wordBreak = "break-all";
+    refCard.append(refTop, refLine);
+    ui.root.insertBefore(refCard, layerCard);
+
+    // ---- 输出位置 -----------------------------------------------------------
+    // Root folder under output/ plus the merged PSD name; the panel writes the
+    // two hidden widgets, so the node fields stay out of the way.
+    const outCard = el("div", "stlu-card");
+    outCard.appendChild(el("div", "stlu-cardtitle", "输出位置"));
+    const outRow = el("div", "stlu-line");
+    outRow.appendChild(el("span", "stlu-label", "根目录"));
+    const outInp = el("input", "stlu-input");
+    outInp.style.flex = "1";
+    outInp.placeholder = "SeeThrough/PsdUpscale";
+    outInp.value = String(widgetValue(node, "out_dir", "") || "");
+    outInp.title = "output 下的相对目录，可以直接输入不存在的文件夹名";
+    outInp.addEventListener("change", () => {
+      const rel = String(outInp.value || "").trim()
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      setWidget(node, "out_dir", rel);
+      outInp.value = rel;
+      refresh();
+    });
+    const browseBtn = el("button", "stlu-btn", "浏览…");
+    browseBtn.addEventListener("click", () => pickFolderNative({
+      title: "选择 PSD 放大的输出根目录",
+      start: String(widgetValue(node, "out_dir", "") || ""),
+      onPick(rel) {
+        const dir = rel || "SeeThrough/PsdUpscale";
+        setWidget(node, "out_dir", dir);
+        outInp.value = dir;
+        refresh();
+      },
+    }));
+    outRow.append(outInp, browseBtn);
+    outCard.appendChild(outRow);
+    const subRow = el("div", "stlu-line");
+    subRow.appendChild(el("span", "stlu-label", "子目录"));
+    const subInp = el("input", "stlu-input");
+    subInp.style.flex = "1";
+    subInp.placeholder = "可空，如 角色/甲";
+    subInp.title = "相对根目录的子目录（可空）：成品写到 "
+      + "<根>/<子目录>/<PSD 名称>/<PSD 名称>.psd";
+    subInp.value = String(widgetValue(node, "sub_dir", "") || "");
+    subInp.addEventListener("change", () => {
+      const rel = String(subInp.value || "").trim()
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      setWidget(node, "sub_dir", rel);
+      subInp.value = rel;
+      refresh();
+    });
+    subInp.addEventListener("input", refresh);
+    subRow.appendChild(subInp);
+    outCard.appendChild(subRow);
+    const nameRow = el("div", "stlu-line");
+    nameRow.appendChild(el("span", "stlu-label", "PSD 名称"));
+    const nameInp = el("input", "stlu-input");
+    nameInp.style.flex = "1";
+    nameInp.placeholder = "<原文件名>_upscaled";
+    nameInp.value = String(widgetValue(node, "psd_name", "") || "");
+    nameInp.addEventListener("change", () => {
+      setWidget(node, "psd_name", String(nameInp.value || "").trim());
+      refresh();
+    });
+    nameInp.addEventListener("input", () => {
+      setWidget(node, "psd_name", String(nameInp.value || "").trim());
+      paintOutLine();
+    });
+    nameRow.append(nameInp, el("span", "stlu-hint", ".psd"));
+    outCard.appendChild(nameRow);
+    const outLine = el("div", "stlu-hint");
+    outLine.style.wordBreak = "break-all";
+    outCard.appendChild(outLine);
+    function paintOutLine() {
+      const rootDir = String(widgetValue(node, "out_dir", "") || "").trim() ||
+        "SeeThrough/PsdUpscale";
+      const subDir = String(widgetValue(node, "sub_dir", "") || "").trim()
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      const merged = String(nameInp.value || "").trim() ||
+        String(widgetValue(node, "psd_name", "") || "").trim() ||
+        "<原文件名>_upscaled";
+      outLine.textContent = "输出：output/" + rootDir + (subDir ? "/" + subDir : "") +
+        "/" + merged + "/" + merged + ".psd";
+      outLine.title = state.out || outLine.textContent;
+    }
+    const outFoot = el("div", "stlu-line");
+    outFoot.appendChild(el("span", "grow"));
+    const clearBtn = el("button", "stlu-btn", "清空运行结果");
+    clearBtn.title = "删除整个运行目录（包括你自己放进去的文件），不可撤销";
+    clearBtn.disabled = true;
+    outFoot.append(clearBtn, openOut);
+    outCard.appendChild(outFoot);
+    ui.root.insertBefore(outCard, ui.actions);
+
+    // ---- 放大参数 -----------------------------------------------------------
+    // The native factor / max_side / work_max_side / margin widgets are hidden:
+    // their English names said nothing.  This card owns them in plain Chinese
+    // and still writes through to the hidden widgets so the saved workflow
+    // keeps the exact same keys and defaults.
+    const paramCard = el("div", "stlu-card");
+    paramCard.appendChild(el("div", "stlu-cardtitle", "放大参数"));
+    const paramFields = [];
+    function paramField(name, label, opts) {
+      const field = editNumber(node, name, label, opts);
+      paramCard.appendChild(field);
+      paramFields.push(field);
+      return field;
+    }
+    paramField("factor", "放大倍率", { min: 0.5, max: 8.0, step: 0.25, def: 4 });
+    paramField("max_side", "最大输出分辨率",
+      { min: 256, max: 16384, step: 64, def: 4096 });
+    paramField("work_max_side", "最大输入分辨率",
+      { min: 0, max: 4096, step: 64, def: 2048 });
+    paramField("margin", "裁剪边距", { min: 0, max: 0.5, step: 0.01, def: 0.08 });
+    ui.root.insertBefore(paramCard, layerCard);
+
+    // ---- 提示词 -------------------------------------------------------------
+    const promptCard = el("div", "stlu-card");
+    promptCard.appendChild(el("div", "stlu-cardtitle", "提示词"));
+    const promptArea = document.createElement("textarea");
+    promptArea.className = "stlu-promptarea";
+    promptArea.rows = 4;
+    promptArea.value = String(widgetValue(node, "prompt", "") || "");
+    promptArea.addEventListener("input",
+      () => setWidget(node, "prompt", promptArea.value));
+    promptCard.appendChild(promptArea);
+    promptCard.appendChild(el("div", "stlu-hint",
+      "告诉模型如何修细节/瑕疵；轮廓由裁剪图自带的透明通道给出，"
+      + "模型放大后原样返回。"));
+    // Negative prompt + CFG: the guider only subtracts the negative branch
+    // when CFG > 1, so the pair is shown together and the CFG defaults to the
+    // current 1.0 (same single-pass speed/quality as before).
+    promptCard.appendChild(el("div", "stlu-cardtitle", "负向提示词"));
+    const negArea = document.createElement("textarea");
+    negArea.className = "stlu-promptarea";
+    negArea.rows = 3;
+    negArea.placeholder = "不想出现的效果（可空）";
+    negArea.value = String(widgetValue(node, "negative_prompt", "") || "");
+    negArea.addEventListener("input",
+      () => setWidget(node, "negative_prompt", negArea.value));
+    promptCard.appendChild(negArea);
+    const cfgField = editNumber(node, "cfg", "CFG", {
+      min: 0, max: 8, step: 0.1, def: 1,
+    });
+    promptCard.appendChild(cfgField);
+    paramFields.push(cfgField);
+    ui.root.insertBefore(promptCard, seedCard);
+
+    ui.actions.remove();
+    ui.actions2.remove();
 
     const state = {
       root: ui.root,
       out: "",
-      psd: "",
+      psd: "",          // the PSD currently loaded in the table
+      resultPsd: "",    // last finished PSD, kept on the status line
+      canvas: [],
+      layers: [],
+      rows: [],
+      noMatch: null,
+      layerError: "",   // last /psd_layers failure, shown in place of the table
+      layersLoaded: false,
       total: 0,
       done: new Set(),
       on(kind, data) {
         if (kind === "plan") {
-          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
-            setWidget(node, "plan_json", String(data.plan));
-            refresh();
-          }
+          state.out = String(data.out_dir || state.out);
+          ui.line.textContent = "画布 " + (data.canvas || []).join("×") + " · " +
+            Number(data.count || 0) + " 层待放大";
+          openOut.disabled = !state.out;
+          loadPsdState();
         } else if (kind === "start") {
           state.total = Number(data.total) || 0;
           state.done.clear();
           state.out = String(data.out_dir || state.out);
           ui.tag.className = "stlu-tag";
           ui.tag.textContent = "正在放大…";
-          ui.line.textContent = "开始放大 " + state.total + " 层（去噪 " +
-            Number(data.denoise || 0).toFixed(2) + "）：" +
-            (data.parts || []).join("、");
+          ui.line.textContent = "开始放大 " + state.total + " 层";
           openOut.disabled = !state.out;
         } else if (kind === "layer") {
           const file = String(data.file || "");
-          if (file && !state.done.has(file)) state.done.add(file);
+          if (file) state.done.add(file);
           const total = Math.max(state.total, state.done.size);
           ui.line.textContent = "正在放大 " + state.done.size + "/" + total +
             " · " + baseNameOf(file);
         } else if (kind === "assembled") {
           state.out = String(data.dir || state.out);
-          state.psd = String(data.psd || "");
+          state.resultPsd = String(data.psd || "");
           ui.tag.className = "stlu-tag ok";
           ui.tag.textContent = "✓ 完成";
-          ui.line.textContent = "已生成：" + (data.name || baseNameOf(state.psd)) +
-            (Number(data.fallback) ? "（" + data.fallback + " 层回退原图）" : "");
-          ui.line.title = state.psd;
-          openPsd.disabled = !state.psd;
+          ui.line.textContent = "已生成：" + (data.name || baseNameOf(state.resultPsd));
+          ui.line.title = state.resultPsd;
           openOut.disabled = !state.out;
-          const src = psdPreviewSrc(state.out);
-          if (src) {
-            ui.wrap.style.display = "";
-            ui.thumb.src = src;
-          }
+          cacheKey = "";
+          loadPsdState();
         } else if (kind === "error") {
           ui.tag.className = "stlu-tag";
           ui.tag.textContent = "已中断";
@@ -7903,42 +8289,484 @@
       },
     };
 
-    function refresh() {
-      const plan = String(widgetValue(node, "plan_json", "") || "");
-      const workflow = String(widgetValue(node, "workflow_json", "") || "");
-      ui.line.textContent = (plan ? "计划：" + baseNameOf(absDirOf(plan)) + "/psd_plan.json" : "计划：跟随 ① 自动填写") +
-        " · 工作流：" + (workflow ? baseNameOf(workflow) : "默认模板");
-      ui.line.title = plan || workflow;
+    let refShown = "";
+    let refStamp = 0;
+
+    // ---- 已生成标注（/stlu/psd_state）-------------------------------------
+    // ``cache`` mirrors the backend's per-layer verdict for the current run
+    // folder: hit = 已生成并将复用, stale = 有文件但参数/PSD 变了, missing =
+    // 没跑过.  An absent plan leaves ``cacheKnown`` false -> nothing is marked.
+    let cache = {};
+    let cacheKnown = false;
+    let cacheKey = "";
+    let cacheSeq = 0;
+    let cacheTimer = 0;
+
+    function psdStateKey() {
+      return [String(widgetValue(node, "psd_path", "") || ""),
+        String(widgetValue(node, "out_dir", "") || "").trim(),
+        String(widgetValue(node, "sub_dir", "") || "").trim(),
+        String(widgetValue(node, "factor", 4) || 4),
+        String(widgetValue(node, "max_side", 4096) || 4096)].join("|");
     }
 
-    pick.addEventListener("click", () => openPicker({
-      title: "选择 psd_plan.json",
-      mode: "json",
-      scopes: [{ scope: "output", label: "输出目录" }],
-      start: state.out || "",
-      onPick(rel, abs, file) {
-        const target = (file && file.abs) || abs || rel;
-        setWidget(node, "plan_json", String(target || ""));
-        if (file && file.rel) state.out = absDirOf(file.rel);
+    async function loadPsdState() {
+      const psd = String(widgetValue(node, "psd_path", "") || "");
+      const key = psdStateKey();
+      cacheKey = key;
+      if (!psd) {
+        cache = {};
+        cacheKnown = false;
+        openOut.disabled = true;
+        renderLayers();
+        return null;
+      }
+      const seq = ++cacheSeq;
+      try {
+        const data = await getJson("/stlu/psd_state?psd=" + encodeURIComponent(psd) +
+          "&out_dir=" + encodeURIComponent(String(widgetValue(node, "out_dir", "") || "")) +
+          "&sub_dir=" + encodeURIComponent(String(widgetValue(node, "sub_dir", "") || "")) +
+          "&factor=" + encodeURIComponent(String(widgetValue(node, "factor", 4) || 4)) +
+          "&max_side=" + encodeURIComponent(String(widgetValue(node, "max_side", 4096) || 4096)));
+        if (seq !== cacheSeq) return null;
+        cache = data && data.layers ? data.layers : {};
+        cacheKnown = !!(data && data.found);
+        // The run folder's existence is authoritative: reopening a saved
+        // workflow must show "open output folder" lit iff the folder is really
+        // on disk, not only after a run event.  ``state.out`` has to carry the
+        // path too, or the click opens nothing.
+        state.out = String((data && data.out_dir) || state.out);
+        openOut.disabled = !(data && data.dir_exists);
+        if (state.layersLoaded) renderLayers();
+        return data;
+      } catch (e) {
+        console.warn("[STLU] psd state", e);
+        return null;
+      }
+    }
+
+    // Debounced: sub_dir/factor fire on every keystroke, and each miss walks the
+    // run folder on the backend.
+    function scheduleState() {
+      if (psdStateKey() === cacheKey) return;
+      if (cacheTimer) clearTimeout(cacheTimer);
+      cacheTimer = setTimeout(() => {
+        cacheTimer = 0;
+        loadPsdState();
+      }, 250);
+    }
+
+    function layerNames() {
+      return state.layers.map((layer) => String(layer.name));
+    }
+
+    // Mirrors psd_upscale.parse_selection so the ticks show exactly which
+    // layers the saved ``select`` value resolves to.
+    function readSelection() {
+      const names = layerNames();
+      const raw = String(widgetValue(node, "select", "") || "").trim();
+      const picked = new Set();
+      const removed = new Set();
+      if (!raw || raw.toLowerCase() === "all") {
+        for (const n of names) picked.add(n);
+        return picked;
+      }
+      if (raw.toLowerCase() === "none") return picked;
+      const tokens = raw.indexOf(",") >= 0 ? raw.split(",") : raw.split(/\s+/);
+      const lower = names.map((n) => n.toLowerCase());
+      let explicit = false;
+      for (let token of tokens) {
+        token = String(token || "").trim();
+        if (!token) continue;
+        const drop = token.charAt(0) === "-";
+        if (drop) token = token.slice(1).trim();
+        const key = token.toLowerCase();
+        if (!key) continue;
+        if (key === "all") {
+          explicit = true;
+          for (const n of names) picked.add(n);
+          continue;
+        }
+        let hits = names.filter((n, i) => lower[i] === key);
+        if (!hits.length) hits = names.filter((n, i) => lower[i].indexOf(key) >= 0);
+        if (!hits.length) continue;
+        explicit = true;
+        for (const n of hits) (drop ? removed : picked).add(n);
+      }
+      if (!explicit) {
+        for (const n of names) picked.add(n);
+        return picked;
+      }
+      const out = new Set();
+      for (const n of names) if (picked.has(n) && !removed.has(n)) out.add(n);
+      return out;
+    }
+
+    // Serialize ticks as ``all,-<unchecked>`` so a stale value can never
+    // silently fall back to running the whole catalogue by accident.
+    let writingSelect = false;
+    function writeSelection(picked) {
+      const names = layerNames();
+      let text;
+      if (!names.length || picked.size === names.length) text = "all";
+      else if (!picked.size) text = "none";
+      else text = "all," + names.filter((n) => !picked.has(n))
+        .map((n) => "-" + n).join(",");
+      writingSelect = true;
+      try {
+        setWidget(node, "select", text);
+      } finally {
+        writingSelect = false;
+      }
+      renderLayers();
+    }
+
+    function filterRows() {
+      const q = String(search.value || "").trim().toLowerCase();
+      let shown = 0;
+      for (const row of state.rows) {
+        const on = !q || String(row.name).toLowerCase().indexOf(q) >= 0;
+        row.dom.style.display = on ? "" : "none";
+        if (on) shown++;
+      }
+      if (state.noMatch && state.noMatch.parentNode) {
+        state.noMatch.parentNode.removeChild(state.noMatch);
+      }
+      state.noMatch = null;
+      if (q && state.rows.length && !shown) {
+        state.noMatch = el("div", "stlu-hint",
+          "没有匹配「" + q + "」的图层名，清空搜索框显示全部。");
+        layerTable.appendChild(state.noMatch);
+      }
+    }
+    search.addEventListener("input", filterRows);
+
+    // The ticks and the "10/24" counter both derive from ``select``.  After a
+    // reload LiteGraph can restore the widget before the table exists, and a
+    // browser restoring page state can flip a box without firing our change
+    // handler -- either way the counter said 10 while nothing looked ticked.
+    // Re-assert the boxes from the saved value on every render, plus once
+    // more after the frame settles.
+    function syncChecks() {
+      if (!state.layersLoaded) return;
+      const picked = readSelection();
+      for (const row of state.rows) {
+        if (row.cb && !row.cb.disabled) row.cb.checked = picked.has(row.name);
+      }
+    }
+
+    function renderLayers() {
+      layerTable.innerHTML = "";
+      state.rows = [];
+      layerCount.className = "stlu-tag";
+      layerCount.textContent = "0";
+      allBtn.disabled = true;
+      noneBtn.disabled = true;
+      if (!state.layersLoaded) {
+        layerTable.appendChild(el("div", "stlu-hint",
+          state.psd ? "读取图层中…" : "还没有选择成品 PSD。"));
+        return;
+      }
+      const names = layerNames();
+      if (!names.length) {
+        layerTable.appendChild(el("div", "stlu-hint",
+          state.layerError
+            ? "读取图层失败：" + state.layerError
+            : "这份 PSD 没有可放大的图层。"));
+        return;
+      }
+      allBtn.disabled = false;
+      noneBtn.disabled = false;
+      const picked = readSelection();
+      layerCount.textContent = picked.size + "/" + names.length;
+      if (picked.size) layerCount.className = "stlu-tag ok";
+      const doneCount = cacheKnown
+        ? names.filter((n) => cache[n] && cache[n].status === "hit").length : 0;
+      layerHint.textContent = cacheKnown
+        ? "只放大勾选的图层；没勾的层在合并时保持原样。已生成 " + doneCount +
+          "/" + names.length + " 层（绿标，运行时会直接复用）。"
+        : "只放大勾选的图层；没勾的层在合并时保持原样。";
+      const factor = Math.max(0.01, Number(widgetValue(node, "factor", 4)) || 4);
+      const cap = Number(widgetValue(node, "max_side", 4096)) || 0;
+      const targetOf = (w, h) => {
+        let tw = Math.max(1, Math.round(w * factor));
+        let th = Math.max(1, Math.round(h * factor));
+        if (cap > 0 && Math.max(tw, th) > cap) {
+          const s = cap / Math.max(tw, th);
+          tw = Math.max(1, Math.round(tw * s));
+          th = Math.max(1, Math.round(th * s));
+        }
+        return [tw, th];
+      };
+      for (const layer of state.layers) {
+        try {
+          const name = String(layer.name);
+          const row = el("label", "stlu-check");
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          const bad = name.indexOf(",") >= 0;
+          cb.checked = bad ? true : picked.has(name);
+          cb.disabled = bad;
+          if (bad) cb.title = "图层名含逗号，筛选语法无法单独排除";
+          cb.addEventListener("change", () => {
+            const next = readSelection();
+            if (cb.checked) next.add(name); else next.delete(name);
+            writeSelection(next);
+          });
+          row.appendChild(cb);
+          const thumb = el("img");
+          thumb.style.cssText = "width:26px;height:26px;object-fit:contain;flex:0 0 auto;" +
+            "border:1px solid #2a2a2c;border-radius:3px;background:#0d0d0e;";
+          if (layer.thumb) thumb.src = localThumbUrl(layer.thumb, 48);
+          else thumb.style.visibility = "hidden";
+          row.appendChild(thumb);
+          const label = el("span", null, name);
+          label.style.cssText = "flex:1;min-width:0;overflow:hidden;" +
+            "text-overflow:ellipsis;white-space:nowrap;";
+          label.title = name;
+          row.appendChild(label);
+          const info = cacheKnown ? cache[name] : null;
+          if (info && (info.status === "hit" || info.status === "stale")) {
+            const badge = el("span", "stlu-tag" + (info.status === "hit" ? " ok" : ""),
+              info.status === "hit" ? "已生成" : "已过期");
+            badge.style.cssText = "flex:0 0 auto;font-size:10px;padding:0 4px;line-height:14px;";
+            badge.title = (info.detail ? info.detail : "") +
+              (info.status === "hit"
+                ? "（磁盘上已有这层的放大结果，运行时会直接复用）"
+                : "（有旧结果但参数或 PSD 已变，会重新生成）");
+            row.appendChild(badge);
+          }
+          const s = Array.isArray(layer.size) && layer.size.length === 2
+            ? layer.size : null;
+          if (s) {
+            const tg = targetOf(Number(s[0]), Number(s[1]));
+            const sizeEl = el("span", null,
+              s[0] + "×" + s[1] + " → " + tg[0] + "×" + tg[1]);
+            sizeEl.style.cssText = "white-space:nowrap;color:#9ad;font-size:11px;";
+            row.appendChild(sizeEl);
+          }
+          layerTable.appendChild(row);
+          state.rows.push({ name, dom: row, cb });
+        } catch (err) {
+          // One malformed layer must not blank the whole table -- before this
+          // guard a throw mid-loop left the counter written and the list empty.
+          console.error("[STLU] 放大列表某一行构建失败:", layer && layer.name, err);
+        }
+      }
+      filterRows();
+      syncChecks();
+      requestAnimationFrame(syncChecks);
+    }
+
+    allBtn.addEventListener("click", () => writeSelection(new Set(layerNames())));
+    noneBtn.addEventListener("click", () => writeSelection(new Set()));
+
+    function paintPsdCard(psd) {
+      psdFileCardThumb(psdCard, psd, 160);
+      psdOpen.disabled = !psd;
+      if (!psd) {
+        psdCard.nameEl.textContent = "还没选 PSD —— 点「选择成品 PSD」";
+        psdCard.nameEl.title = "";
+        psdCard.subEl.textContent = "";
+        psdCard.tag.className = "stlu-tag";
+        psdCard.tag.textContent = "未选择";
+        return;
+      }
+      psdCard.nameEl.textContent = baseNameOf(psd);
+      psdCard.nameEl.title = psd;
+      psdCard.subEl.textContent = "倍率 ×" +
+        Number(widgetValue(node, "factor", 4));
+      psdCard.tag.className = "stlu-tag" + (state.layersLoaded ? " ok" : "");
+      psdCard.tag.textContent = state.layersLoaded
+        ? state.layers.length + " 层" : "读取中…";
+    }
+
+    function refresh() {
+      seedField.stluSync();
+      // onConfigure restores widget values after the panel was built, and that
+      // path bypasses watchValue -- pull the restored numbers back in.
+      for (const field of paramFields) field.stluSync();
+      const promptWidget = String(widgetValue(node, "prompt", "") || "");
+      if (document.activeElement !== promptArea &&
+          promptArea.value !== promptWidget) promptArea.value = promptWidget;
+      const negWidget = String(widgetValue(node, "negative_prompt", "") || "");
+      if (document.activeElement !== negArea &&
+          negArea.value !== negWidget) negArea.value = negWidget;
+      const psd = String(widgetValue(node, "psd_path", "") || "");
+      paintPsdCard(psd);
+      if (!state.resultPsd) {
+        ui.line.textContent = psd
+          ? "已选择：" + baseNameOf(psd) + " · 倍率 " +
+            Number(widgetValue(node, "factor", 4)) + "，单层上限 " +
+            Number(widgetValue(node, "max_side", 4096))
+          : "还没有选择 PSD";
+        ui.line.title = psd;
+      }
+      // onConfigure restores widget values after the panel was built.
+      const outWidget = String(widgetValue(node, "out_dir", "") || "");
+      if (document.activeElement !== outInp && outInp.value !== outWidget)
+        outInp.value = outWidget;
+      const subWidget = String(widgetValue(node, "sub_dir", "") || "");
+      if (document.activeElement !== subInp && subInp.value !== subWidget)
+        subInp.value = subWidget;
+      const nameWidget = String(widgetValue(node, "psd_name", "") || "");
+      if (document.activeElement !== nameInp && nameInp.value !== nameWidget)
+        nameInp.value = nameWidget;
+      paintOutLine();
+      const ref = String(widgetValue(node, "reference_path", "") || "");
+      refLine.textContent = ref
+        ? "参考原图：" + baseNameOf(ref) + " · 已按每层位置裁参考块"
+        : "参考原图：未选择（可选；选了发丝与边缘细节就照真实像素修）";
+      refLine.title = ref;
+      refOpen.disabled = !ref;
+      refClear.disabled = !ref;
+      if (ref !== refShown) {
+        refShown = ref;
+        if (ref) {
+          refThumb.src = localThumbUrl(
+            ref, 160, SESSION_V + "-minref-" + (++refStamp));
+          refThumb.style.display = "";
+        } else {
+          refThumb.style.display = "none";
+          refThumb.removeAttribute("src");
+        }
+      }
+      if (psd !== state.psd) loadLayers(psd);
+      clearBtn.disabled = !psd;
+      scheduleState();
+    }
+
+    // local=1 lets the PSD live on any drive, not just output/input.
+    async function loadLayers(psd) {
+      state.psd = psd;
+      state.layers = [];
+      state.canvas = [];
+      state.layerError = "";
+      state.layersLoaded = false;
+      renderLayers();
+      paintPsdCard(psd);
+      if (!psd) return;
+      // A hung request would leave the table reading "读取图层中…" forever,
+      // so give up after 8s and say so instead of looking frozen.
+      const guard = setTimeout(() => {
+        if (state.psd !== psd || state.layersLoaded) return;
+        state.layersLoaded = true;
+        state.layerError = "读取超时（8 秒），重新选一次 PSD 再试";
+        renderLayers();
+      }, 8000);
+      try {
+        const data = await getJson("/stlu/psd_layers?path=" +
+          encodeURIComponent(psd) + "&local=1");
+        if (state.psd !== psd) return;
+        state.layers = Array.isArray(data.layers) ? data.layers : [];
+        state.canvas = Array.isArray(data.canvas) ? data.canvas : [];
+        state.layerError = "";
+      } catch (e) {
+        console.warn("[STLU] psd layers", e);
+        if (state.psd === psd) {
+          state.layerError = String(e && e.message ? e.message : e);
+        }
+      } finally {
+        clearTimeout(guard);
+      }
+      if (state.psd !== psd) return;
+      state.layersLoaded = true;
+      renderLayers();
+      paintPsdCard(psd);
+    }
+
+    function pickPsd() {
+      pickFileNative({
+        title: "选择成品 PSD",
+        kind: "psd",
+        start: String(widgetValue(node, "psd_path", "") || ""),
+        onPick(abs) {
+          setWidget(node, "psd_path", abs);
+          state.resultPsd = "";
+          ui.tag.className = "stlu-tag";
+          ui.tag.textContent = "等待运行";
+          refresh();
+        },
+      });
+    }
+    refBtn.addEventListener("click", () => pickFileNative({
+      title: "选择参考原图（与 PSD 同构图的高分辨率原图）",
+      kind: "image",
+      start: String(widgetValue(node, "reference_path", "") || ""),
+      onPick(abs) {
+        setWidget(node, "reference_path", abs);
         refresh();
       },
     }));
-    wf.addEventListener("click", () => openPicker({
-      title: "选择图编辑工作流",
-      mode: "workflow",
-      scopes: [{ scope: "workflows", label: "工作流" }],
-      start: "",
-      onPick(rel, abs, file) {
-        setWidget(node, "workflow_json", String((file && file.abs) || abs || rel || ""));
-        refresh();
-      },
-    }));
-    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    refOpen.addEventListener("click", () => openLocal(
+      String(widgetValue(node, "reference_path", "") || ""), true));
+    refClear.addEventListener("click", () => {
+      setWidget(node, "reference_path", "");
+      refresh();
+    });
+    watchValue(node, "reference_path", refresh);
+
     openOut.addEventListener("click", () => openPath(state.out, false));
+    clearBtn.addEventListener("click", async () => {
+      clearBtn.disabled = true;
+      try {
+        // Ask the backend for the authoritative run folder instead of
+        // rebuilding the naming rule here.
+        const data = await loadPsdState();
+        const dir = String((data && data.out_dir) || "").trim();
+        if (!dir) {
+          window.alert("还没有运行目录可清空（先选 PSD）。");
+          return;
+        }
+        if (!window.confirm(
+          "清空运行目录？\n\noutput/" + dir + "\n\n" +
+          "会删除整个目录，包括你自己放进去的文件；不可撤销。")) return;
+        const res = await postJson("/stlu/psd/clear", { dir });
+        state.resultPsd = "";
+        state.out = dir;
+        cache = {};
+        cacheKnown = false;
+        cacheKey = "";
+        ui.tag.className = "stlu-tag";
+        ui.tag.textContent = "已清空";
+        ui.line.textContent = "已清空运行目录（删除 " +
+          Number((res && res.removed) || 0) + " 个文件）";
+        ui.line.title = "";
+        renderLayers();
+        await loadPsdState();
+      } catch (e) {
+        window.alert("清空失败：" + (e && e.message ? e.message : e));
+      } finally {
+        clearBtn.disabled = !String(widgetValue(node, "psd_path", "") || "");
+      }
+    });
+    watchValue(node, "psd_path", refresh);
+    watchValue(node, "factor", refresh);
+    watchValue(node, "max_side", refresh);
+    // Ticks read factor/max_side to show each layer's target size.
+    watchValue(node, "factor", () => { if (state.layersLoaded) renderLayers(); });
+    watchValue(node, "max_side", () => { if (state.layersLoaded) renderLayers(); });
+    watchValue(node, "out_dir", refresh);
+    watchValue(node, "psd_name", refresh);
+    watchValue(node, "select", () => {
+      // writeSelection repaints right after setWidget; skip that second pass.
+      if (writingSelect) return;
+      renderLayers();
+    });
+    // Values restored by onConfigure bypass watchValue (and the named-value
+    // hook runs before this one), so repaint the table once the saved
+    // ``select`` and layer list are back.
+    addConfigureHook(node, () => {
+      refresh();
+      if (state.layersLoaded) renderLayers();
+    });
 
     refresh();
-    addPsdState(node, state, "stlu_psd_upscale_card", 210, 400);
+    // Widget values restored by onConfigure bypass watchValue: re-read them.
+    setTimeout(refresh, 0);
+    addPsdState(node, state, "stlu_psd_min_card", 340, 780);
   }
+
 
   // -------------------------------------------------------------------------
   // PSD edit workflow (① prepare -> ② per-task edit -> ③ assemble)
@@ -7948,50 +8776,382 @@
   // The task table is the whole point: every row is one layer to edit (or a
   // new accessory that does not exist yet), serialized to the hidden
   // ``tasks`` widget as JSON so nothing has to be typed by hand.
+  // ---- edit-panel controls: DOM widgets mirroring hidden node widgets -----
+  // Each helper reads through ``widgetValue`` and writes through ``setWidget``
+  // so a value linked to a primitive upstream still lands on the right widget,
+  // and a hidden widget keeps serializing into the saved workflow.
+  function editFieldWrap(label) {
+    const wrap = el("label");
+    wrap.style.cssText =
+      "display:flex;align-items:center;gap:6px;font-size:11px;color:#bbb;";
+    if (label) {
+      const cap = el("span", null, label);
+      cap.style.minWidth = "64px";
+      wrap.appendChild(cap);
+    }
+    return wrap;
+  }
+
+  function editNumber(node, name, label, opts) {
+    opts = opts || {};
+    const wrap = editFieldWrap(label);
+    const inp = el("input", "stlu-input");
+    inp.type = "number";
+    // A 10-digit seed must not be clipped: pin the width and let the CSS rule
+    // drop the native spin buttons so the digits get the whole box.
+    inp.style.width = "110px";
+    inp.style.flex = "0 0 auto";
+    if (opts.min != null) inp.min = opts.min;
+    if (opts.max != null) inp.max = opts.max;
+    if (opts.step != null) inp.step = opts.step;
+    const read = () => {
+      const v = widgetValue(node, name, opts.def != null ? opts.def : 0);
+      return typeof v === "number" ? v : parseFloat(v);
+    };
+    inp.value = String(read());
+    inp.addEventListener("change", () => {
+      const v = parseFloat(inp.value);
+      if (Number.isFinite(v)) setWidget(node, name, v);
+      inp.value = String(read());
+    });
+    // onConfigure restores widget values with a plain assignment, which never
+    // fires watchValue; panels call this from their own refresh instead.
+    wrap.stluSync = () => {
+      if (document.activeElement !== inp) inp.value = String(read());
+    };
+    wrap.appendChild(inp);
+    if (opts.hint) wrap.appendChild(el("span", "stlu-hint", opts.hint));
+    watchValue(node, name, () => { inp.value = String(read()); });
+    return wrap;
+  }
+
+  function editRange(node, name, label, opts) {
+    opts = opts || {};
+    const wrap = editFieldWrap(label);
+    const inp = el("input");
+    inp.type = "range";
+    inp.style.flex = "1";
+    inp.style.minWidth = "80px";
+    inp.min = opts.min != null ? opts.min : 0;
+    inp.max = opts.max != null ? opts.max : 100;
+    inp.step = opts.step != null ? opts.step : 1;
+    const out = el("span", "stlu-hint");
+    out.style.minWidth = "34px";
+    out.style.textAlign = "right";
+    const read = () => {
+      const v = widgetValue(node, name, opts.def != null ? opts.def : inp.min);
+      return typeof v === "number" ? v : (parseFloat(v) || 0);
+    };
+    const paint = () => { out.textContent = String(read()); };
+    inp.value = String(read());
+    paint();
+    inp.addEventListener("input", () => {
+      const v = parseFloat(inp.value);
+      if (Number.isFinite(v)) setWidget(node, name, v);
+      out.textContent = inp.value;
+    });
+    wrap.appendChild(inp);
+    wrap.appendChild(out);
+    watchValue(node, name, () => { inp.value = String(read()); paint(); });
+    return wrap;
+  }
+
+  function editSelect(node, name, label, options) {
+    const wrap = editFieldWrap(label);
+    const sel = document.createElement("select");
+    sel.className = "stlu-input";
+    for (const pair of options) {
+      const o = document.createElement("option");
+      o.value = pair[0];
+      o.textContent = pair[1];
+      sel.appendChild(o);
+    }
+    const read = () =>
+      String(widgetValue(node, name, options.length ? options[0][0] : "") || "");
+    const sync = () => {
+      const v = read();
+      if (!Array.from(sel.options).some((o) => o.value === v)) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = v;
+        sel.appendChild(o);
+      }
+      sel.value = v;
+    };
+    sync();
+    sel.addEventListener("change", () => setWidget(node, name, sel.value));
+    wrap.appendChild(sel);
+    watchValue(node, name, sync);
+    return wrap;
+  }
+
+  function editCheck(node, name, label) {
+    const wrap = el("label", "stlu-check");
+    const inp = document.createElement("input");
+    inp.type = "checkbox";
+    const read = () => !!widgetValue(node, name, true);
+    inp.checked = read();
+    inp.addEventListener("change", () => setWidget(node, name, inp.checked));
+    wrap.appendChild(inp);
+    wrap.appendChild(el("span", null, label));
+    watchValue(node, name, () => { inp.checked = read(); });
+    return wrap;
+  }
+
+  function editText(node, name, label, opts) {
+    opts = opts || {};
+    const wrap = el("div");
+    wrap.style.cssText =
+      "display:flex;flex-direction:column;gap:4px;font-size:11px;color:#bbb;";
+    if (label) wrap.appendChild(el("span", null, label));
+    const row = el("div", "stlu-line");
+    const inp = document.createElement(opts.multiline ? "textarea" : "input");
+    inp.className = "stlu-input";
+    if (opts.multiline) {
+      inp.rows = opts.rows || 2;
+      inp.style.width = "100%";
+      inp.style.resize = "vertical";
+    } else {
+      inp.style.flex = "1";
+    }
+    const read = () => String(widgetValue(node, name, opts.def || "") || "");
+    inp.value = read();
+    inp.addEventListener("input", () => setWidget(node, name, inp.value));
+    row.appendChild(inp);
+    if (opts.button) {
+      const btn = el("button", "stlu-btn", opts.button.text);
+      btn.addEventListener("click", () => opts.button.onClick(inp));
+      row.appendChild(btn);
+    }
+    wrap.appendChild(row);
+    // Same onConfigure escape hatch as editNumber: a plain widget assignment
+    // never fires watchValue, so panels call stluSync() from their refresh.
+    wrap.stluSync = () => {
+      const v = read();
+      if (document.activeElement !== inp && inp.value !== v) inp.value = v;
+    };
+    watchValue(node, name, () => { inp.value = read(); });
+    return wrap;
+  }
+
+  // A small thumbnail tile; click reveals the file, empty source shows a
+  // dashed placeholder so the grid keeps its shape before a run.
+  function editThumb(rel, size, title) {
+    const img = document.createElement("img");
+    img.style.cssText =
+      "width:48px;height:48px;object-fit:contain;border:1px solid #2a2a2c;" +
+      "border-radius:3px;cursor:zoom-in;background:#0d0d0e;flex:0 0 auto;";
+    img.title = title || "";
+    if (rel) {
+      img.src = thumbUrl(rel, size || 160);
+      img.addEventListener("click", () => openPath(rel, true));
+    } else {
+      img.style.borderStyle = "dashed";
+      img.style.opacity = "0.5";
+    }
+    return img;
+  }
+
   function setupEditPrepare(node) {
+    pinSeedControl(node);
     hideWidget(widgetOf(node, "psd_path"));
     hideWidget(widgetOf(node, "tasks"));
     hideWidget(widgetOf(node, "out_dir"));
-    hideWidget(widgetOf(node, "reference_path"));
+    for (const name of ["psd_name", "seed", "sub_dir", "prompt",
+                        "negative_prompt", "cfg"]) {
+      hideWidget(widgetOf(node, name));
+    }
 
     const ui = psdPanel(node, "① 编辑准备（切层 + 任务表）",
-      "选好成品 PSD，再一行一个任务：选原图层改色/改材质，或新增一个饰品层。运行一次即按任务裁好每块裁剪图。");
-    const outBtn = el("button", "stlu-btn", "输出位置：默认");
-    const pick = el("button", "stlu-btn stlu-primary", "选择成品 PSD…");
-    const openPsd = el("button", "stlu-btn", "打开 PSD");
-    const openOut = el("button", "stlu-btn", "打开输出文件夹");
-    openPsd.disabled = true;
-    openOut.disabled = true;
-    ui.actions.append(pick);
-    ui.actions.append(outBtn);
-    ui.actions2.append(openPsd);
-    ui.actions2.append(openOut);
+      "选好成品 PSD；每个任务对应一个图层（改色/改材质）或一个新饰品层。运行一次即按任务裁好每块裁剪图。");
+    // psdPanel预置的行/预览挪到卡片下方，作为「上次运行」结果区。
+    ui.actions.remove();
+    ui.actions2.remove();
 
-    // Optional high-resolution reference: same frame, finer pixels, cut at
-    // the same boxes so the encoder sees real detail instead of upsampling.
-    const refRow = el("div", "stlu-line");
-    const refBtn = el("button", "stlu-btn", "选择参考原图…");
-    const refOpen = el("button", "stlu-btn", "打开原图");
-    const refClear = el("button", "stlu-btn", "清除");
-    refBtn.title = "可选：与 PSD 同构图的高分辨率原图，会按同一位置为每层裁出参考块";
-    refOpen.disabled = true;
-    refClear.disabled = true;
-    refRow.append(refBtn);
-    refRow.append(refOpen);
-    refRow.append(refClear);
-    ui.line.after(refRow);
-    const refLine = el("div", "stlu-hint");
-    refLine.style.wordBreak = "break-all";
-    refRow.after(refLine);
+    // ---- 文件卡片：成品 PSD ----------------------------------------------
+    // 选完文件立刻出缩略图 + 尺寸 + 状态，而不是只在运行后才有一行灰字。
+    const psdCard = psdFileCard("成品 PSD", "还没选 PSD —— 点「选择成品 PSD…」");
+    const psdPick = el("button", "stlu-btn stlu-primary", "选择成品 PSD…");
+    const psdOpen = el("button", "stlu-btn", "打开");
+    psdOpen.disabled = true;
+    psdCard.btnRow.append(psdPick, psdOpen);
+    ui.root.appendChild(psdCard.box);
 
-    // The task table lives below the reference row.
+    // 「上次运行」结果：一行任务摘要。
+    ui.root.appendChild(ui.line);
+
+    // ---- 提示词：全局正向 + 负向 + CFG --------------------------------------
+    // ② prepends the global positive prompt to every task's own instruction,
+    // so shared wording (transparency, style) is written once; the table's
+    // per-task instructions still apply.  The negative prompt only changes the
+    // result when CFG > 1, so both live in the same card.
+    const promptCard = el("div", "stlu-card");
+    promptCard.appendChild(el("div", "stlu-cardtitle", "提示词"));
+    const globalPromptField = editText(node, "prompt",
+      "正向提示词（拼在每个任务指令前，可空）", { multiline: true, rows: 3 });
+    promptCard.appendChild(globalPromptField);
+    const negPromptField = editText(node, "negative_prompt",
+      "负向提示词（可空）", { multiline: true, rows: 2 });
+    promptCard.appendChild(negPromptField);
+    const cfgField = editNumber(node, "cfg", "CFG", {
+      min: 0, max: 8, step: 0.1, def: 1,
+    });
+    promptCard.appendChild(cfgField);
+    promptCard.appendChild(el("div", "stlu-hint",
+      "正向提示词会拼在每个任务的编辑指令前面；任务行里的指令照常生效。"));
+    ui.root.appendChild(promptCard);
+
+    // ---- 编辑任务 ----------------------------------------------------------
+    const taskHead = el("div", "stlu-line");
+    taskHead.appendChild(el("span", "stlu-cardtitle", "编辑任务"));
+    const taskCount = el("span", "stlu-tag", "0");
+    taskHead.appendChild(taskCount);
+    taskHead.appendChild(el("span", "grow"));
+    const addBtn = el("button", "stlu-btn", "＋ 添加任务");
+    taskHead.appendChild(addBtn);
+    ui.root.appendChild(taskHead);
+
     const tableEl = el("div");
     tableEl.style.display = "flex";
     tableEl.style.flexDirection = "column";
     tableEl.style.gap = "6px";
-    refLine.after(tableEl);
-    const addBtn = el("button", "stlu-btn", "＋ 添加任务");
-    tableEl.after(addBtn);
+    ui.root.appendChild(tableEl);
+
+    // ---- 种子 ---------------------------------------------------------------
+    // 只有这里填种子；② 逐层编辑从计划文件里读，默认每层同种子。
+    const seedRow = el("div", "stlu-card");
+    seedRow.appendChild(el("div", "stlu-cardtitle", "种子"));
+    const seedLine = el("div", "stlu-line");
+    const seedField = editNumber(node, "seed", "种子", {
+      min: 0, max: 4294967295, step: 1, def: 42,
+    });
+    seedLine.appendChild(seedField);
+    const seedBtn = el("button", "stlu-btn", "随机");
+    seedBtn.addEventListener("click", () => {
+      setWidget(node, "seed", Math.floor(Math.random() * 0x100000000));
+    });
+    seedLine.appendChild(seedBtn);
+    const seedNote = el("div", "stlu-hint",
+      "② 从这里读种子，每层 = 种子 + 任务序号，逐层递增。同一张 PSD 用同一种子结果可复现。");
+    seedNote.style.marginLeft = "70px";
+    seedRow.append(seedLine, seedNote);
+    ui.root.appendChild(seedRow);
+
+    // ---- 输出位置 + 重置 ----------------------------------------------------
+    // Same shape as the tile-flow card: a typed folder (auto-created on run),
+    // a browse button, the PSD name, and the exact path that will be written.
+    const outCard = el("div", "stlu-card");
+    outCard.appendChild(el("div", "stlu-cardtitle", "输出位置"));
+
+    // Mirrors core_plan.safe_name so the preview matches the real folder.
+    function safeName(value) {
+      let out = String(value || "").replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_")
+        .trim().replace(/[. ]+$/, "");
+      if (!out || out === "." || out === "..") out = "_";
+      if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(out.split(".")[0]))
+        out = "_" + out;
+      return out;
+    }
+
+    function psdStem() {
+      const name = baseNameOf(String(widgetValue(node, "psd_path", "") || ""));
+      return safeName((name || "psd").replace(/\.[^.]+$/, ""));
+    }
+
+    const outRow = el("div", "stlu-line");
+    outRow.appendChild(el("span", "stlu-label", "根目录"));
+    const outInp = el("input", "stlu-input");
+    outInp.style.flex = "1";
+    outInp.placeholder = "SeeThrough/PsdEdit";
+    outInp.value = String(widgetValue(node, "out_dir", "") || "");
+    outInp.title = "output 下的相对目录，可以直接输入不存在的文件夹名";
+    outInp.addEventListener("change", () => {
+      const rel = String(outInp.value || "").trim()
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      setWidget(node, "out_dir", rel);
+      outInp.value = rel;
+      refresh();
+      loadEditState();
+    });
+    const browseBtn = el("button", "stlu-btn", "浏览…");
+    browseBtn.addEventListener("click", () => pickFolderNative({
+      title: "选择 PSD 编辑的输出根目录",
+      start: String(widgetValue(node, "out_dir", "") || ""),
+      onPick(rel) {
+        setWidget(node, "out_dir", rel || "SeeThrough/PsdEdit");
+        outInp.value = rel || "SeeThrough/PsdEdit";
+        refresh();
+        loadEditState();
+      },
+    }));
+    outRow.append(outInp, browseBtn);
+    outCard.appendChild(outRow);
+
+    const subRow = el("div", "stlu-line");
+    subRow.appendChild(el("span", "stlu-label", "子目录"));
+    const subInp = el("input", "stlu-input");
+    subInp.style.flex = "1";
+    subInp.placeholder = "可空，如 角色/甲";
+    subInp.title = "相对根目录的子目录（可空）：成品写到 "
+      + "<根>/<子目录>/<PSD 名称>/<PSD 名称>.psd";
+    subInp.value = String(widgetValue(node, "sub_dir", "") || "");
+    subInp.addEventListener("change", () => {
+      const rel = String(subInp.value || "").trim()
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      setWidget(node, "sub_dir", rel);
+      subInp.value = rel;
+      refresh();
+      loadEditState();
+    });
+    subInp.addEventListener("input", refresh);
+    subRow.appendChild(subInp);
+    outCard.appendChild(subRow);
+
+    const nameRow = el("div", "stlu-line");
+    nameRow.appendChild(el("span", "stlu-label", "PSD 名称"));
+    const nameInp = el("input", "stlu-input");
+    nameInp.style.flex = "1";
+    nameInp.value = String(widgetValue(node, "psd_name", "") || "");
+    nameInp.addEventListener("change", () => {
+      setWidget(node, "psd_name", String(nameInp.value || "").trim());
+      refresh();
+    });
+    nameInp.addEventListener("input", () => {
+      setWidget(node, "psd_name", String(nameInp.value || "").trim());
+      paintOutLine();
+    });
+    nameRow.append(nameInp, el("span", "stlu-hint", ".psd"));
+    outCard.appendChild(nameRow);
+
+    const outLine = el("div", "stlu-hint");
+    outLine.style.wordBreak = "break-all";
+    outCard.appendChild(outLine);
+
+    // Same path the backend builds: <根>/<子目录>/<PSD 名称>, product .psd.
+    function paintOutLine() {
+      const rootDir = String(widgetValue(node, "out_dir", "") || "").trim()
+        || "SeeThrough/PsdEdit";
+      const subDir = String(widgetValue(node, "sub_dir", "") || "").trim()
+        .replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      const rawName = String(nameInp.value || "").trim()
+        || String(widgetValue(node, "psd_name", "") || "").trim();
+      const name = rawName || (psdStem() + "_edited");
+      outLine.textContent = (rawName ? "" : "未命名时默认 ") +
+        "输出：output/" + rootDir + (subDir ? "/" + subDir : "") +
+        "/" + safeName(name) + "/" + safeName(name) + ".psd";
+      outLine.title = state.out || outLine.textContent;
+    }
+
+    const foot = el("div", "stlu-line");
+    const openOut = el("button", "stlu-btn", "打开输出文件夹");
+    openOut.disabled = true;
+    const clearBtn = el("button", "stlu-btn", "清空运行结果");
+    clearBtn.title = "删除整个运行目录（包括你自己放进去的文件），不可撤销";
+    clearBtn.disabled = true;
+    let clearBusy = false;
+    foot.append(clearBtn, openOut);
+    outCard.appendChild(foot);
+    ui.root.appendChild(outCard);
 
     const state = {
       root: ui.root,
@@ -7999,25 +9159,57 @@
       out: "",
       layers: [],
       layerNames: new Set(),
+      layersLoaded: false,
       canvas: [],
       tasks: [],
+      crops: {},
+      // Layer names whose edited PNG already exists on disk (from the last
+      // ① plan or from /stlu/edit_state).  existsKnown=false means "no run
+      // record for this PSD yet", not "nothing generated".
+      existing: new Set(),
+      existsKnown: false,
+      stateKey: "",
       on(kind, data) {
         if (kind === "plan") {
           state.out = String(data.out_dir || "");
+          state.crops = {};
+          state.existing = new Set();
+          for (const c of (Array.isArray(data.crops) ? data.crops : [])) {
+            if (!c) continue;
+            if (c.name && c.crop) state.crops[String(c.name)] = String(c.crop);
+            if (c.name && c.exists) state.existing.add(String(c.name));
+          }
+          state.existsKnown = true;
+          state.stateKey = editStateKey();
           const canvas = data.canvas || [];
+          if (canvas.length === 2) state.canvas = canvas;
           const nl = Array.isArray(data.new_layers) ? data.new_layers.length : 0;
+          const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
           ui.tag.className = "stlu-tag ok";
           ui.tag.textContent = (Number(data.count) || 0) + " 个任务";
           ui.line.textContent = (canvas.length === 2 ? "画布 " + canvas[0] + "×" + canvas[1] + " · " : "") +
             (Number(data.count) || 0) + " 个编辑任务" + (nl ? "（含 " + nl + " 个新层）" : "") +
+            (skipped ? "（已生成 " + skipped + " 个）" : "") +
             " → output/" + (state.out || "") + "/";
           ui.line.title = state.out;
           openOut.disabled = !state.out;
-          openPsd.disabled = !state.psd;
-          const src = psdPreviewSrc(state.out);
-          if (src) {
-            ui.wrap.style.display = "";
-            ui.thumb.src = src;
+          refresh();
+          renderAll(false); // refresh per-task crop thumbnails
+        } else if (kind === "start") {
+          const done = new Set();
+          for (const it of (Array.isArray(data.items) ? data.items : [])) {
+            if (it && it.name) done.add(String(it.name));
+          }
+          for (const n of done) state.existing.delete(n);
+          for (const n of (Array.isArray(data.skipped) ? data.skipped : [])) {
+            if (n) state.existing.add(String(n));
+          }
+          if (done.size || state.existing.size) renderAll(false);
+        } else if (kind === "layer") {
+          const name = String(data.name || "");
+          if (name && !state.existing.has(name)) {
+            state.existing.add(name);
+            renderAll(false);
           }
         } else if (kind === "error") {
           ui.tag.className = "stlu-tag";
@@ -8040,10 +9232,24 @@
       return Number.isFinite(n) ? n : fallback;
     }
 
+    function splitRefs(value) {
+      if (Array.isArray(value)) {
+        return value.map((v) => String(v || "").trim()).filter(Boolean);
+      }
+      const text = String(value || "").trim();
+      if (!text) return [];
+      return text.split(/[;；\n]/).map((v) => v.trim()).filter(Boolean);
+    }
+
     function serializeTask(task) {
       const out = { name: String(task.name || "").trim(), prompt: String(task.prompt || "") };
-      if (String(task.ref_file || "").trim()) out.ref_file = task.ref_file;
-      out.silhouette = task.silhouette === "key" ? "key" : "lock";
+      const refs = splitRefs(task.ref_files);
+      if (refs.length) out.ref_files = refs;
+      else if (String(task.ref_file || "").trim()) out.ref_file = task.ref_file;
+      // Only meaningful for an existing layer: re-edit even if its PNG is
+      // already on disk.  Written as force_rerun because "force" alone reads
+      // like an unrelated flag in older task rows.
+      if (!task.isNew && task.force_rerun) out.force_rerun = true;
       if (task.isNew) {
         const b = task.box || {};
         out.box = { x: intOr(b.x, 0), y: intOr(b.y, 0), w: intOr(b.w, 512), h: intOr(b.h, 512) };
@@ -8081,6 +9287,7 @@
         rows.push({
           name: cells[0] || "", prompt: cells[1] || "", ref_file: cells[2] || "",
           silhouette: cells[3] || "", box: cells[4] || "", insert: cells[5] || "",
+          force: cells[6] || "",
         });
       }
       return rows;
@@ -8089,9 +9296,10 @@
     function normalizeTask(raw) {
       const name = String(raw.name || "").trim();
       const prompt = String(raw.prompt || raw.instruction || "").trim();
-      const ref = String(raw.ref_file || raw.reference || "").trim();
-      const sil = String(raw.silhouette || raw.mode || "lock").toLowerCase();
-      const silhouette = /绿幕|key|green|chroma|抠图/.test(sil) ? "key" : "lock";
+      let refs = splitRefs(raw.ref_files);
+      if (!refs.length) refs = splitRefs(raw.ref_file || raw.reference);
+      const ref = refs[0] || "";
+      const silhouette = String(raw.silhouette || raw.mode || "").trim();
       let box = { x: 0, y: 0, w: 512, h: 512 };
       const b = raw.box;
       if (b && typeof b === "object" && !Array.isArray(b)) {
@@ -8106,7 +9314,11 @@
       const hasBox = raw.box != null && raw.box !== "";
       const known = state.layerNames.size > 0;
       const isNew = hasBox || !name || (known && !state.layerNames.has(name));
-      return { name, prompt, ref_file: ref, silhouette, box, insert, isNew };
+      let force = raw.force_rerun != null ? raw.force_rerun : raw.force;
+      if (typeof force === "string")
+        force = /^(1|y|yes|true|force|是|重跑)$/i.test(force.trim());
+      return { name, prompt, ref_file: ref, ref_files: refs, silhouette, box, insert,
+               isNew, force_rerun: !!force };
     }
 
     function numField(task, key, label) {
@@ -8174,47 +9386,143 @@
       prompt.addEventListener("input", () => { task.prompt = prompt.value; serialize(); });
       card.appendChild(prompt);
 
-      // Silhouette mode + optional reference image.
-      const line2 = el("div", "stlu-line");
-      const sil = document.createElement("select");
-      sil.className = "stlu-input";
-      sil.style.maxWidth = "150px";
-      sil.title = "锁定轮廓=保持原形状只改内容；绿幕重抠=允许改形状，抠回时按绿幕重抠";
-      sil.appendChild(optionEl("lock", "锁定轮廓"));
-      sil.appendChild(optionEl("key", "绿幕重抠"));
-      sil.value = task.silhouette === "key" ? "key" : "lock";
-      sil.addEventListener("change", () => { task.silhouette = sil.value; serialize(); });
-      line2.appendChild(sil);
-
-      const refBtn = el("button", "stlu-btn", "参考图…");
-      const refLbl = el("span", "stlu-hint", task.ref_file ? baseNameOf(task.ref_file) : "无参考图");
-      refLbl.style.maxWidth = "150px";
-      refLbl.style.overflow = "hidden";
-      refLbl.style.textOverflow = "ellipsis";
-      refLbl.style.whiteSpace = "nowrap";
-      refLbl.title = task.ref_file || "";
-      const refClear = el("button", "stlu-btn", "清除");
-      refBtn.addEventListener("click", () => openFsPicker({
-        title: "选择该任务的参考图（可选）",
-        mode: "image",
-        start: task.ref_file || "",
-        onPick(abs) {
-          task.ref_file = abs;
-          refLbl.textContent = baseNameOf(abs);
-          refLbl.title = abs;
+      // Already generated?  ② skips a layer whose PNG is on disk unless this
+      // box is ticked, so say which way this row will go before the run.
+      if (!task.isNew && task.name) {
+        const lineState = el("div", "stlu-line");
+        const generated = state.existing.has(task.name);
+        const tag = el("span", "stlu-tag" +
+          (generated && !task.force_rerun ? " ok" : ""),
+          !state.existsKnown ? "未运行 ①，未知"
+            : (generated ? (task.force_rerun ? "已生成 · 强制重跑" : "已生成，将跳过")
+                         : "未生成"));
+        lineState.appendChild(tag);
+        const force = el("label", "stlu-check");
+        force.title = "勾上后即使这层的图已经生成，也重新编辑一次";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !!task.force_rerun;
+        cb.addEventListener("change", () => {
+          task.force_rerun = cb.checked;
           serialize();
+          renderAll(false);
+        });
+        force.appendChild(cb);
+        force.appendChild(el("span", null, "强制重跑"));
+        lineState.appendChild(force);
+        card.appendChild(lineState);
+      }
+
+      // Crop preview from the last ① run: shows exactly what the model will
+      // see for this layer, so "which layer am I editing" stops being a guess.
+      const cropRel = (!task.isNew && task.name) ? state.crops[task.name] : "";
+      if (cropRel) {
+        const lineCrop = el("div", "stlu-line");
+        lineCrop.style.alignItems = "flex-start";
+        const img = document.createElement("img");
+        img.style.cssText = "max-width:180px;max-height:96px;object-fit:contain;" +
+          "border:1px solid #2a2a2c;border-radius:3px;background:#0d0d0e;" +
+          "cursor:zoom-in;";
+        img.src = thumbUrl(cropRel, 256);
+        img.title = "上次运行裁出的编辑块（点击打开原图）";
+        img.addEventListener("click", () => openPath(cropRel, true));
+        lineCrop.appendChild(img);
+        lineCrop.appendChild(el("span", "stlu-hint", "上次裁出的编辑块"));
+        card.appendChild(lineCrop);
+      }
+
+      // These per-task references are the only extra ones, so they start at
+      // <image2>.  <imageN> counts CONNECTED slots, so dropping one shifts the
+      // later ones down (前移).
+      const refStart = 2;
+      const refBox = el("div");
+      refBox.style.cssText = "display:flex;flex-direction:column;gap:3px;";
+      const refHead = el("div", "stlu-line");
+      const refAdd = el("button", "stlu-btn", "＋ 添加参考图");
+      refHead.appendChild(refAdd);
+      const refHint = el("span", "stlu-hint",
+        "按顺序对应 <image2>、<image3>…；删掉其中一张，后面的编号会前移。");
+      refHint.style.whiteSpace = "normal";
+      refHead.appendChild(refHint);
+      refBox.appendChild(refHead);
+
+      const refsLine = el("div");
+      refsLine.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;";
+      refBox.appendChild(refsLine);
+
+      task.ref_files = splitRefs(task.ref_files);
+
+      function renderRefs() {
+        refsLine.innerHTML = "";
+        const list = task.ref_files || [];
+        list.forEach((abs, i) => {
+          const cell = el("div");
+          cell.style.cssText = "display:flex;flex-direction:column;align-items:center;" +
+            "gap:2px;width:104px;padding:3px;border:1px solid #2f2f31;border-radius:5px;" +
+            "background:#101012;";
+          const img = document.createElement("img");
+          img.src = localThumbUrl(abs, 96, abs);
+          img.style.cssText = "width:96px;height:72px;object-fit:contain;" +
+            "background:#0d0d0e;border-radius:3px;cursor:zoom-in;";
+          img.title = "点击查看原图";
+          img.addEventListener("click", () => openLocal(abs, true));
+          cell.appendChild(img);
+
+          const badge = el("span", "stlu-tag ok", "<image" + (i + refStart) + ">");
+          cell.appendChild(badge);
+
+          const ops = el("div", "stlu-line");
+          const up = el("button", "stlu-btn", "↑");
+          up.title = "前移一位";
+          up.disabled = i === 0;
+          up.addEventListener("click", () => {
+            [list[i - 1], list[i]] = [list[i], list[i - 1]];
+            serialize();
+            renderRefs();
+          });
+          const down = el("button", "stlu-btn", "↓");
+          down.title = "后移一位";
+          down.disabled = i === list.length - 1;
+          down.addEventListener("click", () => {
+            [list[i + 1], list[i]] = [list[i], list[i + 1]];
+            serialize();
+            renderRefs();
+          });
+          const rm = el("button", "stlu-btn", "×");
+          rm.title = "移除这张参考图";
+          rm.addEventListener("click", () => {
+            list.splice(i, 1);
+            task.ref_file = list[0] || "";
+            serialize();
+            renderRefs();
+          });
+          ops.appendChild(up);
+          ops.appendChild(down);
+          ops.appendChild(rm);
+          cell.appendChild(ops);
+
+          const nm = el("span", "stlu-hint", baseNameOf(abs));
+          nm.style.cssText = "max-width:96px;overflow:hidden;text-overflow:ellipsis;" +
+            "white-space:nowrap;";
+          nm.title = abs;
+          cell.appendChild(nm);
+          refsLine.appendChild(cell);
+        });
+      }
+
+      refAdd.addEventListener("click", () => pickFileNative({
+        title: "添加该任务的参考图（图案 / 款式等）",
+        kind: "image",
+        start: "",
+        onPick(abs) {
+          if (task.ref_files.indexOf(abs) < 0) task.ref_files.push(abs);
+          task.ref_file = task.ref_files[0] || "";
+          serialize();
+          renderRefs();
         },
       }));
-      refClear.addEventListener("click", () => {
-        task.ref_file = "";
-        refLbl.textContent = "无参考图";
-        refLbl.title = "";
-        serialize();
-      });
-      line2.appendChild(refBtn);
-      line2.appendChild(refLbl);
-      line2.appendChild(refClear);
-      card.appendChild(line2);
+      renderRefs();
+      card.appendChild(refBox);
 
       // New layers need a box on the canvas and an insertion point.
       if (task.isNew) {
@@ -8245,11 +9553,24 @@
 
     function renderAll(write) {
       tableEl.innerHTML = "";
+      // On a fresh open the saved tasks render before /stlu/psd_layers
+      // answers; with an empty layerNames every named task looks like a new
+      // layer, so the "new layer" controls flash for ~1s and then swap to the
+      // real row.  Hold the table on a placeholder until the layer list is
+      // known -- loadLayers() always flips layersLoaded (with a watchdog in
+      // case the request hangs), so this can wait but never wedge.
+      if (state.psd && !state.layersLoaded) {
+        tableEl.appendChild(el("div", "stlu-hint", "读取图层中…"));
+        taskCount.textContent = "读取中…";
+        if (write) serialize();
+        return;
+      }
       if (!state.tasks.length) {
         tableEl.appendChild(el("div", "stlu-hint",
-          "还没有任务：点下面「＋ 添加任务」，选一个原图层修改，或新增一个饰品层。"));
+          "还没有任务：点「＋ 添加任务」，选一个原图层修改，或新增一个饰品层。"));
       }
       for (const task of state.tasks) tableEl.appendChild(buildRow(task));
+      taskCount.textContent = state.tasks.length + " 个";
       if (write) serialize();
     }
 
@@ -8258,283 +9579,217 @@
       renderAll(false);
     }
 
-    function refresh() {
-      const out = String(widgetValue(node, "out_dir", "") || "");
-      outBtn.textContent = "输出位置：" + (out || "默认（SeeThrough/PsdEdit）");
-      const ref = String(widgetValue(node, "reference_path", "") || "");
-      refLine.textContent = ref
-        ? "参考原图：" + baseNameOf(ref)
-        : "参考原图：未选择（可选，选了会按同位置裁参考块喂给 ②）";
-      refLine.title = ref;
-      refOpen.disabled = !ref;
-      refClear.disabled = !ref;
-      if (state.psd) {
-        const c = state.canvas || [];
-        ui.line.textContent = "PSD：" + baseNameOf(state.psd) +
-          (c.length === 2 ? " · 画布 " + c[0] + "×" + c[1] : "") +
-          (state.layerNames.size ? " · " + state.layerNames.size + " 层可编辑" : "");
-      } else {
-        ui.line.textContent = "还没有选择成品 PSD";
-      }
-      ui.line.title = state.psd;
-      openPsd.disabled = !state.psd;
+    // ① writes <root>/<PSD stem>/edit_plan.json; when a saved workflow is
+    // reopened nothing has run yet, so ask the backend (same naming) which
+    // tasks already have their PNG and mark those rows 已生成.
+    function editStateKey() {
+      return [
+        String(widgetValue(node, "psd_path") || ""),
+        String(widgetValue(node, "out_dir") || ""),
+        String(widgetValue(node, "sub_dir") || ""),
+        String(widgetValue(node, "psd_name") || ""),
+      ].join("|");
     }
 
+    let editStateSeq = 0;
+    async function loadEditState() {
+      const key = editStateKey();
+      state.stateKey = key;
+      const psd = String(widgetValue(node, "psd_path") || "");
+      if (!psd) {
+        state.existing = new Set();
+        state.existsKnown = false;
+        openOut.disabled = true;
+        renderAll(false);
+        return null;
+      }
+      const seq = ++editStateSeq;
+      let data = null;
+      try {
+        data = await getJson("/stlu/edit_state?psd=" + encodeURIComponent(psd) +
+          "&out_dir=" + encodeURIComponent(String(widgetValue(node, "out_dir") || "")) +
+          "&sub_dir=" + encodeURIComponent(String(widgetValue(node, "sub_dir") || "")) +
+          "&psd_name=" + encodeURIComponent(String(widgetValue(node, "psd_name") || "")));
+      } catch (e) {
+        console.warn("[STLU] edit state", e);
+      }
+      if (seq !== editStateSeq || state.stateKey !== key) return null;
+      const exists = (data && data.exists) || {};
+      state.existing = new Set(Object.keys(exists).filter((n) => exists[n]));
+      state.existsKnown = !!(data && data.found);
+      // Same as the upscale panel: the run folder decides whether "open output
+      // folder" is usable, so a reopened workflow reflects the real disk state
+      // without a run.  ``state.out`` feeds the click handler.
+      state.out = String((data && data.out_dir) || state.out);
+      openOut.disabled = !(data && data.dir_exists);
+      renderAll(false);
+      return data;
+    }
+
+    function refresh() {
+      // onConfigure restores the widget values only after the panel was built,
+      // so pull them back into the text boxes (never stomp active typing).
+      seedField.stluSync();
+      globalPromptField.stluSync();
+      negPromptField.stluSync();
+      cfgField.stluSync();
+      const outWidget = String(widgetValue(node, "out_dir", "") || "");
+      if (document.activeElement !== outInp && outInp.value !== outWidget)
+        outInp.value = outWidget;
+      const subWidget = String(widgetValue(node, "sub_dir", "") || "");
+      if (document.activeElement !== subInp && subInp.value !== subWidget)
+        subInp.value = subWidget;
+      // Mirrors the backend: run_rel = <根目录>/<子目录>/<PSD 名称>, and the
+      // product is written as <run_rel>/<safe_name(PSD 名称)>.psd.
+      const nameWidget = String(widgetValue(node, "psd_name", "") || "").trim();
+      if (document.activeElement !== nameInp && nameInp.value !== nameWidget)
+        nameInp.value = nameWidget;
+      nameInp.placeholder = psdStem() + "_edited";
+      paintOutLine();
+
+      // ---- PSD 卡片 ----
+      state.psd = String(widgetValue(node, "psd_path", "") || "");
+      clearBtn.disabled = clearBusy || !state.psd;
+      psdFileCardThumb(psdCard, state.psd, 160);
+      psdOpen.disabled = !state.psd;
+      if (!state.psd) {
+        psdCard.nameEl.textContent = "还没选 PSD —— 点「选择成品 PSD…」";
+        psdCard.nameEl.title = "";
+        psdCard.subEl.textContent = "";
+        psdCard.tag.className = "stlu-tag";
+        psdCard.tag.textContent = "未选择";
+      } else {
+        psdCard.nameEl.textContent = baseNameOf(state.psd);
+        psdCard.nameEl.title = state.psd;
+        const c = state.canvas || [];
+        const parts = [];
+        if (c.length === 2) parts.push("画布 " + c[0] + "×" + c[1]);
+        if (state.layersLoaded) {
+          if (state.layerNames.size) parts.push(state.layerNames.size + " 个可编辑图层");
+        } else {
+          parts.push("读取图层中…");
+        }
+        psdCard.subEl.textContent = parts.join(" · ");
+        if (!state.layersLoaded) {
+          psdCard.tag.className = "stlu-tag";
+          psdCard.tag.textContent = "读取中…";
+        } else if (state.layerNames.size) {
+          psdCard.tag.className = "stlu-tag ok";
+          psdCard.tag.textContent = state.layerNames.size + " 层";
+        } else {
+          psdCard.tag.className = "stlu-tag error";
+          psdCard.tag.textContent = "读取失败";
+        }
+      }
+    }
+
+    // local=1 让后端跳过 output/input 沙盒：PSD 可以在任意盘符。
     async function loadLayers() {
+      const psd = state.psd;
       state.layers = [];
       state.layerNames = new Set();
       state.canvas = [];
-      if (!state.psd) { refresh(); return; }
+      state.layersLoaded = false;
+      if (!psd) { refresh(); return; }
+      refresh();
+      // Safety net: renderAll() holds the table on "读取图层中…" while
+      // layersLoaded is false, so a hung request must not leave it there.
+      const guard = setTimeout(() => {
+        if (state.psd === psd && !state.layersLoaded) {
+          state.layersLoaded = true;
+          refresh();
+          restore();
+        }
+      }, 8000);
       try {
-        const data = await getJson("/stlu/psd_layers?path=" + encodeURIComponent(state.psd));
+        const data = await getJson("/stlu/psd_layers?path=" + encodeURIComponent(psd) +
+          "&local=1");
+        if (state.psd !== psd) return;
         state.layers = Array.isArray(data.layers) ? data.layers : [];
         state.canvas = Array.isArray(data.canvas) ? data.canvas : [];
         state.layerNames = new Set(state.layers.map((l) => String(l.name)));
       } catch (e) {
         console.warn("[STLU] psd layers", e);
       }
+      if (state.psd !== psd) return;
+      clearTimeout(guard);
+      state.layersLoaded = true;
       refresh();
       restore(); // recompute new/existing now that layer names are known
+      loadEditState();
     }
 
     addBtn.addEventListener("click", () => {
       state.tasks.push({
-        name: "", prompt: "", ref_file: "", silhouette: "lock",
+        name: "", prompt: "", ref_file: "", ref_files: [], silhouette: "alpha",
         box: { x: 0, y: 0, w: 512, h: 512 }, insert: "", isNew: true,
+        force_rerun: false,
       });
       renderAll(true);
     });
-    pick.addEventListener("click", () => openFsPicker({
+    psdPick.addEventListener("click", () => pickFileNative({
       title: "选择成品 PSD",
-      mode: "psd",
+      kind: "psd",
       start: state.psd,
       onPick(abs) {
         state.psd = abs;
         setWidget(node, "psd_path", abs);
+        state.layersLoaded = false;
         refresh();
         loadLayers();
       },
     }));
-    refBtn.addEventListener("click", () => openFsPicker({
-      title: "选择参考原图（与 PSD 同构图的高分辨率原图）",
-      mode: "image",
-      start: String(widgetValue(node, "reference_path", "") || ""),
-      onPick(abs) {
-        setWidget(node, "reference_path", abs);
-        refresh();
-      },
-    }));
-    refOpen.addEventListener("click", () => openLocal(
-      String(widgetValue(node, "reference_path", "") || ""), true));
-    refClear.addEventListener("click", () => {
-      setWidget(node, "reference_path", "");
-      refresh();
+    psdCard.thumbWrap.addEventListener("click", () => {
+      if (state.psd) openLocal(state.psd, true);
     });
-    outBtn.addEventListener("click", () => openPicker({
-      title: "选择输出位置（output 内）",
-      mode: "folder",
-      scopes: [{ scope: "output", label: "输出目录" }],
-      start: String(widgetValue(node, "out_dir", "") || ""),
-      onPick(rel) {
-        setWidget(node, "out_dir", rel || "SeeThrough/PsdEdit");
-        refresh();
-      },
-    }));
-    openPsd.addEventListener("click", () => openLocal(state.psd, true));
+    psdOpen.addEventListener("click", () => openLocal(state.psd, true));
+
+    clearBtn.addEventListener("click", async () => {
+      clearBusy = true;
+      clearBtn.disabled = true;
+      try {
+        // The backend owns the run-folder naming rule; ask it for the path.
+        const data = await loadEditState();
+        const dir = String((data && data.out_dir) || "").trim();
+        if (!dir) {
+          window.alert("还没有运行目录可清空（先选 PSD）。");
+          return;
+        }
+        if (!window.confirm(
+          "清空运行目录？\n\noutput/" + dir + "\n\n" +
+          "会删除整个目录，包括你自己放进去的文件；不可撤销。")) return;
+        const res = await postJson("/stlu/psd/clear", { dir });
+        state.existing = new Set();
+        state.existsKnown = false;
+        state.out = "";
+        ui.tag.className = "stlu-tag";
+        ui.tag.textContent = "已清空";
+        ui.line.textContent = "已清空运行目录（删除 " +
+          Number((res && res.removed) || 0) + " 个文件）";
+        ui.line.title = "";
+        openOut.disabled = true;
+        await loadEditState();
+      } catch (e) {
+        window.alert("清空失败：" + (e && e.message ? e.message : e));
+      } finally {
+        clearBusy = false;
+        clearBtn.disabled = !state.psd;
+      }
+    });
+
     openOut.addEventListener("click", () => openPath(state.out, false));
 
     refresh();
     restore();
-    if (state.psd) loadLayers();
+    if (state.psd) loadLayers(); else loadEditState();
     watchValue(node, "tasks", () => { if (!writing) restore(); });
     // Catch widget values restored by onConfigure (they bypass watchValue).
     setTimeout(() => {
       state.psd = String(widgetValue(node, "psd_path", "") || "");
       refresh();
-      if (state.psd) loadLayers(); else restore();
+      if (state.psd) loadLayers(); else { restore(); loadEditState(); }
     }, 0);
-    addEditCdState(node, state, "stlu_edit_prepare_card", 320, 720);
-  }
-
-  // ② clones the Qwen edit subgraph once per task.
-  function setupEditLayer(node) {
-    hideWidget(widgetOf(node, "plan_json"));
-    hideWidget(widgetOf(node, "workflow_json"));
-    hideWidget(widgetOf(node, "psd_filename"));
-
-    const ui = psdPanel(node, "② 逐层编辑（Qwen 图编辑）",
-      "为每个编辑任务克隆一遍编辑工作流：锁定轮廓的换色/改材质，绿幕项重画形状，新饰品层在绿幕上生成。");
-    const pick = el("button", "stlu-btn", "选择计划文件…");
-    const wf = el("button", "stlu-btn", "选择编辑工作流…");
-    const openOut = el("button", "stlu-btn", "打开输出文件夹");
-    openOut.disabled = true;
-    ui.actions.append(pick);
-    ui.actions.append(wf);
-    ui.actions2.append(openOut);
-
-    const state = {
-      root: ui.root,
-      out: "",
-      total: 0,
-      done: new Set(),
-      on(kind, data) {
-        if (kind === "plan") {
-          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
-            setWidget(node, "plan_json", String(data.plan));
-            refresh();
-          }
-          if (!state.out) state.out = String(data.out_dir || "");
-        } else if (kind === "start") {
-          state.total = Number(data.total) || 0;
-          state.done.clear();
-          state.out = String(data.out_dir || state.out);
-          ui.tag.className = "stlu-tag";
-          ui.tag.textContent = "正在编辑…";
-          const parts = Array.isArray(data.parts) ? data.parts : [];
-          ui.line.textContent = "开始编辑 " + state.total + " 个任务：" + parts.join("、");
-          openOut.disabled = !state.out;
-        } else if (kind === "layer") {
-          const file = String(data.file || "");
-          if (file && !state.done.has(file)) state.done.add(file);
-          const total = Math.max(state.total, state.done.size);
-          ui.line.textContent = "正在编辑 " + state.done.size + "/" + total + " · " + baseNameOf(file);
-        } else if (kind === "assembled") {
-          state.out = String(data.dir || state.out);
-          ui.tag.className = "stlu-tag ok";
-          ui.tag.textContent = "✓ 完成";
-          const edited = Array.isArray(data.edited) ? data.edited.length : (Number(data.edited) || 0);
-          ui.line.textContent = "已生成：" + (data.name || baseNameOf(String(data.psd || ""))) +
-            "（" + edited + " 层编辑）";
-          openOut.disabled = !state.out;
-          const src = psdPreviewSrc(state.out);
-          if (src) {
-            ui.wrap.style.display = "";
-            ui.thumb.src = src;
-          }
-        } else if (kind === "error") {
-          ui.tag.className = "stlu-tag";
-          ui.tag.textContent = "已中断";
-        }
-      },
-    };
-
-    function refresh() {
-      const plan = String(widgetValue(node, "plan_json", "") || "");
-      const workflow = String(widgetValue(node, "workflow_json", "") || "");
-      ui.line.textContent = (plan ? "计划：" + baseNameOf(absDirOf(plan)) + "/edit_plan.json" : "计划：跟随 ① 自动填写") +
-        " · 工作流：" + (workflow ? baseNameOf(workflow) : "默认模板");
-      ui.line.title = plan || workflow;
-    }
-
-    pick.addEventListener("click", () => openPicker({
-      title: "选择 edit_plan.json",
-      mode: "json",
-      scopes: [{ scope: "output", label: "输出目录" }],
-      start: state.out || "",
-      onPick(rel, abs, file) {
-        const target = (file && file.abs) || abs || rel;
-        setWidget(node, "plan_json", String(target || ""));
-        if (file && file.rel) state.out = absDirOf(file.rel);
-        refresh();
-      },
-    }));
-    wf.addEventListener("click", () => openPicker({
-      title: "选择图编辑工作流",
-      mode: "workflow",
-      scopes: [{ scope: "workflows", label: "工作流" }],
-      start: "",
-      onPick(rel, abs, file) {
-        setWidget(node, "workflow_json", String((file && file.abs) || abs || rel || ""));
-        refresh();
-      },
-    }));
-    openOut.addEventListener("click", () => openPath(state.out, false));
-
-    refresh();
-    addEditCdState(node, state, "stlu_edit_layer_card", 190, 380);
-  }
-
-  // ③ rebuilds the edited PSD once every task has been cut back to a layer.
-  function setupEditAssemble(node) {
-    hideWidget(widgetOf(node, "plan_json"));
-    hideWidget(widgetOf(node, "psd_filename"));
-
-    const ui = psdPanel(node, "③ 重组编辑 PSD",
-      "所有编辑任务都抠回图层以后运行：按原顺序、混合模式和透明度重拼成新 PSD，新饰品层按插入位置入列。");
-    const pick = el("button", "stlu-btn", "选择计划文件…");
-    const openPsd = el("button", "stlu-btn", "打开 PSD");
-    const openOut = el("button", "stlu-btn", "打开文件夹");
-    openPsd.disabled = true;
-    openOut.disabled = true;
-    ui.actions.append(pick);
-    ui.actions2.append(openPsd);
-    ui.actions2.append(openOut);
-
-    const state = {
-      root: ui.root,
-      plan: String(widgetValue(node, "plan_json", "") || ""),
-      out: "",
-      psd: "",
-      on(kind, data) {
-        if (kind === "plan") {
-          if (!String(widgetValue(node, "plan_json", "") || "") && data.plan) {
-            setWidget(node, "plan_json", String(data.plan));
-            state.plan = String(data.plan);
-            refresh();
-          }
-          if (!state.out) state.out = String(data.out_dir || "");
-        } else if (kind === "assembled") {
-          state.out = String(data.dir || state.out);
-          state.psd = String(data.psd || "");
-          const canvas = data.canvas || [];
-          const edited = Array.isArray(data.edited) ? data.edited.length : (Number(data.edited) || 0);
-          const fb = Array.isArray(data.fallback) ? data.fallback.length : (Number(data.fallback) || 0);
-          const nl = Array.isArray(data.new_layers) ? data.new_layers.length : 0;
-          ui.tag.className = "stlu-tag ok";
-          ui.tag.textContent = "✓ 已重组";
-          ui.line.textContent = (canvas.length === 2 ? canvas[0] + "×" + canvas[1] + " · " : "") +
-            edited + " 层编辑" + (fb ? " · " + fb + " 层回退原图" : "") +
-            (nl ? " · " + nl + " 个新层" : "") + " — " + (data.name || "");
-          ui.line.title = state.psd;
-          openPsd.disabled = !state.psd;
-          openOut.disabled = !state.out;
-          const src = psdPreviewSrc(state.out);
-          if (src) {
-            ui.wrap.style.display = "";
-            ui.thumb.src = src;
-          }
-        } else if (kind === "error") {
-          ui.tag.className = "stlu-tag";
-          ui.tag.textContent = "未完成";
-        }
-      },
-    };
-
-    function refresh() {
-      ui.line.textContent = state.plan
-        ? "计划：" + baseNameOf(absDirOf(state.plan)) + "/edit_plan.json"
-        : "还没有计划文件：先运行 ①，或手动选择 edit_plan.json";
-      ui.line.title = state.plan;
-    }
-
-    pick.addEventListener("click", () => openPicker({
-      title: "选择 edit_plan.json",
-      mode: "json",
-      scopes: [{ scope: "output", label: "输出目录" }],
-      start: state.out || "",
-      onPick(rel, abs, file) {
-        const target = (file && file.abs) || abs || rel;
-        state.plan = String(target || "");
-        setWidget(node, "plan_json", state.plan);
-        if (file && file.rel) state.out = absDirOf(file.rel);
-        refresh();
-      },
-    }));
-    openPsd.addEventListener("click", () => openLocal(state.psd, true));
-    openOut.addEventListener("click", () => openPath(state.out, false));
-
-    refresh();
-    addEditCdState(node, state, "stlu_edit_assemble_card", 200, 390);
+    addEditCdState(node, state, "stlu_edit_prepare_card", 340, 780);
   }
 
   // -------------------------------------------------------------------------
@@ -8582,6 +9837,17 @@
         };
       }
 
+      // Every STLU node: let the named copy of the saved values win over the
+      // positional restore.  Queued before the panel setup below, so its hook
+      // runs before pinSeedControl pins control_after_generate again.
+      if (String(nodeData.name).indexOf("STLU_") === 0) {
+        const namedCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+          addConfigureHook(this, (n, info) => applyNamedWidgetValues(n, info));
+          return namedCreated ? namedCreated.apply(this, arguments) : undefined;
+        };
+      }
+
       if (nodeData.name !== EDIT_BATCH
           && nodeData.name !== TILES && nodeData.name !== TILE_SELECT
           && nodeData.name !== TILE_MERGE && nodeData.name !== TILE_GRID
@@ -8591,11 +9857,10 @@
           && nodeData.name !== SAVE_TILES && nodeData.name !== WAVE
           && nodeData.name !== TILE_PSD && nodeData.name !== WAVE_INDEX
           && nodeData.name !== PSD_PREVIEW && nodeData.name !== SEQ_LOOP
-          && nodeData.name !== PSD_PREPARE && nodeData.name !== PSD_LOAD_CROP
+          && nodeData.name !== PSD_LOAD_CROP
           && nodeData.name !== PSD_CUT && nodeData.name !== PSD_ASSEMBLE
-          && nodeData.name !== PSD_UPSCALE
-          && nodeData.name !== EDIT_PREPARE && nodeData.name !== EDIT_LAYER
-          && nodeData.name !== EDIT_ASSEMBLE
+          && nodeData.name !== PSD_UPSCALE_PREPARE && nodeData.name !== PSD_UPSCALE_MIN
+          && nodeData.name !== EDIT_PREPARE
           && nodeData.name !== "STLU_LayerPSD") return;
       bindEvents();
       const onCreated = nodeType.prototype.onNodeCreated;
@@ -8619,14 +9884,11 @@
           else if (nodeData.name === WAVE_INDEX) setupWaveIndex(this);
           else if (nodeData.name === PSD_PREVIEW) setupPartsPreview(this);
           else if (nodeData.name === SEQ_LOOP) setupTileLoop(this);
-          else if (nodeData.name === PSD_PREPARE) setupPsdPrepare(this);
           else if (nodeData.name === PSD_LOAD_CROP) setupPsdLoadCrop(this);
           else if (nodeData.name === PSD_CUT) setupPsdCutToLayer(this);
           else if (nodeData.name === PSD_ASSEMBLE) setupPsdAssemble(this);
-          else if (nodeData.name === PSD_UPSCALE) setupPsdUpscale(this);
+          else if (nodeData.name === PSD_UPSCALE_PREPARE) setupPsdUpscaleMin(this);
           else if (nodeData.name === EDIT_PREPARE) setupEditPrepare(this);
-          else if (nodeData.name === EDIT_LAYER) setupEditLayer(this);
-          else if (nodeData.name === EDIT_ASSEMBLE) setupEditAssemble(this);
           else if (nodeData.name === "STLU_LayerPSD") setupMaskPSD(this);
         } catch (e) {
           console.error("[STLU] failed to build UI for " + nodeData.name, e);

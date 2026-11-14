@@ -130,16 +130,62 @@ def resize_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
     return np.array(im, dtype=np.uint8) > 127
 
 
-def resize_alpha(alpha: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Resample an HxW uint8 alpha map with bilinear filtering."""
+def resize_alpha(alpha: np.ndarray, width: int, height: int,
+                 sharp: bool = False) -> np.ndarray:
+    """Resample an HxW uint8 alpha map with bilinear filtering.
+
+    ``sharp`` swaps the kernel for Lanczos: a source silhouette upscaled from
+    crop size keeps a much narrower transition, which is what a locked
+    outline needs (bilinear spreads a hard edge over the whole scale factor).
+    """
     width = max(1, int(width))
     height = max(1, int(height))
     alpha = np.asarray(alpha, dtype=np.uint8)
     if alpha.shape[:2] == (height, width):
         return alpha
     im = Image.fromarray(alpha, "L")
-    im = im.resize((width, height), Image.Resampling.BILINEAR)
+    kernel = Image.Resampling.LANCZOS if sharp else Image.Resampling.BILINEAR
+    im = im.resize((width, height), kernel)
     return np.array(im, dtype=np.uint8)
+
+
+def extend_colour(rgb: np.ndarray, alpha: np.ndarray,
+                  solid: int = 200) -> np.ndarray:
+    """Fill non-solid pixels with the nearest solid pixel's colour.
+
+    Transparent background carries whatever colour the model painted there
+    (Qwen 2.1 decodes alpha 0 as noisy purple); premultiplied resampling would
+    bleed that colour into the silhouette edge.  Every pixel below ``solid``
+    takes the colour of its closest opaque neighbour instead, so a resize only
+    ever mixes the part's own colours.
+    """
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    a = np.asarray(alpha, dtype=np.uint8)
+    if a.ndim == 3:
+        a = a[..., 0]
+    solid_mask = a >= int(solid)
+    if not solid_mask.any() or solid_mask.all():
+        return rgb
+    try:
+        from scipy import ndimage
+    except ImportError:  # pragma: no cover - scipy ships with ComfyUI
+        out = rgb.copy()
+        known = solid_mask.copy()
+        for _ in range(max(rgb.shape[:2])):
+            if known.all():
+                break
+            grow = known.copy()
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                shifted = np.roll(known, (dy, dx), (0, 1))
+                source = np.roll(out, (-dy, -dx), (0, 1))
+                sel = ~grow & shifted
+                out[sel] = source[sel]
+                grow |= shifted
+            known = grow
+        return out
+    idx = ndimage.distance_transform_edt(~solid_mask, return_distances=False,
+                                         return_indices=True)
+    return rgb[idx[0], idx[1]]
 
 
 def merge_alpha(rgba: np.ndarray, mask_alpha, keep_input_alpha: bool = False) -> np.ndarray:

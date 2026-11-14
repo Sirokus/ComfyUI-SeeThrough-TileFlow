@@ -19,7 +19,7 @@ except Exception:  # noqa: BLE001
     NODE_DISPLAY_NAME_MAPPINGS = {}
 
 try:
-    # Registers /stlu/ls and /stlu/layers with the running prompt server.
+    # Registers the /stlu/* routes with the running prompt server.
     from . import routes as _routes  # noqa: F401
 except Exception:  # noqa: BLE001
     traceback.print_exc()
